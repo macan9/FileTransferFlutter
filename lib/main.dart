@@ -1,13 +1,20 @@
 
+import 'dart:io';
+
 import 'package:file_transfer_flutter/app/app.dart';
-import 'package:file_transfer_flutter/core/services/window_state_service.dart';
 import 'package:file_transfer_flutter/core/constants/app_constants.dart';
+import 'package:file_transfer_flutter/core/services/window_state_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:window_manager/window_manager.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  if (!_isDesktopPlatform) {
+    runApp(const ProviderScope(child: FileTransferApp()));
+    return;
+  }
 
   await windowManager.ensureInitialized();
 
@@ -42,3 +49,6 @@ Future<void> main() async {
 
   runApp(const ProviderScope(child: FileTransferApp()));
 }
+
+bool get _isDesktopPlatform =>
+    Platform.isWindows || Platform.isLinux || Platform.isMacOS;

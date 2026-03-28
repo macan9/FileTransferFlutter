@@ -634,7 +634,7 @@ class _FilesPageState extends ConsumerState<FilesPage> {
 
                 if (snapshot.hasError) {
                   return _ErrorState(
-                    message: '加载文件列表失败，请确认本机 3000 端口服务已启动。',
+                    message: '加载文件列表失败，请确认 192.168.5.86:3000 服务已启动，且手机可访问这台电脑。',
                     onRetry: _reloadFiles,
                   );
                 }

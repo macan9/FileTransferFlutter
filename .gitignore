@@ -6,6 +6,7 @@
 .pub/
 .pub-cache/
 build/
+*.log
 
 # Android Studio / IntelliJ
 *.iml

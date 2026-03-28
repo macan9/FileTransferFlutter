@@ -38,7 +38,7 @@ class HttpFileRepository implements FileRepository {
     http.Client? client,
     Uri? baseUri,
   })  : _client = client ?? http.Client(),
-        _baseUri = baseUri ?? Uri.parse('http://127.0.0.1:3000');
+        _baseUri = baseUri ?? Uri.parse('http://192.168.5.86:3000');
 
   final http.Client _client;
   final Uri _baseUri;

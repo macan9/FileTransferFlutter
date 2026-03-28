@@ -33,13 +33,18 @@ class AppShell extends StatelessWidget {
   Widget build(BuildContext context) {
     final bool isDesktop =
         Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+    final Widget content = Column(
+      children: <Widget>[
+        if (isDesktop) const _DesktopTitleBar(),
+        Expanded(child: navigationShell),
+      ],
+    );
 
     return Scaffold(
-      body: Column(
-        children: <Widget>[
-          if (isDesktop) const _DesktopTitleBar(),
-          Expanded(child: navigationShell),
-        ],
+      body: SafeArea(
+        top: !isDesktop,
+        bottom: false,
+        child: content,
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: navigationShell.currentIndex,
