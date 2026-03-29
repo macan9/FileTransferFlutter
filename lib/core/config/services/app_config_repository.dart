@@ -1,4 +1,5 @@
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
+import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:file_transfer_flutter/core/config/services/app_config_defaults_resolver.dart';
 import 'package:hive/hive.dart';
 
@@ -52,7 +53,10 @@ class HiveAppConfigRepository implements AppConfigRepository {
 
     final AppConfig persisted = AppConfig.fromJson(json);
     return defaults.copyWith(
-      serverUrl: _preferPersisted(persisted.serverUrl, defaults.serverUrl),
+      serverUrl: _preferPersistedServerUrl(
+        persisted.serverUrl,
+        defaults.serverUrl,
+      ),
       deviceId: _preferPersisted(persisted.deviceId, defaults.deviceId),
       deviceName: _preferPersisted(persisted.deviceName, defaults.deviceName),
       downloadDirectory: _preferPersisted(
@@ -68,6 +72,15 @@ class HiveAppConfigRepository implements AppConfigRepository {
   String _preferPersisted(String persisted, String fallback) {
     final String trimmed = persisted.trim();
     return trimmed.isEmpty ? fallback : trimmed;
+  }
+
+  String _preferPersistedServerUrl(String persisted, String fallback) {
+    final String trimmed = persisted.trim();
+    if (trimmed.isEmpty || AppNetworkConfig.isLegacyLocalServerUrl(trimmed)) {
+      return fallback;
+    }
+
+    return trimmed;
   }
 
   bool _jsonEquals(dynamic raw, Map<String, dynamic> normalizedJson) {

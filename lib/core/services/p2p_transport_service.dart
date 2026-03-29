@@ -24,6 +24,8 @@ class P2pTransportService {
         _uuid = uuid ?? const Uuid();
 
   static const int chunkSize = 16 * 1024;
+  static const int maxFileSizeBytes = 800 * 1024 * 1024;
+  static const Duration incomingTransferTimeout = Duration(minutes: 2);
   static const String _defaultChannelLabel = 'file-transfer';
 
   final RealtimePeerConnectionFactory _peerConnectionFactory;
@@ -58,6 +60,9 @@ class P2pTransportService {
     _downloadDirectory = null;
     for (final _PeerLink link in _links.values) {
       await link.dispose();
+    }
+    for (final _IncomingBuffer buffer in _incomingBuffers.values) {
+      await buffer.dispose(deleteTempFile: true);
     }
     _links.clear();
     _incomingBuffers.clear();
@@ -179,6 +184,9 @@ class P2pTransportService {
 
     final File file = File(filePath);
     final int fileSize = await file.length();
+    if (fileSize > maxFileSizeBytes) {
+      throw const RealtimeError('实时传输单文件上限为 800MB。');
+    }
     final String fileName = p.basename(filePath);
     final String mimeType = _mimeTypeFor(fileName);
     final int totalChunks = (fileSize / chunkSize).ceil();
@@ -233,7 +241,7 @@ class P2pTransportService {
 
       int sentBytes = 0;
       int sentChunks = 0;
-      await for (final List<int> chunk in file.openRead()) {
+      await for (final List<int> chunk in _readFileChunks(file)) {
         await _sendBinaryMessage(link, _buildChunkPayload(sentChunks, chunk));
         sentBytes += chunk.length;
         sentChunks += 1;
@@ -242,6 +250,12 @@ class P2pTransportService {
             sentBytes: sentBytes,
             sentChunks: sentChunks,
           ),
+        );
+      }
+
+      if (sentChunks != totalChunks) {
+        throw RealtimeError(
+          'Chunk count mismatch: expected $totalChunks, sent $sentChunks.',
         );
       }
 
@@ -350,10 +364,22 @@ class P2pTransportService {
         case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
           link.linkStatus = TransportLinkStatus.failed;
           link.lastError = 'PeerConnection failed';
+          unawaited(
+            _cleanupIncomingBuffersForSession(
+              link.session.sessionId,
+              errorMessage: '连接已断开，未完成的文件接收已取消。',
+            ),
+          );
           break;
         case RTCPeerConnectionState.RTCPeerConnectionStateDisconnected:
         case RTCPeerConnectionState.RTCPeerConnectionStateClosed:
           link.linkStatus = TransportLinkStatus.closed;
+          unawaited(
+            _cleanupIncomingBuffersForSession(
+              link.session.sessionId,
+              errorMessage: '连接已断开，未完成的文件接收已取消。',
+            ),
+          );
           break;
         default:
           link.linkStatus = TransportLinkStatus.negotiating;
@@ -430,12 +456,23 @@ class P2pTransportService {
       }
 
       final _ChunkPayload payload = _parseChunkPayload(message.binary);
-      buffer.chunks[payload.index] = payload.data;
+      if (payload.index != buffer.nextChunkIndex) {
+        throw RealtimeError(
+          'Unexpected chunk index ${payload.index}, expected ${buffer.nextChunkIndex}.',
+        );
+      }
+
+      buffer.sink.add(payload.data);
+      buffer.nextChunkIndex += 1;
       buffer.receivedBytes += payload.data.length;
+      buffer.touch(
+        incomingTransferTimeout,
+        () => _handleIncomingBufferTimeout(buffer.context.transferId),
+      );
       _upsertIncoming(
         buffer.context = buffer.context.copyWith(
           receivedBytes: buffer.receivedBytes,
-          receivedChunks: buffer.chunks.length,
+          receivedChunks: buffer.nextChunkIndex,
           status: TransferRecordStatus.receiving,
           startedAt: buffer.context.startedAt ?? DateTime.now(),
         ),
@@ -465,25 +502,44 @@ class P2pTransportService {
     Map<String, dynamic> json,
   ) async {
     final String transferId = json['transferId']?.toString() ?? _uuid.v4();
+    final String downloadDirectory = _requireDownloadDirectory();
+    final int fileSize = (json['fileSize'] as num?)?.toInt() ?? 0;
+    if (fileSize > maxFileSizeBytes) {
+      throw const RealtimeError('实时传输单文件上限为 800MB。');
+    }
+    final String tempFilePath = await _buildTempDownloadPath(
+      downloadDirectory,
+      transferId,
+    );
+    final File tempFile = File(tempFilePath);
+    await tempFile.parent.create(recursive: true);
+    final IOSink sink = tempFile.openWrite();
+
     final IncomingTransferContext context = IncomingTransferContext(
       transferId: transferId,
       sessionId: link.session.sessionId,
       senderDeviceId: link.peerDeviceId,
       receiverDeviceId: _requireSelfDeviceId(),
       fileName: json['fileName']?.toString() ?? 'incoming.bin',
-      fileSize: (json['fileSize'] as num?)?.toInt() ?? 0,
+      fileSize: fileSize,
       mimeType: json['mimeType']?.toString() ?? 'application/octet-stream',
       chunkSize: (json['chunkSize'] as num?)?.toInt() ?? chunkSize,
       totalChunks: (json['totalChunks'] as num?)?.toInt() ?? 0,
       status: TransferRecordStatus.receiving,
       createdAt: DateTime.now(),
       startedAt: DateTime.now(),
-      downloadDirectory: _requireDownloadDirectory(),
+      downloadDirectory: downloadDirectory,
     );
 
     _incomingBuffers[transferId] = _IncomingBuffer(
       context: context,
       sessionId: link.session.sessionId,
+      tempFilePath: tempFilePath,
+      sink: sink,
+    );
+    _incomingBuffers[transferId]!.touch(
+      incomingTransferTimeout,
+      () => _handleIncomingBufferTimeout(transferId),
     );
     _upsertIncoming(context);
     await _emitTransferProgress(transferId: transferId, status: 'receiving');
@@ -500,23 +556,25 @@ class P2pTransportService {
     }
 
     try {
-      final List<int> bytes = <int>[];
-      for (int i = 0; i < buffer.context.totalChunks; i += 1) {
-        final Uint8List? chunk = buffer.chunks[i];
-        if (chunk == null) {
-          throw const RealtimeError(
-              'Missing file chunks while rebuilding file');
-        }
-        bytes.addAll(chunk);
+      if (buffer.nextChunkIndex != buffer.context.totalChunks) {
+        throw RealtimeError(
+          'Missing file chunks while rebuilding file: expected ${buffer.context.totalChunks}, received ${buffer.nextChunkIndex}.',
+        );
       }
+      if (buffer.receivedBytes != buffer.context.fileSize) {
+        throw RealtimeError(
+          'Received file size mismatch: expected ${buffer.context.fileSize}, got ${buffer.receivedBytes}.',
+        );
+      }
+
+      await buffer.close();
 
       final String savePath = await _buildDownloadPath(
         buffer.context.downloadDirectory,
         buffer.context.fileName,
       );
-      final File file = File(savePath);
-      await file.parent.create(recursive: true);
-      await file.writeAsBytes(bytes, flush: true);
+      await File(savePath).parent.create(recursive: true);
+      await File(buffer.tempFilePath).rename(savePath);
 
       buffer.completed = true;
       _upsertIncoming(
@@ -524,8 +582,8 @@ class P2pTransportService {
           savePath: savePath,
           completedAt: DateTime.now(),
           status: TransferRecordStatus.received,
-          receivedBytes: bytes.length,
-          receivedChunks: buffer.context.totalChunks,
+          receivedBytes: buffer.receivedBytes,
+          receivedChunks: buffer.nextChunkIndex,
         ),
       );
 
@@ -537,6 +595,8 @@ class P2pTransportService {
           'transferId': transferId,
         },
       );
+      buffer.cancelTimeout();
+      _incomingBuffers.remove(transferId);
     } catch (error) {
       _upsertIncoming(
         buffer.context = buffer.context.copyWith(
@@ -545,10 +605,13 @@ class P2pTransportService {
           completedAt: DateTime.now(),
         ),
       );
+      buffer.cancelTimeout();
+      await buffer.dispose(deleteTempFile: true);
       await _emitTransferFailed(
         transferId: transferId,
         errorMessage: '$error',
       );
+      _incomingBuffers.remove(transferId);
       rethrow;
     }
   }
@@ -687,6 +750,21 @@ class P2pTransportService {
     await channel.send(RTCDataChannelMessage.fromBinary(bytes));
   }
 
+  Stream<List<int>> _readFileChunks(File file) async* {
+    final RandomAccessFile raf = await file.open();
+    try {
+      while (true) {
+        final Uint8List chunk = await raf.read(chunkSize);
+        if (chunk.isEmpty) {
+          break;
+        }
+        yield chunk;
+      }
+    } finally {
+      await raf.close();
+    }
+  }
+
   Uint8List _buildChunkPayload(int index, List<int> chunk) {
     final ByteData header = ByteData(4)..setUint32(0, index, Endian.big);
     final Uint8List payload = Uint8List(4 + chunk.length);
@@ -717,6 +795,19 @@ class P2pTransportService {
       index += 1;
     }
     return candidate;
+  }
+
+  Future<String> _buildTempDownloadPath(
+    String directoryPath,
+    String transferId,
+  ) async {
+    final String tempDirectoryPath = p.join(directoryPath, '.p2p_tmp');
+    final Directory tempDirectory = Directory(tempDirectoryPath);
+    if (!await tempDirectory.exists()) {
+      await tempDirectory.create(recursive: true);
+    }
+
+    return p.join(tempDirectoryPath, '$transferId.part');
   }
 
   String _mimeTypeFor(String fileName) {
@@ -762,8 +853,75 @@ class P2pTransportService {
     if (link == null) {
       return;
     }
+    await _cleanupIncomingBuffersForSession(
+      sessionId,
+      errorMessage: '会话已关闭，未完成的文件接收已清理。',
+    );
     await link.dispose();
     _refreshSessionTransports();
+  }
+
+  Future<void> _handleIncomingBufferTimeout(String transferId) async {
+    final _IncomingBuffer? buffer = _incomingBuffers[transferId];
+    if (buffer == null || buffer.completed) {
+      return;
+    }
+
+    await _failIncomingBuffer(
+      transferId,
+      buffer,
+      errorMessage: '接收超时，未完成的文件已清理。',
+    );
+  }
+
+  Future<void> _cleanupIncomingBuffersForSession(
+    String sessionId, {
+    required String errorMessage,
+  }) async {
+    final List<MapEntry<String, _IncomingBuffer>> pending =
+        _incomingBuffers.entries
+            .where(
+              (MapEntry<String, _IncomingBuffer> entry) =>
+                  entry.value.sessionId == sessionId && !entry.value.completed,
+            )
+            .toList();
+
+    for (final MapEntry<String, _IncomingBuffer> entry in pending) {
+      await _failIncomingBuffer(
+        entry.key,
+        entry.value,
+        errorMessage: errorMessage,
+      );
+    }
+  }
+
+  Future<void> _failIncomingBuffer(
+    String transferId,
+    _IncomingBuffer buffer, {
+    required String errorMessage,
+  }) async {
+    buffer.cancelTimeout();
+    _upsertIncoming(
+      buffer.context = buffer.context.copyWith(
+        status: TransferRecordStatus.failed,
+        errorMessage: errorMessage,
+        completedAt: DateTime.now(),
+      ),
+    );
+    await buffer.dispose(deleteTempFile: true);
+    _incomingBuffers.remove(transferId);
+
+    final io.Socket? socket = _socket;
+    if (socket != null) {
+      socket.emitWithAck(
+        'client:transfer-failed',
+        <String, dynamic>{
+          'transferId': transferId,
+          'errorMessage': errorMessage,
+        },
+        ack: (dynamic _) {},
+      );
+    }
   }
 
   void _reconcileOutgoing(TransferRecord record) {
@@ -971,13 +1129,54 @@ class _IncomingBuffer {
   _IncomingBuffer({
     required this.context,
     required this.sessionId,
+    required this.tempFilePath,
+    required this.sink,
   });
 
   IncomingTransferContext context;
   final String sessionId;
-  final Map<int, Uint8List> chunks = <int, Uint8List>{};
+  final String tempFilePath;
+  final IOSink sink;
   int receivedBytes = 0;
+  int nextChunkIndex = 0;
   bool completed = false;
+  bool _closed = false;
+  Timer? _timeoutTimer;
+
+  Future<void> close() async {
+    if (_closed) {
+      return;
+    }
+
+    _closed = true;
+    await sink.flush();
+    await sink.close();
+  }
+
+  void touch(Duration timeout, Future<void> Function() onTimeout) {
+    _timeoutTimer?.cancel();
+    _timeoutTimer = Timer(timeout, () {
+      unawaited(onTimeout());
+    });
+  }
+
+  void cancelTimeout() {
+    _timeoutTimer?.cancel();
+    _timeoutTimer = null;
+  }
+
+  Future<void> dispose({required bool deleteTempFile}) async {
+    cancelTimeout();
+    await close();
+    if (!deleteTempFile) {
+      return;
+    }
+
+    final File tempFile = File(tempFilePath);
+    if (await tempFile.exists()) {
+      await tempFile.delete();
+    }
+  }
 }
 
 class _ChunkPayload {

@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
+import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:file_transfer_flutter/core/error/app_exception.dart';
 import 'package:file_transfer_flutter/core/models/cloud_file.dart';
 import 'package:file_transfer_flutter/core/models/file_storage_limits.dart';
@@ -42,7 +43,7 @@ class HttpFileRepository implements FileRepository {
     Uri? baseUri,
     required String downloadDirectory,
   })  : _client = client ?? http.Client(),
-        _baseUri = baseUri ?? Uri.parse('http://127.0.0.1:3000'),
+        _baseUri = baseUri ?? AppNetworkConfig.defaultServerUri,
         _downloadDirectory = downloadDirectory;
 
   final http.Client _client;

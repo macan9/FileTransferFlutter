@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/p2p_presence_state.dart';
 import 'package:file_transfer_flutter/shared/providers/p2p_presence_providers.dart';
@@ -67,7 +68,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   _buildTextField(
                     controller: _serverUrlController,
                     label: '服务端地址',
-                    hintText: '例如 http://192.168.1.10:3000',
+                    hintText: '例如 ${AppNetworkConfig.exampleLanServerUrl}',
                     keyboardType: TextInputType.url,
                     validator: _validateServerUrl,
                   ),
@@ -100,7 +101,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     },
                     contentPadding: EdgeInsets.zero,
                     title: const Text('自动上线'),
-                    subtitle: const Text('为后续自动连入信令层预留开关。'),
+                    subtitle: const Text('为后续自动接入信令层预留开关。'),
                   ),
                   const SizedBox(height: 20),
                   Wrap(
@@ -120,22 +121,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                             : const Icon(Icons.save_outlined),
                         label: Text(_saving ? '保存中...' : '保存配置'),
                       ),
-                      FilledButton.icon(
-                        onPressed: presence.isBusy ? null : _toggleOnlineState,
-                        icon: presence.isBusy
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : Icon(
-                                presence.isOnline
-                                    ? Icons.cloud_off_outlined
-                                    : Icons.cloud_done_outlined,
-                              ),
-                        label: Text(_presenceActionLabel(presence)),
-                      ),
                     ],
                   ),
                 ],
@@ -144,7 +129,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             const SizedBox(height: 16),
             SectionCard(
               title: '信令在线状态',
-              subtitle: '这里展示 /signaling 的连接、注册和在线广播同步结果。',
+              subtitle: '这里只展示 /signaling 的连接、注册和在线广播同步结果。',
               child: Column(
                 children: <Widget>[
                   _InfoRow(
@@ -159,10 +144,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     value:
                         '${presence.devicesExcludingSelf(config.deviceId).length}',
                   ),
-                  _InfoRow(
-                    label: 'Socket ID',
-                    value: presence.socketId ?? '-',
-                  ),
+                  _InfoRow(label: 'Socket ID', value: presence.socketId ?? '-'),
                   _InfoRow(
                     label: '最近心跳',
                     value:
@@ -184,7 +166,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   _InfoRow(label: '设备名称', value: config.deviceName),
                   _InfoRow(label: '保存目录', value: config.downloadDirectory),
                   _InfoRow(
-                      label: '自动上线', value: config.autoOnline ? '开启' : '关闭'),
+                    label: '自动上线',
+                    value: config.autoOnline ? '开启' : '关闭',
+                  ),
                   _InfoRow(label: '平台', value: _platformLabel),
                 ],
               ),
@@ -319,30 +303,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       );
   }
 
-  Future<void> _toggleOnlineState() async {
-    final presenceNotifier = ref.read(p2pPresenceProvider.notifier);
-    final presence = ref.read(p2pPresenceProvider);
-    if (presence.isOnline) {
-      await presenceNotifier.goOffline();
-      if (!mounted) {
-        return;
-      }
-      _showSnackBar('已下线');
-      return;
-    }
-
-    final AppConfig? savedConfig = await _saveConfig(showFeedback: false);
-    if (savedConfig == null) {
-      return;
-    }
-
-    await presenceNotifier.goOnline();
-    if (!mounted) {
-      return;
-    }
-    _showSnackBar('正在连接信令服务...');
-  }
-
   Future<AppConfig?> _saveConfig({bool showFeedback = true}) async {
     final FormState? form = _formKey.currentState;
     if (form == null || !form.validate()) {
@@ -375,7 +335,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       return savedConfig;
     } catch (error) {
       if (mounted) {
-        _showSnackBar('保存失败：$error');
+        _showSnackBar('保存失败: $error');
       }
       return null;
     } finally {
@@ -436,15 +396,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     }
 
     return null;
-  }
-
-  String _presenceActionLabel(P2pPresenceState presence) {
-    return switch (presence.status) {
-      SignalingPresenceStatus.offline => '上线',
-      SignalingPresenceStatus.connecting => '连接中...',
-      SignalingPresenceStatus.registering => '注册中...',
-      SignalingPresenceStatus.online => '下线',
-    };
   }
 
   String _presenceStatusLabel(P2pPresenceState presence) {

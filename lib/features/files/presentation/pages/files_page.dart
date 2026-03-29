@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/error/app_exception.dart';
 import 'package:file_transfer_flutter/core/models/cloud_file.dart';
 import 'package:file_transfer_flutter/core/models/file_storage_limits.dart';
@@ -604,6 +605,7 @@ class _FilesPageState extends ConsumerState<FilesPage> {
 
   @override
   Widget build(BuildContext context) {
+    final AppConfig config = ref.watch(appConfigProvider);
     final Widget content = RefreshIndicator(
       onRefresh: _refreshPage,
       child: ListView(
@@ -634,7 +636,8 @@ class _FilesPageState extends ConsumerState<FilesPage> {
 
                 if (snapshot.hasError) {
                   return _ErrorState(
-                    message: '加载文件列表失败，请确认 192.168.5.86:3000 服务已启动，且手机可访问这台电脑。',
+                    message:
+                        '加载文件列表失败，请确认 ${config.serverUrl} 服务已启动，且手机可访问这台电脑。',
                     onRetry: _reloadFiles,
                   );
                 }

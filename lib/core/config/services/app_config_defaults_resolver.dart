@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/constants/app_constants.dart';
@@ -22,7 +23,7 @@ class AppConfigDefaultsResolver {
     final String downloadDirectory = await _resolveDownloadDirectory();
 
     return AppConfig(
-      serverUrl: 'http://127.0.0.1:3000',
+      serverUrl: AppNetworkConfig.defaultServerUrl,
       deviceId: _uuid.v4(),
       deviceName: deviceName,
       downloadDirectory: downloadDirectory,

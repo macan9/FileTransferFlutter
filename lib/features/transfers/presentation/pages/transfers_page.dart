@@ -31,10 +31,21 @@ class TransfersPage extends ConsumerWidget {
         ref.watch(p2pTransportStreamProvider);
     final P2pTransportState transport =
         transportAsync.value ?? const P2pTransportState.initial();
-    final List<P2pDevice> devices =
-        presence.devicesExcludingSelf(config.deviceId);
-    final List<ConnectionRequest> incomingRequests =
-        presence.incomingPendingRequests(config.deviceId);
+    final List<P2pDevice> onlineDevices = presence
+        .devicesExcludingSelf(config.deviceId)
+        .where((P2pDevice device) => device.status.isReachable)
+        .toList();
+    final List<ConnectionRequest> pendingRequests = presence
+        .requestsForDevice(config.deviceId)
+        .where(
+          (ConnectionRequest request) =>
+              request.status == ConnectionRequestStatus.pending,
+        )
+        .toList()
+      ..sort(
+        (ConnectionRequest a, ConnectionRequest b) =>
+            b.createdAt.compareTo(a.createdAt),
+      );
     final List<P2pSession> sessions =
         presence.sessionsForDevice(config.deviceId);
 
@@ -42,44 +53,35 @@ class TransfersPage extends ConsumerWidget {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: <Widget>[
+          _RealtimeHeader(
+            config: config,
+            presence: presence,
+            pendingRequests: pendingRequests,
+            onShowPendingRequests: () => _showPendingRequestsDialog(
+              context,
+              selfDeviceId: config.deviceId,
+              pendingRequests: pendingRequests,
+            ),
+          ),
+          const SizedBox(height: 16),
           SectionCard(
-            title: '连接请求',
-            subtitle: '发起互传、处理对端请求，并推进到可复用的 WebRTC 连接。',
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                _PresenceBanner(presence: presence),
-                const SizedBox(height: 16),
-                if (devices.isEmpty)
-                  const Text('当前没有其他在线设备，先让另一台客户端点击“上线”。')
-                else
-                  Column(
-                    children: devices
+            title: '在线设备',
+            subtitle: '这里展示当前可直接发起互传的在线设备，已有邀请会通过弹窗查看和处理。',
+            child: onlineDevices.isEmpty
+                ? _EmptyOnlineDevicesState(isOnline: presence.isOnline)
+                : Column(
+                    children: onlineDevices
                         .map(
                           (P2pDevice device) => _PeerActionTile(
                             device: device,
                             presence: presence,
                             selfDeviceId: config.deviceId,
-                          ),
-                        )
-                        .toList(),
-                  ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-          SectionCard(
-            title: '待处理请求',
-            subtitle: '这里只展示发给当前设备且仍处于 pending 的请求。',
-            child: incomingRequests.isEmpty
-                ? const Text('当前没有待处理的连接请求。')
-                : Column(
-                    children: incomingRequests
-                        .map(
-                          (ConnectionRequest request) => _RequestTile(
-                            request: request,
-                            selfDeviceId: config.deviceId,
-                            showActions: true,
+                            onShowRequestDialog: (ConnectionRequest request) =>
+                                _showSingleRequestDialog(
+                              context,
+                              selfDeviceId: config.deviceId,
+                              request: request,
+                            ),
                           ),
                         )
                         .toList(),
@@ -89,7 +91,7 @@ class TransfersPage extends ConsumerWidget {
           SectionCard(
             title: '活动会话',
             subtitle:
-                '同一条活动 session 会复用同一条 PeerConnection/DataChannel，支持后续双向多次互传。',
+                '同一条活动 session 会复用同一条 PeerConnection 和 DataChannel，支持后续双向多次互传，单文件上限 800MB。',
             child: sessions.isEmpty
                 ? const Text('当前还没有任何会话。')
                 : Column(
@@ -137,6 +139,80 @@ class TransfersPage extends ConsumerWidget {
     );
   }
 
+  Future<void> _showPendingRequestsDialog(
+    BuildContext context, {
+    required String selfDeviceId,
+    required List<ConnectionRequest> pendingRequests,
+  }) async {
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('待处理邀请'),
+          content: SizedBox(
+            width: 560,
+            child: pendingRequests.isEmpty
+                ? const SizedBox(
+                    height: 180,
+                    child: Center(
+                      child: Text('当前没有待处理的邀请或连接请求。'),
+                    ),
+                  )
+                : ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: pendingRequests.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (BuildContext context, int index) {
+                      final ConnectionRequest request = pendingRequests[index];
+                      return _RequestTile(
+                        request: request,
+                        selfDeviceId: selfDeviceId,
+                        showActions: true,
+                      );
+                    },
+                  ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('关闭'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showSingleRequestDialog(
+    BuildContext context, {
+    required String selfDeviceId,
+    required ConnectionRequest request,
+  }) async {
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('连接邀请'),
+          content: SizedBox(
+            width: 520,
+            child: _RequestTile(
+              request: request,
+              selfDeviceId: selfDeviceId,
+              showActions: true,
+              dense: true,
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('关闭'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Future<void> _showTransferRecordsDialog(
     BuildContext context,
     WidgetRef ref, {
@@ -171,10 +247,7 @@ class TransfersPage extends ConsumerWidget {
                   return SizedBox(
                     height: 180,
                     child: Center(
-                      child: Text(
-                        message,
-                        textAlign: TextAlign.center,
-                      ),
+                      child: Text(message, textAlign: TextAlign.center),
                     ),
                   );
                 }
@@ -235,11 +308,293 @@ class _PresenceBanner extends StatelessWidget {
         borderRadius: BorderRadius.circular(16),
       ),
       child: Text(
-        online ? '信令已上线，可以发起连接请求。' : '当前未上线，请先到设置页点击“上线”。',
+        online ? '信令已上线，可以发起连接请求。' : '当前未上线，请先点击“上线”。',
         style: theme.textTheme.bodyMedium?.copyWith(
           color: color,
           fontWeight: FontWeight.w600,
         ),
+      ),
+    );
+  }
+}
+
+class _RealtimeHeader extends ConsumerWidget {
+  const _RealtimeHeader({
+    required this.config,
+    required this.presence,
+    required this.pendingRequests,
+    required this.onShowPendingRequests,
+  });
+
+  final AppConfig config;
+  final P2pPresenceState presence;
+  final List<ConnectionRequest> pendingRequests;
+  final VoidCallback onShowPendingRequests;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final ThemeData theme = Theme.of(context);
+    final P2pDevice? currentDevice = presence.currentDevice;
+    final bool online = presence.isOnline;
+    final Color accent =
+        online ? const Color(0xFF15803D) : const Color(0xFFB42318);
+    final String deviceStatus = currentDevice?.status.value ?? 'offline';
+    final String deviceName =
+        currentDevice?.deviceName.trim().isNotEmpty == true
+            ? currentDevice!.deviceName
+            : config.deviceName;
+
+    return SectionCard(
+      title: '实时传输',
+      subtitle:
+          '上线后将连接 /signaling，进入设备发现、会话协商和双向互传链路。实时传输单文件上限 800MB，中断或超时会自动清理临时文件。',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          _PresenceBanner(presence: presence),
+          const SizedBox(height: 14),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: accent.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: accent.withValues(alpha: 0.25)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  deviceName,
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: accent,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: <Widget>[
+                    _InfoPill(
+                      label: '信令状态',
+                      value: _presenceStatusLabel(presence),
+                    ),
+                    _InfoPill(
+                      label: '设备状态',
+                      value: deviceStatus,
+                    ),
+                    _InfoPill(
+                      label: '设备 ID',
+                      value: config.deviceId,
+                    ),
+                  ],
+                ),
+                if (presence.lastError != null &&
+                    presence.lastError!.trim().isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 10),
+                  Text(
+                    presence.lastError!,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.error,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: <Widget>[
+              FilledButton.icon(
+                onPressed: presence.isBusy
+                    ? null
+                    : () => _toggleOnlineState(context, ref),
+                icon: presence.isBusy
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Icon(
+                        online
+                            ? Icons.cloud_off_outlined
+                            : Icons.cloud_done_outlined,
+                      ),
+                label: Text(_presenceActionLabel(presence)),
+              ),
+              OutlinedButton.icon(
+                onPressed: onShowPendingRequests,
+                icon: Stack(
+                  clipBehavior: Clip.none,
+                  children: <Widget>[
+                    const Icon(Icons.mark_email_unread_outlined),
+                    if (pendingRequests.isNotEmpty)
+                      Positioned(
+                        right: -6,
+                        top: -6,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 5,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.error,
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Text(
+                            '${pendingRequests.length}',
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: theme.colorScheme.onError,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                label: Text(
+                  pendingRequests.isEmpty
+                      ? '查看邀请'
+                      : '查看邀请 (${pendingRequests.length})',
+                ),
+              ),
+              Text(
+                '配置来自设置页，校验未通过时会先提示补全配置。',
+                style: theme.textTheme.bodySmall,
+              ),
+              Text(
+                '实时传输单文件上限 800MB，接收中断或超时后会自动清理残留 .part 文件。',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _toggleOnlineState(BuildContext context, WidgetRef ref) async {
+    final P2pPresenceController notifier =
+        ref.read(p2pPresenceProvider.notifier);
+    final P2pPresenceState latestPresence = ref.read(p2pPresenceProvider);
+    if (latestPresence.isOnline) {
+      await notifier.goOffline();
+      if (context.mounted) {
+        _showSnackBar(context, '已下线');
+      }
+      return;
+    }
+
+    final String? validationError = _validateConfig(config);
+    if (validationError != null) {
+      _showSnackBar(context, validationError);
+      return;
+    }
+
+    await notifier.goOnline();
+    if (context.mounted) {
+      _showSnackBar(context, '正在连接信令服务...');
+    }
+  }
+
+  String? _validateConfig(AppConfig config) {
+    final Uri? uri = Uri.tryParse(config.serverUrl.trim());
+    if (config.serverUrl.trim().isEmpty) {
+      return '请先到设置页填写服务端地址';
+    }
+    if (uri == null || !uri.hasScheme || uri.host.trim().isEmpty) {
+      return '服务端地址格式不正确，请先到设置页修正';
+    }
+    if (uri.scheme != 'http' && uri.scheme != 'https') {
+      return '服务端地址仅支持 http 或 https';
+    }
+    if (config.deviceName.trim().isEmpty) {
+      return '请先到设置页填写设备名称';
+    }
+    if (config.downloadDirectory.trim().isEmpty) {
+      return '请先到设置页选择本地保存目录';
+    }
+    return null;
+  }
+
+  void _showSnackBar(BuildContext context, String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+  }
+
+  String _presenceActionLabel(P2pPresenceState presence) {
+    return switch (presence.status) {
+      SignalingPresenceStatus.offline => '上线',
+      SignalingPresenceStatus.connecting => '连接中...',
+      SignalingPresenceStatus.registering => '注册中...',
+      SignalingPresenceStatus.online => '下线',
+    };
+  }
+
+  String _presenceStatusLabel(P2pPresenceState presence) {
+    return switch (presence.status) {
+      SignalingPresenceStatus.offline => '未上线',
+      SignalingPresenceStatus.connecting => '连接信令中',
+      SignalingPresenceStatus.registering => '注册设备中',
+      SignalingPresenceStatus.online => '在线',
+    };
+  }
+}
+
+class _EmptyOnlineDevicesState extends StatelessWidget {
+  const _EmptyOnlineDevicesState({required this.isOnline});
+
+  final bool isOnline;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 24),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLowest,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Column(
+        children: <Widget>[
+          Icon(
+            Icons.devices_other_outlined,
+            size: 40,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            '暂无在线设备',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            isOnline
+                ? '暂时没有发现其他在线客户端。让另一台设备先上线，随后就可以在这里发起互传。'
+                : '当前你还没有接入信令服务。先点击“上线”，在线设备出现后即可发起互传。',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -250,11 +605,13 @@ class _PeerActionTile extends ConsumerWidget {
     required this.device,
     required this.presence,
     required this.selfDeviceId,
+    required this.onShowRequestDialog,
   });
 
   final P2pDevice device;
   final P2pPresenceState presence;
   final String selfDeviceId;
+  final ValueChanged<ConnectionRequest> onShowRequestDialog;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -323,7 +680,7 @@ class _PeerActionTile extends ConsumerWidget {
               if (outgoingRequest != null)
                 _InfoPill(label: '请求', value: outgoingRequest.status.value),
               if (incomingRequest != null)
-                _InfoPill(label: '收到请求', value: incomingRequest.status.value),
+                _InfoPill(label: '收到邀请', value: incomingRequest.status.value),
             ],
           ),
           const SizedBox(height: 12),
@@ -353,34 +710,9 @@ class _PeerActionTile extends ConsumerWidget {
     if (incomingRequest != null) {
       return <Widget>[
         FilledButton.icon(
-          onPressed: () async {
-            await _runAction(
-              context,
-              () => ref
-                  .read(p2pPresenceProvider.notifier)
-                  .respondToConnectionRequest(
-                    requestId: incomingRequest.requestId,
-                    accepted: true,
-                  ),
-            );
-          },
-          icon: const Icon(Icons.check_circle_outline),
-          label: const Text('接受'),
-        ),
-        OutlinedButton.icon(
-          onPressed: () async {
-            await _runAction(
-              context,
-              () => ref
-                  .read(p2pPresenceProvider.notifier)
-                  .respondToConnectionRequest(
-                    requestId: incomingRequest.requestId,
-                    accepted: false,
-                  ),
-            );
-          },
-          icon: const Icon(Icons.close_rounded),
-          label: const Text('拒绝'),
+          onPressed: () => onShowRequestDialog(incomingRequest),
+          icon: const Icon(Icons.mark_email_read_outlined),
+          label: const Text('查看邀请'),
         ),
       ];
     }
@@ -400,16 +732,9 @@ class _PeerActionTile extends ConsumerWidget {
     if (outgoingRequest != null) {
       return <Widget>[
         OutlinedButton.icon(
-          onPressed: () async {
-            await _runAction(
-              context,
-              () => ref
-                  .read(p2pPresenceProvider.notifier)
-                  .cancelConnectionRequest(outgoingRequest.requestId),
-            );
-          },
+          onPressed: () => onShowRequestDialog(outgoingRequest),
           icon: const Icon(Icons.hourglass_top_rounded),
-          label: const Text('取消请求'),
+          label: const Text('查看请求'),
         ),
       ];
     }
@@ -485,17 +810,19 @@ class _RequestTile extends ConsumerWidget {
     required this.request,
     required this.selfDeviceId,
     required this.showActions,
+    this.dense = false,
   });
 
   final ConnectionRequest request;
   final String selfDeviceId;
   final bool showActions;
+  final bool dense;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final bool incoming = request.toDeviceId == selfDeviceId;
     return Container(
-      margin: const EdgeInsets.only(bottom: 12),
+      margin: dense ? EdgeInsets.zero : const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surfaceContainerLowest,
@@ -525,34 +852,82 @@ class _RequestTile extends ConsumerWidget {
             Wrap(
               spacing: 10,
               children: <Widget>[
-                FilledButton(
-                  onPressed: () async {
-                    await ref
-                        .read(p2pPresenceProvider.notifier)
-                        .respondToConnectionRequest(
-                          requestId: request.requestId,
-                          accepted: true,
-                        );
-                  },
-                  child: const Text('接受'),
-                ),
-                OutlinedButton(
-                  onPressed: () async {
-                    await ref
-                        .read(p2pPresenceProvider.notifier)
-                        .respondToConnectionRequest(
-                          requestId: request.requestId,
-                          accepted: false,
-                        );
-                  },
-                  child: const Text('拒绝'),
-                ),
+                if (incoming) ...<Widget>[
+                  FilledButton(
+                    onPressed: () async {
+                      await _runAction(
+                        context,
+                        () => ref
+                            .read(p2pPresenceProvider.notifier)
+                            .respondToConnectionRequest(
+                              requestId: request.requestId,
+                              accepted: true,
+                            ),
+                      );
+                    },
+                    child: const Text('接受'),
+                  ),
+                  OutlinedButton(
+                    onPressed: () async {
+                      await _runAction(
+                        context,
+                        () => ref
+                            .read(p2pPresenceProvider.notifier)
+                            .respondToConnectionRequest(
+                              requestId: request.requestId,
+                              accepted: false,
+                            ),
+                      );
+                    },
+                    child: const Text('拒绝'),
+                  ),
+                ] else ...<Widget>[
+                  OutlinedButton(
+                    onPressed: () async {
+                      await _runAction(
+                        context,
+                        () => ref
+                            .read(p2pPresenceProvider.notifier)
+                            .cancelConnectionRequest(request.requestId),
+                      );
+                    },
+                    child: const Text('取消请求'),
+                  ),
+                ],
               ],
             ),
           ],
         ],
       ),
     );
+  }
+
+  Future<void> _runAction(
+    BuildContext context,
+    Future<void> Function() action,
+  ) async {
+    final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
+    try {
+      await action();
+      if (context.mounted) {
+        Navigator.of(context).pop();
+      }
+    } on RealtimeError catch (error) {
+      _showMessage(messenger, error.message);
+    } catch (error) {
+      _showMessage(messenger, '$error');
+    }
+  }
+
+  void _showMessage(ScaffoldMessengerState messenger, String message) {
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
   }
 }
 
@@ -642,10 +1017,7 @@ class _SessionTile extends ConsumerWidget {
           ),
           if (outgoingTransfers.isNotEmpty) ...<Widget>[
             const SizedBox(height: 12),
-            Text(
-              '我发出的文件',
-              style: Theme.of(context).textTheme.titleSmall,
-            ),
+            Text('我发出的文件', style: Theme.of(context).textTheme.titleSmall),
             const SizedBox(height: 8),
             ...outgoingTransfers.map(
               (OutgoingTransferContext item) => _TransferProgressTile(
@@ -657,10 +1029,7 @@ class _SessionTile extends ConsumerWidget {
           ],
           if (incomingTransfers.isNotEmpty) ...<Widget>[
             const SizedBox(height: 12),
-            Text(
-              '我接收的文件',
-              style: Theme.of(context).textTheme.titleSmall,
-            ),
+            Text('我接收的文件', style: Theme.of(context).textTheme.titleSmall),
             const SizedBox(height: 8),
             ...incomingTransfers.map(
               (IncomingTransferContext item) => _TransferProgressTile(
@@ -759,10 +1128,7 @@ class _TransferProgressTile extends StatelessWidget {
           if (extra != null && extra!.trim().isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 2),
-              child: Text(
-                extra!,
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
+              child: Text(extra!, style: Theme.of(context).textTheme.bodySmall),
             ),
           const SizedBox(height: 6),
           LinearProgressIndicator(value: progress == 0 ? null : progress),
@@ -806,15 +1172,9 @@ class _TransferRecordTile extends StatelessWidget {
             style: theme.textTheme.bodySmall,
           ),
           const SizedBox(height: 4),
-          Text(
-            '会话 ${record.sessionId}',
-            style: theme.textTheme.bodySmall,
-          ),
+          Text('会话 ${record.sessionId}', style: theme.textTheme.bodySmall),
           const SizedBox(height: 2),
-          Text(
-            timeLabel,
-            style: theme.textTheme.bodySmall,
-          ),
+          Text(timeLabel, style: theme.textTheme.bodySmall),
           if (record.errorMessage != null &&
               record.errorMessage!.trim().isNotEmpty)
             Padding(
