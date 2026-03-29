@@ -6,6 +6,7 @@ import 'package:file_transfer_flutter/core/services/device_discovery_service.dar
 import 'package:file_transfer_flutter/core/services/file_repository.dart';
 import 'package:file_transfer_flutter/core/services/realtime_client_factory.dart';
 import 'package:file_transfer_flutter/core/services/transfer_service.dart';
+import 'package:file_transfer_flutter/core/services/transfer_record_service.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 final appConfigRepositoryProvider = Provider<AppConfigRepository>((Ref ref) {
@@ -45,6 +46,12 @@ final deviceDiscoveryServiceProvider =
 
 final transferServiceProvider = Provider<TransferService>((Ref ref) {
   return const MockTransferService();
+});
+
+final transferRecordServiceProvider =
+    Provider<TransferRecordService>((Ref ref) {
+  final AppConfig config = ref.watch(appConfigProvider);
+  return HttpTransferRecordService(baseUri: config.serverUri);
 });
 
 class AppConfigController extends Notifier<AppConfig> {

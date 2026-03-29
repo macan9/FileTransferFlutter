@@ -1,5 +1,8 @@
 import 'package:equatable/equatable.dart';
+import 'package:file_transfer_flutter/core/models/connection_request.dart';
 import 'package:file_transfer_flutter/core/models/p2p_device.dart';
+import 'package:file_transfer_flutter/core/models/p2p_session.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
 
 enum SignalingPresenceStatus {
   offline,
@@ -12,6 +15,8 @@ class P2pPresenceState extends Equatable {
   const P2pPresenceState({
     required this.status,
     required this.devices,
+    required this.connectionRequests,
+    required this.sessions,
     this.currentDevice,
     this.socketId,
     this.lastError,
@@ -22,6 +27,8 @@ class P2pPresenceState extends Equatable {
   const P2pPresenceState.initial()
       : status = SignalingPresenceStatus.offline,
         devices = const <P2pDevice>[],
+        connectionRequests = const <ConnectionRequest>[],
+        sessions = const <P2pSession>[],
         currentDevice = null,
         socketId = null,
         lastError = null,
@@ -30,6 +37,8 @@ class P2pPresenceState extends Equatable {
 
   final SignalingPresenceStatus status;
   final List<P2pDevice> devices;
+  final List<ConnectionRequest> connectionRequests;
+  final List<P2pSession> sessions;
   final P2pDevice? currentDevice;
   final String? socketId;
   final String? lastError;
@@ -51,9 +60,73 @@ class P2pPresenceState extends Equatable {
         .toList();
   }
 
+  List<ConnectionRequest> requestsForDevice(String deviceId) {
+    return connectionRequests.where((ConnectionRequest item) {
+      return item.fromDeviceId == deviceId || item.toDeviceId == deviceId;
+    }).toList();
+  }
+
+  List<ConnectionRequest> incomingPendingRequests(String selfDeviceId) {
+    return connectionRequests.where((ConnectionRequest item) {
+      return item.toDeviceId == selfDeviceId &&
+          item.status == ConnectionRequestStatus.pending;
+    }).toList()
+      ..sort(
+        (ConnectionRequest a, ConnectionRequest b) =>
+            b.createdAt.compareTo(a.createdAt),
+      );
+  }
+
+  ConnectionRequest? outgoingPendingRequestTo({
+    required String selfDeviceId,
+    required String peerDeviceId,
+  }) {
+    return _firstWhereOrNull(
+      connectionRequests,
+      (ConnectionRequest item) =>
+          item.fromDeviceId == selfDeviceId &&
+          item.toDeviceId == peerDeviceId &&
+          item.status == ConnectionRequestStatus.pending,
+    );
+  }
+
+  ConnectionRequest? incomingPendingRequestFrom({
+    required String selfDeviceId,
+    required String peerDeviceId,
+  }) {
+    return _firstWhereOrNull(
+      connectionRequests,
+      (ConnectionRequest item) =>
+          item.fromDeviceId == peerDeviceId &&
+          item.toDeviceId == selfDeviceId &&
+          item.status == ConnectionRequestStatus.pending,
+    );
+  }
+
+  P2pSession? activeSessionWith({
+    required String selfDeviceId,
+    required String peerDeviceId,
+  }) {
+    return _firstWhereOrNull(
+      sessions,
+      (P2pSession item) =>
+          item.involves(selfDeviceId) &&
+          item.involves(peerDeviceId) &&
+          item.status.isOpen,
+    );
+  }
+
+  List<P2pSession> sessionsForDevice(String deviceId) {
+    return sessions.where((P2pSession item) => item.involves(deviceId)).toList()
+      ..sort(
+          (P2pSession a, P2pSession b) => b.createdAt.compareTo(a.createdAt));
+  }
+
   P2pPresenceState copyWith({
     SignalingPresenceStatus? status,
     List<P2pDevice>? devices,
+    List<ConnectionRequest>? connectionRequests,
+    List<P2pSession>? sessions,
     P2pDevice? currentDevice,
     bool clearCurrentDevice = false,
     String? socketId,
@@ -68,6 +141,8 @@ class P2pPresenceState extends Equatable {
     return P2pPresenceState(
       status: status ?? this.status,
       devices: devices ?? this.devices,
+      connectionRequests: connectionRequests ?? this.connectionRequests,
+      sessions: sessions ?? this.sessions,
       currentDevice:
           clearCurrentDevice ? null : currentDevice ?? this.currentDevice,
       socketId: clearSocketId ? null : socketId ?? this.socketId,
@@ -84,10 +159,24 @@ class P2pPresenceState extends Equatable {
   List<Object?> get props => <Object?>[
         status,
         devices,
+        connectionRequests,
+        sessions,
         currentDevice,
         socketId,
         lastError,
         heartbeatTimeoutMs,
         lastHeartbeatAt,
       ];
+
+  static T? _firstWhereOrNull<T>(
+    List<T> items,
+    bool Function(T item) predicate,
+  ) {
+    for (final T item in items) {
+      if (predicate(item)) {
+        return item;
+      }
+    }
+    return null;
+  }
 }
