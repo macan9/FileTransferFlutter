@@ -1,21 +1,65 @@
+import 'package:file_transfer_flutter/core/config/models/app_config.dart';
+import 'package:file_transfer_flutter/core/config/services/app_config_repository.dart';
 import 'package:file_transfer_flutter/core/models/device_info.dart';
 import 'package:file_transfer_flutter/core/models/transfer_task.dart';
 import 'package:file_transfer_flutter/core/services/device_discovery_service.dart';
 import 'package:file_transfer_flutter/core/services/file_repository.dart';
+import 'package:file_transfer_flutter/core/services/realtime_client_factory.dart';
 import 'package:file_transfer_flutter/core/services/transfer_service.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-final fileRepositoryProvider = Provider<FileRepository>((Ref ref) {
-  return HttpFileRepository();
+final appConfigRepositoryProvider = Provider<AppConfigRepository>((Ref ref) {
+  throw UnimplementedError(
+      'AppConfigRepository must be overridden at startup.');
 });
 
-final deviceDiscoveryServiceProvider = Provider<DeviceDiscoveryService>((Ref ref) {
+final initialAppConfigProvider = Provider<AppConfig>((Ref ref) {
+  throw UnimplementedError('Initial AppConfig must be overridden at startup.');
+});
+
+final appConfigProvider =
+    NotifierProvider<AppConfigController, AppConfig>(AppConfigController.new);
+
+final realtimeSocketFactoryProvider =
+    Provider<RealtimeSocketFactory>((Ref ref) {
+  return const RealtimeSocketFactory();
+});
+
+final realtimePeerConnectionFactoryProvider =
+    Provider<RealtimePeerConnectionFactory>((Ref ref) {
+  return const RealtimePeerConnectionFactory();
+});
+
+final fileRepositoryProvider = Provider<FileRepository>((Ref ref) {
+  final AppConfig config = ref.watch(appConfigProvider);
+  return HttpFileRepository(
+    baseUri: config.serverUri,
+    downloadDirectory: config.downloadDirectory,
+  );
+});
+
+final deviceDiscoveryServiceProvider =
+    Provider<DeviceDiscoveryService>((Ref ref) {
   return const MockDeviceDiscoveryService();
 });
 
 final transferServiceProvider = Provider<TransferService>((Ref ref) {
   return const MockTransferService();
 });
+
+class AppConfigController extends Notifier<AppConfig> {
+  @override
+  AppConfig build() {
+    return ref.watch(initialAppConfigProvider);
+  }
+
+  Future<AppConfig> save(AppConfig nextConfig) async {
+    final AppConfig savedConfig =
+        await ref.read(appConfigRepositoryProvider).save(nextConfig);
+    state = savedConfig;
+    return savedConfig;
+  }
+}
 
 class MockDeviceDiscoveryService implements DeviceDiscoveryService {
   const MockDeviceDiscoveryService();

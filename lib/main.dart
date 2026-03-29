@@ -1,18 +1,30 @@
-
 import 'dart:io';
 
 import 'package:file_transfer_flutter/app/app.dart';
+import 'package:file_transfer_flutter/core/bootstrap/app_bootstrap.dart';
 import 'package:file_transfer_flutter/core/constants/app_constants.dart';
 import 'package:file_transfer_flutter/core/services/window_state_service.dart';
+import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:window_manager/window_manager.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  final AppBootstrap bootstrap = await AppBootstrap.initialize();
 
   if (!_isDesktopPlatform) {
-    runApp(const ProviderScope(child: FileTransferApp()));
+    runApp(
+      ProviderScope(
+        overrides: <Override>[
+          appConfigRepositoryProvider.overrideWithValue(
+            bootstrap.appConfigRepository,
+          ),
+          initialAppConfigProvider.overrideWithValue(bootstrap.initialConfig),
+        ],
+        child: const FileTransferApp(),
+      ),
+    );
     return;
   }
 
@@ -47,7 +59,17 @@ Future<void> main() async {
     await windowManager.focus();
   });
 
-  runApp(const ProviderScope(child: FileTransferApp()));
+  runApp(
+    ProviderScope(
+      overrides: <Override>[
+        appConfigRepositoryProvider.overrideWithValue(
+          bootstrap.appConfigRepository,
+        ),
+        initialAppConfigProvider.overrideWithValue(bootstrap.initialConfig),
+      ],
+      child: const FileTransferApp(),
+    ),
+  );
 }
 
 bool get _isDesktopPlatform =>

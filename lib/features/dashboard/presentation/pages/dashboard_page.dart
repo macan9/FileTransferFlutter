@@ -48,7 +48,7 @@ class DashboardPage extends ConsumerWidget {
           const SizedBox(height: 16),
           SectionCard(
             title: '最近文件',
-            subtitle: '后续可接入本地索引、收藏夹和最近访问记录',
+            subtitle: '后续可接入本地索引、收藏夹和最近访问记录。',
             child: recentFiles.when(
               data: (List<String> files) {
                 return Column(
@@ -74,32 +74,29 @@ class DashboardPage extends ConsumerWidget {
           const SizedBox(height: 16),
           SectionCard(
             title: '设备概览',
-            subtitle: '后续可接入 UDP 广播、mDNS 或自定义发现协议',
-            child: devices.when(
-              data: (items) {
-                final onlineCount = items.where((item) => item.isOnline).length;
-                return Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: _MetricTile(label: '在线设备', value: '$onlineCount'),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _MetricTile(label: '已发现设备', value: '${items.length}'),
-                    ),
-                  ],
-                );
-              },
-              loading: () => const LinearProgressIndicator(),
-              error: (Object error, StackTrace stackTrace) {
-                return Text('加载失败：$error');
-              },
+            subtitle: '这里已经接入全局信令在线状态，可看到其它客户端的上线结果。',
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  child: _MetricTile(
+                    label: '在线设备',
+                    value: '${devices.where((item) => item.isOnline).length}',
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _MetricTile(
+                    label: '已发现设备',
+                    value: '${devices.length}',
+                  ),
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 16),
           SectionCard(
             title: '传输状态',
-            subtitle: '后续可扩展上传、下载、局域网直传和任务调度',
+            subtitle: '后续可扩展上传、下载、局域网直传和任务调度。',
             child: transfers.when(
               data: (items) {
                 return Column(
@@ -140,7 +137,7 @@ class _MetricTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+    final ThemeData theme = Theme.of(context);
 
     return Container(
       padding: const EdgeInsets.all(16),

@@ -1,3 +1,5 @@
+// ignore_for_file: dead_code
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -8,6 +10,7 @@ import 'package:file_transfer_flutter/core/error/app_exception.dart';
 import 'package:file_transfer_flutter/core/models/cloud_file.dart';
 import 'package:file_transfer_flutter/core/models/file_storage_limits.dart';
 import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
 
 typedef TransferProgressCallback = void Function(double progress);
 
@@ -37,11 +40,14 @@ class HttpFileRepository implements FileRepository {
   HttpFileRepository({
     http.Client? client,
     Uri? baseUri,
+    required String downloadDirectory,
   })  : _client = client ?? http.Client(),
-        _baseUri = baseUri ?? Uri.parse('http://192.168.5.86:3000');
+        _baseUri = baseUri ?? Uri.parse('http://127.0.0.1:3000'),
+        _downloadDirectory = downloadDirectory;
 
   final http.Client _client;
   final Uri _baseUri;
+  final String _downloadDirectory;
 
   @override
   Future<List<String>> fetchRecentFiles() async {
@@ -168,6 +174,16 @@ class HttpFileRepository implements FileRepository {
     CloudFile file, {
     TransferProgressCallback? onProgress,
   }) async {
+    final Directory directory = Directory(_downloadDirectory);
+    if (!await directory.exists()) {
+      await directory.create(recursive: true);
+    }
+
+    final String targetPath = await _buildDownloadPath(
+      directory,
+      file.originalName,
+    );
+    return _downloadToPath(file, targetPath, onProgress: onProgress);
     final String? savePath = await FilePicker.platform.saveFile(
       dialogTitle: '保存文件',
       fileName: file.originalName,
@@ -226,6 +242,63 @@ class HttpFileRepository implements FileRepository {
 
   Uri _buildUri(String path) {
     return _baseUri.replace(path: path);
+  }
+
+  Future<String> _downloadToPath(
+    CloudFile file,
+    String savePath, {
+    TransferProgressCallback? onProgress,
+  }) async {
+    final http.StreamedResponse response = await _client.send(
+      http.Request('GET', _buildUri('/files/${file.id}/download')),
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      final http.Response normalizedResponse =
+          await http.Response.fromStream(response);
+      _ensureSuccess(normalizedResponse, fallbackMessage: '涓嬭浇鏂囦欢澶辫触');
+    }
+
+    final File targetFile = File(savePath);
+    final IOSink sink = targetFile.openWrite();
+    final int totalBytes = response.contentLength ?? file.size;
+    int receivedBytes = 0;
+
+    try {
+      await for (final List<int> chunk in response.stream) {
+        sink.add(chunk);
+        receivedBytes += chunk.length;
+        if (totalBytes > 0) {
+          onProgress?.call(
+            math.min(receivedBytes / totalBytes, 1).toDouble(),
+          );
+        }
+      }
+    } finally {
+      await sink.close();
+    }
+
+    onProgress?.call(1);
+    return targetFile.path;
+  }
+
+  Future<String> _buildDownloadPath(
+    Directory directory,
+    String originalFileName,
+  ) async {
+    final String sanitizedName =
+        originalFileName.trim().isEmpty ? 'download.bin' : originalFileName;
+    final String extension = p.extension(sanitizedName);
+    final String basename = p.basenameWithoutExtension(sanitizedName);
+    String candidate = p.join(directory.path, sanitizedName);
+    int index = 1;
+
+    while (await File(candidate).exists()) {
+      candidate = p.join(directory.path, '$basename ($index)$extension');
+      index += 1;
+    }
+
+    return candidate;
   }
 
   String _extractFileName(String filePath) {
