@@ -5,11 +5,13 @@ class SectionCard extends StatelessWidget {
     super.key,
     required this.title,
     this.subtitle,
+    this.titleAction,
     required this.child,
   });
 
   final String title;
   final String? subtitle;
+  final Widget? titleAction;
   final Widget child;
 
   @override
@@ -22,9 +24,20 @@ class SectionCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
-            Text(title, style: theme.textTheme.titleMedium),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: <Widget>[
+                Expanded(
+                  child: Text(title, style: theme.textTheme.titleMedium),
+                ),
+                if (titleAction != null) ...<Widget>[
+                  const SizedBox(width: 12),
+                  titleAction!,
+                ],
+              ],
+            ),
             if (subtitle != null) ...<Widget>[
-              const SizedBox(height: 6),
+              const SizedBox(height: 8),
               Text(
                 subtitle!,
                 style: theme.textTheme.bodyMedium?.copyWith(

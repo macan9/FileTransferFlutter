@@ -3,8 +3,6 @@ import 'dart:io';
 import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
-import 'package:file_transfer_flutter/core/constants/app_constants.dart';
-import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
@@ -80,24 +78,55 @@ class AppConfigDefaultsResolver {
   }
 
   Future<String> _resolveDownloadDirectory() async {
-    Directory? baseDirectory;
+    if (Platform.isAndroid) {
+      final Directory? androidDownloadDirectory =
+          await _resolveAndroidDownloadDirectory();
+      if (androidDownloadDirectory != null) {
+        return androidDownloadDirectory.path;
+      }
+    }
+
+    if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+      try {
+        final Directory? downloadsDirectory = await getDownloadsDirectory();
+        if (downloadsDirectory != null) {
+          return downloadsDirectory.path;
+        }
+      } catch (_) {
+        // Fall through to platform-specific fallback below.
+      }
+    }
+
+    if (Platform.isIOS) {
+      return (await getApplicationDocumentsDirectory()).path;
+    }
+
+    return (await getApplicationDocumentsDirectory()).path;
+  }
+
+  Future<Directory?> _resolveAndroidDownloadDirectory() async {
+    final List<String> candidates = <String>[
+      '/storage/emulated/0/Download',
+      '/sdcard/Download',
+    ];
+
+    for (final String candidate in candidates) {
+      final Directory directory = Directory(candidate);
+      if (await directory.exists()) {
+        return directory;
+      }
+    }
 
     try {
-      baseDirectory = await getDownloadsDirectory();
+      final Directory? downloadsDirectory = await getDownloadsDirectory();
+      if (downloadsDirectory != null) {
+        return downloadsDirectory;
+      }
     } catch (_) {
-      baseDirectory = null;
+      // Ignore and fall back to app documents directory.
     }
 
-    baseDirectory ??= await getApplicationDocumentsDirectory();
-
-    final Directory targetDirectory = Directory(
-      p.join(baseDirectory.path, AppConstants.downloadFolderName),
-    );
-    if (!await targetDirectory.exists()) {
-      await targetDirectory.create(recursive: true);
-    }
-
-    return targetDirectory.path;
+    return null;
   }
 
   String _nonEmptyOrFallback(String? value, {required String fallback}) {

@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
-
 import 'package:file_transfer_flutter/core/models/incoming_transfer_context.dart';
 import 'package:file_transfer_flutter/core/models/outgoing_transfer_context.dart';
 import 'package:file_transfer_flutter/core/models/p2p_session.dart';
@@ -11,6 +9,7 @@ import 'package:file_transfer_flutter/core/models/p2p_transport_state.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:file_transfer_flutter/core/models/transfer_record.dart';
 import 'package:file_transfer_flutter/core/services/realtime_client_factory.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:path/path.dart' as p;
 import 'package:socket_io_client/socket_io_client.dart' as io;
@@ -26,6 +25,7 @@ class P2pTransportService {
   static const int chunkSize = 16 * 1024;
   static const int maxFileSizeBytes = 800 * 1024 * 1024;
   static const Duration incomingTransferTimeout = Duration(minutes: 2);
+  static const Duration fileMetaAckTimeout = Duration(seconds: 10);
   static const String _defaultChannelLabel = 'file-transfer';
 
   final RealtimePeerConnectionFactory _peerConnectionFactory;
@@ -35,6 +35,8 @@ class P2pTransportService {
   final Map<String, _PeerLink> _links = <String, _PeerLink>{};
   final Map<String, _IncomingBuffer> _incomingBuffers =
       <String, _IncomingBuffer>{};
+  final Map<String, Completer<void>> _fileMetaAckWaiters =
+      <String, Completer<void>>{};
 
   P2pTransportState _state = const P2pTransportState.initial();
   io.Socket? _socket;
@@ -49,12 +51,18 @@ class P2pTransportService {
     required String selfDeviceId,
     required String downloadDirectory,
   }) async {
+    _log(
+      'attach self=$selfDeviceId downloadDirectory=$downloadDirectory socketId=${socket.id}',
+    );
     _socket = socket;
     _selfDeviceId = selfDeviceId;
     _downloadDirectory = downloadDirectory;
   }
 
   Future<void> detach() async {
+    _log(
+      'detach start links=${_links.length} incomingBuffers=${_incomingBuffers.length}',
+    );
     _socket = null;
     _selfDeviceId = null;
     _downloadDirectory = null;
@@ -66,6 +74,8 @@ class P2pTransportService {
     }
     _links.clear();
     _incomingBuffers.clear();
+    _fileMetaAckWaiters.clear();
+    _log('detach done');
     _emit(const P2pTransportState.initial());
   }
 
@@ -76,6 +86,7 @@ class P2pTransportService {
 
   Future<void> syncSessions(List<P2pSession> sessions) async {
     final String selfDeviceId = _requireSelfDeviceId();
+    _log('syncSessions start self=$selfDeviceId count=${sessions.length}');
     final Set<String> nextIds =
         sessions.map((P2pSession s) => s.sessionId).toSet();
 
@@ -87,7 +98,11 @@ class P2pTransportService {
     }
 
     for (final P2pSession session in sessions) {
+      _log(
+        'syncSessions visit session=${session.sessionId} status=${session.status.value} peer=${session.peerDeviceIdOf(selfDeviceId)} createdBy=${session.createdByDeviceId}',
+      );
       if (session.status.isTerminal) {
+        _log('syncSessions dispose terminal session=${session.sessionId}');
         await _disposeLink(session.sessionId);
         continue;
       }
@@ -101,27 +116,42 @@ class P2pTransportService {
       if (session.status == P2pSessionStatus.connecting &&
           session.createdByDeviceId == selfDeviceId &&
           !link.negotiationStarted) {
+        _log('syncSessions createOffer session=${session.sessionId}');
         await _createOffer(link);
       }
     }
 
+    _log('syncSessions complete activeLinks=${_links.length}');
     _refreshSessionTransports();
   }
 
   Future<void> handleRemoteOffer(Map<String, dynamic> payload) async {
-    final _PeerLink link =
-        await _findLinkByPeer(_extractTargetDeviceId(payload));
+    final String targetDeviceId = _extractTargetDeviceId(payload);
+    _log('handleRemoteOffer target=$targetDeviceId');
+    final _PeerLink link = await _findLinkByPeer(targetDeviceId);
     final Map<String, dynamic> offer = _normalizeMap(payload['offer']);
+    _log(
+      'handleRemoteOffer setRemoteDescription session=${link.session.sessionId} type=${offer["type"]}',
+    );
+    _log(
+        'handleRemoteOffer before setRemoteDescription session=${link.session.sessionId}');
     await link.peerConnection.setRemoteDescription(
       RTCSessionDescription(
         offer['sdp']?.toString(),
         offer['type']?.toString() ?? 'offer',
       ),
     );
+    _log(
+        'handleRemoteOffer after setRemoteDescription session=${link.session.sessionId}');
 
     final RTCSessionDescription answer =
         await link.peerConnection.createAnswer(<String, dynamic>{});
+    _log('handleRemoteOffer createAnswer session=${link.session.sessionId}');
+    _log(
+        'handleRemoteOffer before setLocalDescription session=${link.session.sessionId}');
     await link.peerConnection.setLocalDescription(answer);
+    _log(
+        'handleRemoteOffer after setLocalDescription session=${link.session.sessionId}');
     link.negotiationStarted = true;
     _refreshSessionTransports();
     _emitSignaling(
@@ -137,21 +167,33 @@ class P2pTransportService {
   }
 
   Future<void> handleRemoteAnswer(Map<String, dynamic> payload) async {
-    final _PeerLink link =
-        await _findLinkByPeer(_extractTargetDeviceId(payload));
+    final String targetDeviceId = _extractTargetDeviceId(payload);
+    _log('handleRemoteAnswer target=$targetDeviceId');
+    final _PeerLink link = await _findLinkByPeer(targetDeviceId);
     final Map<String, dynamic> answer = _normalizeMap(payload['answer']);
+    _log(
+      'handleRemoteAnswer setRemoteDescription session=${link.session.sessionId} type=${answer["type"]}',
+    );
+    _log(
+        'handleRemoteAnswer before setRemoteDescription session=${link.session.sessionId}');
     await link.peerConnection.setRemoteDescription(
       RTCSessionDescription(
         answer['sdp']?.toString(),
         answer['type']?.toString() ?? 'answer',
       ),
     );
+    _log(
+        'handleRemoteAnswer after setRemoteDescription session=${link.session.sessionId}');
   }
 
   Future<void> handleRemoteCandidate(Map<String, dynamic> payload) async {
-    final _PeerLink link =
-        await _findLinkByPeer(_extractTargetDeviceId(payload));
+    final String targetDeviceId = _extractTargetDeviceId(payload);
+    _log('handleRemoteCandidate target=$targetDeviceId');
+    final _PeerLink link = await _findLinkByPeer(targetDeviceId);
     final Map<String, dynamic> candidate = _normalizeMap(payload['candidate']);
+    _log(
+      'handleRemoteCandidate addCandidate session=${link.session.sessionId} sdpMid=${candidate["sdpMid"]} sdpMLineIndex=${candidate["sdpMLineIndex"]}',
+    );
     await link.peerConnection.addCandidate(
       RTCIceCandidate(
         candidate['candidate']?.toString(),
@@ -218,6 +260,7 @@ class P2pTransportService {
         createdAt: DateTime.now(),
       );
       _upsertOutgoing(context);
+      final Future<void> metaAckFuture = _waitForFileMetaAck(transferId);
 
       await _sendJsonMessage(
         link,
@@ -231,6 +274,7 @@ class P2pTransportService {
           'totalChunks': totalChunks,
         },
       );
+      await metaAckFuture;
 
       await _emitTransferProgress(transferId: transferId, status: 'sending');
       context = context.copyWith(
@@ -289,9 +333,12 @@ class P2pTransportService {
   Future<_PeerLink> _ensureLink(P2pSession session, String peerDeviceId) async {
     final _PeerLink? existing = _links[session.sessionId];
     if (existing != null) {
+      _log('ensureLink reuse session=${session.sessionId} peer=$peerDeviceId');
       return existing;
     }
 
+    _log(
+        'ensureLink createPeerConnection session=${session.sessionId} peer=$peerDeviceId');
     final RTCPeerConnection peerConnection =
         await _peerConnectionFactory.create(
       iceServers: const <Map<String, dynamic>>[
@@ -307,18 +354,30 @@ class P2pTransportService {
     );
     _links[session.sessionId] = link;
     _bindPeerConnection(link);
+    _log('ensureLink created session=${session.sessionId}');
     return link;
   }
 
   Future<void> _createOffer(_PeerLink link) async {
+    _log(
+        'createOffer start session=${link.session.sessionId} peer=${link.peerDeviceId}');
     final RTCDataChannel channel = await _ensureDataChannel(
       link,
       createIfMissing: true,
     );
     _bindDataChannel(link, channel);
+    _log(
+      'createOffer dataChannel label=${channel.label} state=${channel.state?.name ?? 'null'}',
+    );
     final RTCSessionDescription offer =
         await link.peerConnection.createOffer(<String, dynamic>{});
+    _log(
+        'createOffer created type=${offer.type} session=${link.session.sessionId}');
+    _log(
+        'createOffer before setLocalDescription session=${link.session.sessionId}');
     await link.peerConnection.setLocalDescription(offer);
+    _log(
+        'createOffer after setLocalDescription session=${link.session.sessionId}');
     link.negotiationStarted = true;
     _refreshSessionTransports();
     _emitSignaling(
@@ -336,8 +395,12 @@ class P2pTransportService {
   void _bindPeerConnection(_PeerLink link) {
     link.peerConnection.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate.candidate == null) {
+        _log('onIceCandidate null-candidate session=${link.session.sessionId}');
         return;
       }
+      _log(
+        'onIceCandidate session=${link.session.sessionId} sdpMid=${candidate.sdpMid} sdpMLineIndex=${candidate.sdpMLineIndex}',
+      );
       _emitSignaling(
         'client:candidate',
         <String, dynamic>{
@@ -352,10 +415,15 @@ class P2pTransportService {
     };
 
     link.peerConnection.onDataChannel = (RTCDataChannel channel) {
+      _log(
+        'onDataChannel session=${link.session.sessionId} label=${channel.label}',
+      );
       _bindDataChannel(link, channel);
     };
 
     link.peerConnection.onConnectionState = (RTCPeerConnectionState state) {
+      _log(
+          'onConnectionState session=${link.session.sessionId} state=${state.name}');
       switch (state) {
         case RTCPeerConnectionState.RTCPeerConnectionStateConnected:
           link.linkStatus = TransportLinkStatus.connected;
@@ -394,6 +462,9 @@ class P2pTransportService {
   }) async {
     final RTCDataChannel? existing = link.dataChannel;
     if (existing != null) {
+      _log(
+        'ensureDataChannel reuse session=${link.session.sessionId} state=${existing.state?.name ?? 'null'}',
+      );
       return existing;
     }
     if (!createIfMissing) {
@@ -405,6 +476,7 @@ class P2pTransportService {
     final RTCDataChannelInit init = RTCDataChannelInit()
       ..ordered = true
       ..maxRetransmits = -1;
+    _log('ensureDataChannel create session=${link.session.sessionId}');
     final RTCDataChannel channel =
         await link.peerConnection.createDataChannel(_defaultChannelLabel, init);
     link.dataChannel = channel;
@@ -416,8 +488,13 @@ class P2pTransportService {
     link.dataChannelLabel = channel.label;
     link.dataChannelOpen =
         channel.state == RTCDataChannelState.RTCDataChannelOpen;
+    _log(
+      'bindDataChannel session=${link.session.sessionId} label=${channel.label} initialState=${channel.state?.name ?? 'null'}',
+    );
 
     channel.onDataChannelState = (RTCDataChannelState state) {
+      _log(
+          'onDataChannelState session=${link.session.sessionId} state=${state.name}');
       link.dataChannelOpen = state == RTCDataChannelState.RTCDataChannelOpen;
       if (link.dataChannelOpen) {
         link.linkStatus = TransportLinkStatus.connected;
@@ -428,17 +505,31 @@ class P2pTransportService {
       _refreshSessionTransports();
     };
 
-    channel.onMessage = (RTCDataChannelMessage message) async {
+    channel.onMessage = (RTCDataChannelMessage message) {
+      _enqueueDataChannelMessage(link, message);
+    };
+
+    _refreshSessionTransports();
+  }
+
+  void _enqueueDataChannelMessage(
+    _PeerLink link,
+    RTCDataChannelMessage message,
+  ) {
+    link.messageQueue = link.messageQueue.then((_) async {
       try {
+        _log(
+          'onDataChannelMessage session=${link.session.sessionId} binary=${message.isBinary}',
+        );
         await _handleDataChannelMessage(link, message);
       } catch (error) {
+        _log(
+            'onDataChannelMessage error session=${link.session.sessionId} error=$error');
         link.lastError = '$error';
         _emit(_state.copyWith(lastError: '$error'));
         _refreshSessionTransports();
       }
-    };
-
-    _refreshSessionTransports();
+    });
   }
 
   Future<void> _handleDataChannelMessage(
@@ -446,6 +537,7 @@ class P2pTransportService {
     RTCDataChannelMessage message,
   ) async {
     if (message.isBinary) {
+      _log('handleDataChannelMessage binary session=${link.session.sessionId}');
       final _IncomingBuffer? buffer = _incomingBuffers.values
           .where((item) =>
               item.sessionId == link.session.sessionId && !item.completed)
@@ -482,9 +574,15 @@ class P2pTransportService {
 
     final Map<String, dynamic> json =
         jsonDecode(message.text) as Map<String, dynamic>;
+    _log(
+      'handleDataChannelMessage text session=${link.session.sessionId} type=${json['type']}',
+    );
     switch (json['type']?.toString() ?? '') {
       case 'file-meta':
         await _handleFileMeta(link, json);
+        return;
+      case 'file-meta-ack':
+        _handleFileMetaAck(json);
         return;
       case 'file-complete':
         await _handleFileComplete(link, json);
@@ -502,6 +600,9 @@ class P2pTransportService {
     Map<String, dynamic> json,
   ) async {
     final String transferId = json['transferId']?.toString() ?? _uuid.v4();
+    _log(
+      'handleFileMeta session=${link.session.sessionId} transferId=$transferId file=${json['fileName']}',
+    );
     final String downloadDirectory = _requireDownloadDirectory();
     final int fileSize = (json['fileSize'] as num?)?.toInt() ?? 0;
     if (fileSize > maxFileSizeBytes) {
@@ -541,6 +642,13 @@ class P2pTransportService {
       incomingTransferTimeout,
       () => _handleIncomingBufferTimeout(transferId),
     );
+    await _sendJsonMessage(
+      link,
+      <String, dynamic>{
+        'type': 'file-meta-ack',
+        'transferId': transferId,
+      },
+    );
     _upsertIncoming(context);
     await _emitTransferProgress(transferId: transferId, status: 'receiving');
   }
@@ -550,6 +658,9 @@ class P2pTransportService {
     Map<String, dynamic> json,
   ) async {
     final String transferId = json['transferId']?.toString() ?? '';
+    _log(
+      'handleFileComplete session=${link.session.sessionId} transferId=$transferId',
+    );
     final _IncomingBuffer? buffer = _incomingBuffers[transferId];
     if (buffer == null) {
       return;
@@ -618,6 +729,7 @@ class P2pTransportService {
 
   Future<void> _handleFileReceivedAck(Map<String, dynamic> json) async {
     final String transferId = json['transferId']?.toString() ?? '';
+    _log('handleFileReceivedAck transferId=$transferId');
     final OutgoingTransferContext? current =
         _state.outgoingByTransferId(transferId);
     if (current == null) {
@@ -634,7 +746,35 @@ class P2pTransportService {
     await _emitTransferComplete(transferId);
   }
 
+  Future<void> _waitForFileMetaAck(String transferId) async {
+    final Completer<void> completer = Completer<void>();
+    _fileMetaAckWaiters[transferId] = completer;
+    try {
+      await completer.future.timeout(
+        fileMetaAckTimeout,
+        onTimeout: () => throw RealtimeError(
+          'Timed out waiting for receiver to prepare incoming file buffer.',
+        ),
+      );
+    } finally {
+      final Completer<void>? current = _fileMetaAckWaiters[transferId];
+      if (identical(current, completer)) {
+        _fileMetaAckWaiters.remove(transferId);
+      }
+    }
+  }
+
+  void _handleFileMetaAck(Map<String, dynamic> json) {
+    final String transferId = json['transferId']?.toString() ?? '';
+    _log('handleFileMetaAck transferId=$transferId');
+    final Completer<void>? completer = _fileMetaAckWaiters.remove(transferId);
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
+    }
+  }
+
   Future<void> _ensureChannelOpen(_PeerLink link) async {
+    _log('ensureChannelOpen session=${link.session.sessionId}');
     final RTCDataChannel channel = await _ensureDataChannel(
       link,
       createIfMissing: link.session.createdByDeviceId == _requireSelfDeviceId(),
@@ -658,6 +798,9 @@ class P2pTransportService {
     required int fileSize,
     required String mimeType,
   }) async {
+    _log(
+      'createTransferRecord session=${session.sessionId} receiver=$receiverDeviceId file=$fileName size=$fileSize',
+    );
     final Completer<String> completer = Completer<String>();
     socket.emitWithAck(
       'client:transfer-start',
@@ -730,6 +873,7 @@ class P2pTransportService {
   }
 
   void _emitSignaling(String event, Map<String, dynamic> payload) {
+    _log('emitSignaling event=$event keys=${payload.keys.join(',')}');
     _requireSocket().emit(event, payload);
   }
 
@@ -737,6 +881,9 @@ class P2pTransportService {
     _PeerLink link,
     Map<String, dynamic> payload,
   ) async {
+    _log(
+      'sendJsonMessage session=${link.session.sessionId} type=${payload['type']}',
+    );
     final RTCDataChannel channel = link.dataChannel ??
         (throw const RealtimeError(
             'No DataChannel available for this session.'));
@@ -744,6 +891,8 @@ class P2pTransportService {
   }
 
   Future<void> _sendBinaryMessage(_PeerLink link, Uint8List bytes) async {
+    _log(
+        'sendBinaryMessage session=${link.session.sessionId} bytes=${bytes.length}');
     final RTCDataChannel channel = link.dataChannel ??
         (throw const RealtimeError(
             'No DataChannel available for this session.'));
@@ -853,6 +1002,7 @@ class P2pTransportService {
     if (link == null) {
       return;
     }
+    _log('disposeLink session=$sessionId');
     await _cleanupIncomingBuffersForSession(
       sessionId,
       errorMessage: '会话已关闭，未完成的文件接收已清理。',
@@ -1100,6 +1250,10 @@ class P2pTransportService {
     }
     return json['message']?.toString() ?? json['error']?.toString();
   }
+
+  void _log(String message) {
+    debugPrint('[P2P/TRANSPORT] $message');
+  }
 }
 
 class _PeerLink {
@@ -1118,6 +1272,7 @@ class _PeerLink {
   bool negotiationStarted = false;
   TransportLinkStatus linkStatus = TransportLinkStatus.idle;
   String? lastError;
+  Future<void> messageQueue = Future<void>.value();
 
   Future<void> dispose() async {
     await dataChannel?.close();

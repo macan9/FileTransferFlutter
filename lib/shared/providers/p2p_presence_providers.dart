@@ -9,6 +9,7 @@ import 'package:file_transfer_flutter/core/models/p2p_presence_state.dart';
 import 'package:file_transfer_flutter/core/models/p2p_session.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:file_transfer_flutter/core/services/realtime_client_factory.dart';
+import 'package:flutter/foundation.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:file_transfer_flutter/shared/providers/p2p_transport_providers.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -32,7 +33,10 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
 
   Future<void> goOnline() async {
     final AppConfig config = ref.read(appConfigProvider);
+    _log(
+        'goOnline start deviceId=${config.deviceId} server=${config.serverUrl}');
     if (state.isBusy) {
+      _log('goOnline ignored busy status=${state.status.name}');
       return;
     }
 
@@ -57,6 +61,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     _socket = socket;
 
     _bindSocket(socket, config);
+    _log('socket.connect namespace=/signaling');
     socket.connect();
   }
 
@@ -132,6 +137,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
 
   void _bindSocket(io.Socket socket, AppConfig config) {
     socket.onConnect((_) {
+      _log('socket.onConnect socketId=${socket.id}');
       state = state.copyWith(
         status: SignalingPresenceStatus.registering,
         socketId: socket.id,
@@ -141,6 +147,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     });
 
     socket.onDisconnect((dynamic _) {
+      _log('socket.onDisconnect manual=$_manuallyOffline');
       _stopHeartbeat();
       if (_manuallyOffline) {
         return;
@@ -153,10 +160,12 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     });
 
     socket.onConnectError((dynamic error) {
+      _log('socket.onConnectError error=$error');
       _handleSocketError('连接信令服务失败: $error');
     });
 
     socket.onError((dynamic error) {
+      _log('socket.onError error=$error');
       _handleSocketError('信令服务异常: $error');
     });
 
@@ -177,6 +186,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
 
     socket.on('server:online-list', (dynamic payload) {
       final List<P2pDevice> devices = _extractDeviceList(payload);
+      _log('server:online-list count=${devices.length}');
       _replaceOnlineDevices(devices, selfDeviceId: config.deviceId);
     });
 
@@ -204,6 +214,9 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     socket.on('server:connection-request', (dynamic payload) {
       final ConnectionRequest? request = _extractConnectionRequest(payload);
       if (request != null) {
+        _log(
+          'server:connection-request requestId=${request.requestId} from=${request.fromDeviceId} to=${request.toDeviceId} status=${request.status.value}',
+        );
         _upsertConnectionRequest(request);
       }
     });
@@ -211,6 +224,9 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     socket.on('server:connection-request-updated', (dynamic payload) {
       final ConnectionRequest? request = _extractConnectionRequest(payload);
       if (request != null) {
+        _log(
+          'server:connection-request-updated requestId=${request.requestId} status=${request.status.value}',
+        );
         _upsertConnectionRequest(request);
       }
     });
@@ -218,6 +234,9 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     socket.on('server:session-updated', (dynamic payload) {
       final P2pSession? session = _extractSession(payload);
       if (session != null) {
+        _log(
+          'server:session-updated sessionId=${session.sessionId} status=${session.status.value} createdBy=${session.createdByDeviceId}',
+        );
         _upsertSession(session);
         unawaited(_syncTransportSessions());
       }
@@ -233,6 +252,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     socket.on('server:offer', (dynamic payload) {
       final Map<String, dynamic>? json = _asMap(payload);
       if (json != null) {
+        _log('server:offer payloadKeys=${json.keys.join(',')}');
         unawaited(
             ref.read(p2pTransportServiceProvider).handleRemoteOffer(json));
       }
@@ -241,6 +261,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     socket.on('server:answer', (dynamic payload) {
       final Map<String, dynamic>? json = _asMap(payload);
       if (json != null) {
+        _log('server:answer payloadKeys=${json.keys.join(',')}');
         unawaited(
             ref.read(p2pTransportServiceProvider).handleRemoteAnswer(json));
       }
@@ -249,6 +270,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     socket.on('server:candidate', (dynamic payload) {
       final Map<String, dynamic>? json = _asMap(payload);
       if (json != null) {
+        _log('server:candidate payloadKeys=${json.keys.join(',')}');
         unawaited(
           ref.read(p2pTransportServiceProvider).handleRemoteCandidate(json),
         );
@@ -257,6 +279,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
   }
 
   void _register(AppConfig config, io.Socket socket) {
+    _log('register emit deviceId=${config.deviceId} name=${config.deviceName}');
     socket.emitWithAck(
       'client:register',
       <String, dynamic>{
@@ -267,6 +290,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
       ack: (dynamic response) {
         final Map<String, dynamic>? json = _asMap(response);
         final bool success = json?['success'] == true;
+        _log('register ack success=$success raw=$json');
         if (!success) {
           final String message = json?['message']?.toString() ?? '设备注册失败';
           _handleSocketError(message);
@@ -296,6 +320,9 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
                 selfDeviceId: config.deviceId,
                 downloadDirectory: config.downloadDirectory,
               ),
+        );
+        _log(
+          'presence online current=${self?.deviceId} onlineUsers=${onlineUsers.length}',
         );
         unawaited(_syncTransportSessions());
         _startHeartbeat(socket);
@@ -382,10 +409,17 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
 
   Future<void> _syncTransportSessions() async {
     try {
+      _log('syncTransportSessions start count=${state.sessions.length}');
       await ref.read(p2pTransportServiceProvider).syncSessions(state.sessions);
+      _log('syncTransportSessions done');
     } catch (error) {
+      _log('syncTransportSessions error=$error');
       _setLastError('$error');
     }
+  }
+
+  void _log(String message) {
+    debugPrint('[P2P/PRESENCE] $message');
   }
 
   void _replaceOnlineDevices(
@@ -411,7 +445,9 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     byId[device.deviceId] = device;
 
     final P2pDevice? currentDevice =
-        device.deviceId == selfDeviceId ? device : state.currentDevice;
+        device.deviceId == selfDeviceId && state.isOnline
+            ? device
+            : state.currentDevice;
 
     state = state.copyWith(
       currentDevice: currentDevice,

@@ -1,6 +1,6 @@
 {
-    "name": "file_transfer_flutter",
-    "short_name": "file_transfer_flutter",
+    "name": "传输助手",
+    "short_name": "传输助手",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

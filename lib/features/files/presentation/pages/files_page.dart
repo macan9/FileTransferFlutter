@@ -698,6 +698,28 @@ class _FilesPageState extends ConsumerState<FilesPage> {
           SectionCard(
             title: '回收站',
             subtitle: '展示已移入回收站的文件，可恢复、单独彻底删除，也可一键清空。',
+            titleAction: FutureBuilder<List<CloudFile>>(
+              future: _trashFilesFuture,
+              builder: (
+                BuildContext context,
+                AsyncSnapshot<List<CloudFile>> snapshot,
+              ) {
+                final List<CloudFile> files = snapshot.data ?? <CloudFile>[];
+                return FilledButton.tonalIcon(
+                  onPressed: files.isEmpty || _clearingTrash
+                      ? null
+                      : () => _clearTrash(files),
+                  icon: _clearingTrash
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.delete_forever_rounded),
+                  label: Text(_clearingTrash ? '清空中...' : '清空回收站'),
+                );
+              },
+            ),
             child: FutureBuilder<List<CloudFile>>(
               future: _trashFilesFuture,
               builder: (
@@ -730,25 +752,6 @@ class _FilesPageState extends ConsumerState<FilesPage> {
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: FilledButton.tonalIcon(
-                        onPressed:
-                            _clearingTrash ? null : () => _clearTrash(files),
-                        icon: _clearingTrash
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.delete_forever_rounded),
-                        label: Text(
-                          _clearingTrash ? '清空中...' : '清空回收站',
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
                     ...files.map((CloudFile file) {
                       return _TrashFileTile(
                         file: file,
@@ -934,7 +937,7 @@ class _UploadHero extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: <Widget>[
               Container(
                 width: 56,
@@ -951,37 +954,57 @@ class _UploadHero extends StatelessWidget {
               ),
               const SizedBox(width: 16),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Text(
-                      '上传到云文件',
-                      style: theme.textTheme.headlineSmall?.copyWith(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      dragEnabled
-                          ? '支持点击选择或直接拖拽文件到当前窗口。上传完成后会自动刷新文件列表和回收站。'
-                          : '支持点击选择文件上传。上传完成后会自动刷新文件列表和回收站。',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: Colors.white.withValues(alpha: 0.92),
-                        height: 1.5,
-                      ),
-                    ),
-                  ],
+                child: Text(
+                  '上传到云文件',
+                  style: theme.textTheme.headlineSmall?.copyWith(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
             ],
           ),
           const SizedBox(height: 22),
-          Wrap(
-            spacing: 12,
-            runSpacing: 12,
-            crossAxisAlignment: WrapCrossAlignment.center,
+          Row(
             children: <Widget>[
+              _UploadInfoChip(
+                label: dragging ? '正在接收拖拽文件...' : '单文件上限 200MB',
+              ),
+              const SizedBox(width: 12),
+              const _UploadInfoChip(label: '总容量 10GB'),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: <Widget>[
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      child: Text(
+                        '请选择文件上传',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: Colors.white.withValues(alpha: 0.92),
+                          height: 1.0,
+                        ),
+                      ),
+                    ),
+                    if (dragEnabled)
+                      Text(
+                        '支持拖拽文件到当前窗口上传',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: Colors.white.withValues(alpha: 0.82),
+                          height: 1.5,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 16),
               FilledButton.icon(
                 onPressed: onUploadPressed,
                 style: FilledButton.styleFrom(
@@ -994,46 +1017,6 @@ class _UploadHero extends StatelessWidget {
                 ),
                 icon: const Icon(Icons.add_rounded),
                 label: const Text('选择文件'),
-              ),
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 10,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.14),
-                  borderRadius: BorderRadius.circular(999),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.18),
-                  ),
-                ),
-                child: Text(
-                  dragging ? '正在接收拖拽文件...' : '单文件上限 200MB',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: Colors.white,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 10,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.14),
-                  borderRadius: BorderRadius.circular(999),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.18),
-                  ),
-                ),
-                child: Text(
-                  '总容量 10GB',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: Colors.white,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
               ),
             ],
           ),
@@ -1156,6 +1139,36 @@ class _UploadProgressTile extends StatelessWidget {
   }
 }
 
+class _UploadInfoChip extends StatelessWidget {
+  const _UploadInfoChip({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+
+    return Container(
+      width: 160,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+      ),
+      child: Text(
+        label,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: Colors.white,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
 class _CloudFileTile extends StatelessWidget {
   const _CloudFileTile({
     required this.file,
@@ -1208,14 +1221,17 @@ class _CloudFileTile extends StatelessWidget {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      '${_formatFileSize(file.size)}  ·  ${file.mimeType}',
+                      '${_formatFileSize(file.size)}  ·  ${_formatMimeTypeLabel(file.mimeType, file.originalName)}',
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '上传时间 ${DateFormat('yyyy-MM-dd HH:mm').format(file.createdAt.toLocal())}',
+                      _formatCloudTimestamp(
+                        label: '上传时间',
+                        time: file.createdAt,
+                      ),
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
@@ -1332,7 +1348,7 @@ class _TrashFileTile extends StatelessWidget {
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  '${_formatFileSize(file.size)}  ·  ${file.mimeType}',
+                  '${_formatFileSize(file.size)}  ·  ${_formatMimeTypeLabel(file.mimeType, file.originalName)}',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
@@ -1341,7 +1357,7 @@ class _TrashFileTile extends StatelessWidget {
                 Text(
                   deletedAt == null
                       ? '已移入回收站'
-                      : '删除时间 ${DateFormat('yyyy-MM-dd HH:mm').format(deletedAt.toLocal())}',
+                      : _formatCloudTimestamp(label: '删除时间', time: deletedAt),
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
@@ -1727,6 +1743,82 @@ IconData _fileIconForMimeType(String mimeType) {
     return Icons.archive_outlined;
   }
   return Icons.insert_drive_file_outlined;
+}
+
+bool get _hideCloudFileTimeLabelsOnApp => Platform.isAndroid || Platform.isIOS;
+
+String _formatCloudTimestamp({
+  required String label,
+  required DateTime? time,
+}) {
+  if (time == null) {
+    return '';
+  }
+
+  final String formatted =
+      DateFormat('yyyy-MM-dd HH:mm').format(time.toLocal());
+  if (_hideCloudFileTimeLabelsOnApp) {
+    return formatted;
+  }
+  return '$label $formatted';
+}
+
+String _formatMimeTypeLabel(String mimeType, String fileName) {
+  final String normalizedMimeType = mimeType.trim().toLowerCase();
+  if (normalizedMimeType.isEmpty ||
+      normalizedMimeType == 'application/octet-stream') {
+    final String extension = _fileExtension(fileName);
+    return extension.isEmpty ? '未知文件' : '${extension.toUpperCase()} 文件';
+  }
+  if (normalizedMimeType.startsWith('image/')) {
+    return '图片';
+  }
+  if (normalizedMimeType.startsWith('video/')) {
+    return '视频';
+  }
+  if (normalizedMimeType.startsWith('audio/')) {
+    return '音频';
+  }
+  if (normalizedMimeType == 'application/pdf') {
+    return 'PDF 文档';
+  }
+  if (normalizedMimeType.contains('word')) {
+    return 'Word 文档';
+  }
+  if (normalizedMimeType.contains('excel') ||
+      normalizedMimeType.contains('spreadsheet')) {
+    return 'Excel 表格';
+  }
+  if (normalizedMimeType.contains('powerpoint') ||
+      normalizedMimeType.contains('presentation')) {
+    return 'PPT 演示文稿';
+  }
+  if (normalizedMimeType.startsWith('text/')) {
+    return '文本';
+  }
+  if (normalizedMimeType.contains('json')) {
+    return 'JSON 文件';
+  }
+  if (normalizedMimeType.contains('zip') ||
+      normalizedMimeType.contains('compressed') ||
+      normalizedMimeType.contains('rar') ||
+      normalizedMimeType.contains('7z')) {
+    return '压缩包';
+  }
+
+  final int separatorIndex = normalizedMimeType.indexOf('/');
+  if (separatorIndex >= 0 && separatorIndex < normalizedMimeType.length - 1) {
+    return normalizedMimeType.substring(separatorIndex + 1).toUpperCase();
+  }
+  return normalizedMimeType.toUpperCase();
+}
+
+String _fileExtension(String fileName) {
+  final int dotIndex = fileName.lastIndexOf('.');
+  if (dotIndex < 0 || dotIndex >= fileName.length - 1) {
+    return '';
+  }
+  return fileName.substring(dotIndex + 1).trim();
 }
 
 String _formatFileSize(int bytes) {

@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
@@ -104,24 +102,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     subtitle: const Text('为后续自动接入信令层预留开关。'),
                   ),
                   const SizedBox(height: 20),
-                  Wrap(
-                    spacing: 12,
-                    runSpacing: 12,
-                    alignment: WrapAlignment.end,
-                    children: <Widget>[
-                      OutlinedButton.icon(
-                        onPressed: _saving ? null : _saveConfig,
-                        icon: _saving
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.save_outlined),
-                        label: Text(_saving ? '保存中...' : '保存配置'),
-                      ),
-                    ],
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: OutlinedButton.icon(
+                      onPressed: _saving ? null : _saveConfig,
+                      icon: _saving
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.save_outlined),
+                      label: Text(_saving ? '保存中...' : '保存配置'),
+                    ),
                   ),
                 ],
               ),
@@ -144,7 +137,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     value:
                         '${presence.devicesExcludingSelf(config.deviceId).length}',
                   ),
-                  _InfoRow(label: 'Socket ID', value: presence.socketId ?? '-'),
                   _InfoRow(
                     label: '最近心跳',
                     value:
@@ -153,23 +145,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   if (presence.lastError != null &&
                       presence.lastError!.trim().isNotEmpty)
                     _InfoRow(label: '错误信息', value: presence.lastError!),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            SectionCard(
-              title: '当前配置',
-              subtitle: '这些值会被全局状态和后续实时链路直接读取。',
-              child: Column(
-                children: <Widget>[
-                  _InfoRow(label: '服务端', value: config.serverUrl),
-                  _InfoRow(label: '设备名称', value: config.deviceName),
-                  _InfoRow(label: '保存目录', value: config.downloadDirectory),
-                  _InfoRow(
-                    label: '自动上线',
-                    value: config.autoOnline ? '开启' : '关闭',
-                  ),
-                  _InfoRow(label: '平台', value: _platformLabel),
                 ],
               ),
             ),
@@ -242,7 +217,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
         const SizedBox(height: 8),
         Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: <Widget>[
             Expanded(
               child: TextFormField(
@@ -255,10 +230,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               ),
             ),
             const SizedBox(width: 12),
-            OutlinedButton.icon(
-              onPressed: _saving ? null : _pickDirectory,
-              icon: const Icon(Icons.folder_open_outlined),
-              label: const Text('选择'),
+            SizedBox(
+              height: 48,
+              child: OutlinedButton.icon(
+                onPressed: _saving ? null : _pickDirectory,
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                ),
+                icon: const Icon(Icons.folder_open_outlined),
+                label: const Text('选择'),
+              ),
             ),
           ],
         ),
@@ -405,25 +386,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       SignalingPresenceStatus.registering => '注册设备中',
       SignalingPresenceStatus.online => '在线',
     };
-  }
-
-  String get _platformLabel {
-    if (Platform.isWindows) {
-      return 'Windows';
-    }
-    if (Platform.isMacOS) {
-      return 'macOS';
-    }
-    if (Platform.isLinux) {
-      return 'Linux';
-    }
-    if (Platform.isAndroid) {
-      return 'Android';
-    }
-    if (Platform.isIOS) {
-      return 'iOS';
-    }
-    return 'Unknown';
   }
 }
 
