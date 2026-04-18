@@ -73,93 +73,34 @@ class _TransfersPageState extends ConsumerState<TransfersPage> {
             b.createdAt.compareTo(a.createdAt),
       );
     return Scaffold(
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: <Widget>[
-          _RealtimeHeader(
-            config: config,
-            presence: presence,
-            pendingRequests: pendingRequests,
-            onShowPendingRequests: () => _showPendingRequestsDialog(
-              context,
-              selfDeviceId: config.deviceId,
-              pendingRequests: pendingRequests,
-              config: config,
-              presence: presence,
-            ),
-          ),
-          const SizedBox(height: 16),
-          SectionCard(
-            title: '在线设备',
-            subtitle: '先发送邀请，待对方接受并建立连接后即可直接发送文件。',
-            child: onlineDevices.isEmpty
-                ? _EmptyOnlineDevicesState(isOnline: presence.isOnline)
-                : Column(
-                    children: onlineDevices.map((P2pDevice device) {
-                      final P2pSession? activeSession =
-                          presence.activeSessionWith(
-                        selfDeviceId: config.deviceId,
-                        peerDeviceId: device.deviceId,
-                      );
-                      final P2pSessionTransport? sessionTransport =
-                          activeSession == null
-                              ? null
-                              : transport.transportForSession(
-                                  activeSession.sessionId,
-                                );
-
-                      return _PeerActionTile(
-                        config: config,
-                        device: device,
-                        presence: presence,
-                        selfDeviceId: config.deviceId,
-                        activeSession: activeSession,
-                        transport: sessionTransport,
-                        outgoingTransfers: activeSession == null
-                            ? const <OutgoingTransferContext>[]
-                            : transport.outgoingForSession(
-                                activeSession.sessionId,
-                              ),
-                        incomingTransfers: activeSession == null
-                            ? const <IncomingTransferContext>[]
-                            : transport.incomingForSession(
-                                activeSession.sessionId,
-                              ),
-                        onShowRequestDialog: (ConnectionRequest request) =>
-                            _showSingleRequestDialog(
-                          context,
-                          selfDeviceId: config.deviceId,
-                          request: request,
-                          config: config,
-                          presence: presence,
-                        ),
-                      );
-                    }).toList(),
-                  ),
-          ),
-          if (transport.lastError != null &&
-              transport.lastError!.trim().isNotEmpty) ...<Widget>[
-            const SizedBox(height: 16),
-            SectionCard(
-              title: '最近错误',
-              child: Text(transport.lastError!),
-            ),
-          ],
-          const SizedBox(height: 12),
-          Align(
-            alignment: Alignment.center,
-            child: TextButton(
-              onPressed: () => _showTransferRecordsDialog(
-                context,
-                ref,
-                deviceId: config.deviceId,
-                config: config,
-                presence: presence,
-              ),
-              child: const Text('查看传输记录'),
-            ),
-          ),
-        ],
+      body: _RealtimeTransferView(
+        config: config,
+        presence: presence,
+        pendingRequests: pendingRequests,
+        onlineDevices: onlineDevices,
+        transport: transport,
+        onShowPendingRequests: () => _showPendingRequestsDialog(
+          context,
+          selfDeviceId: config.deviceId,
+          pendingRequests: pendingRequests,
+          config: config,
+          presence: presence,
+        ),
+        onShowRequestDialog: (ConnectionRequest request) =>
+            _showSingleRequestDialog(
+          context,
+          selfDeviceId: config.deviceId,
+          request: request,
+          config: config,
+          presence: presence,
+        ),
+        onShowTransferRecords: () => _showTransferRecordsDialog(
+          context,
+          ref,
+          deviceId: config.deviceId,
+          config: config,
+          presence: presence,
+        ),
       ),
     );
   }
@@ -388,6 +329,101 @@ class _TransfersPageState extends ConsumerState<TransfersPage> {
           ],
         );
       },
+    );
+  }
+}
+
+class _RealtimeTransferView extends StatelessWidget {
+  const _RealtimeTransferView({
+    required this.config,
+    required this.presence,
+    required this.pendingRequests,
+    required this.onlineDevices,
+    required this.transport,
+    required this.onShowPendingRequests,
+    required this.onShowRequestDialog,
+    required this.onShowTransferRecords,
+  });
+
+  final AppConfig config;
+  final P2pPresenceState presence;
+  final List<ConnectionRequest> pendingRequests;
+  final List<P2pDevice> onlineDevices;
+  final P2pTransportState transport;
+  final VoidCallback onShowPendingRequests;
+  final ValueChanged<ConnectionRequest> onShowRequestDialog;
+  final VoidCallback onShowTransferRecords;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: <Widget>[
+        _RealtimeHeader(
+          config: config,
+          presence: presence,
+          pendingRequests: pendingRequests,
+          onShowPendingRequests: onShowPendingRequests,
+        ),
+        const SizedBox(height: 16),
+        SectionCard(
+          title: '在线设备',
+          subtitle: '先发送邀请，待对方接受并建立连接后即可直接发送文件。',
+          child: onlineDevices.isEmpty
+              ? _EmptyOnlineDevicesState(isOnline: presence.isOnline)
+              : Column(
+                  children: onlineDevices.map((P2pDevice device) {
+                    final P2pSession? activeSession =
+                        presence.activeSessionWith(
+                      selfDeviceId: config.deviceId,
+                      peerDeviceId: device.deviceId,
+                    );
+                    final P2pSessionTransport? sessionTransport =
+                        activeSession == null
+                            ? null
+                            : transport.transportForSession(
+                                activeSession.sessionId,
+                              );
+
+                    return _PeerActionTile(
+                      config: config,
+                      device: device,
+                      presence: presence,
+                      selfDeviceId: config.deviceId,
+                      activeSession: activeSession,
+                      transport: sessionTransport,
+                      outgoingTransfers: activeSession == null
+                          ? const <OutgoingTransferContext>[]
+                          : transport.outgoingForSession(
+                              activeSession.sessionId,
+                            ),
+                      incomingTransfers: activeSession == null
+                          ? const <IncomingTransferContext>[]
+                          : transport.incomingForSession(
+                              activeSession.sessionId,
+                            ),
+                      onShowRequestDialog: onShowRequestDialog,
+                    );
+                  }).toList(),
+                ),
+        ),
+        if (transport.lastError != null &&
+            transport.lastError!.trim().isNotEmpty) ...<Widget>[
+          const SizedBox(height: 16),
+          SectionCard(
+            title: '最近错误',
+            child: Text(transport.lastError!),
+          ),
+        ],
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.center,
+          child: TextButton(
+            onPressed: onShowTransferRecords,
+            child: const Text('查看传输记录'),
+          ),
+        ),
+      ],
     );
   }
 }

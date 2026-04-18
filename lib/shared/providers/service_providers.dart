@@ -4,6 +4,7 @@ import 'package:file_transfer_flutter/core/models/device_info.dart';
 import 'package:file_transfer_flutter/core/models/transfer_task.dart';
 import 'package:file_transfer_flutter/core/services/device_discovery_service.dart';
 import 'package:file_transfer_flutter/core/services/file_repository.dart';
+import 'package:file_transfer_flutter/core/services/networking_service.dart';
 import 'package:file_transfer_flutter/core/services/realtime_client_factory.dart';
 import 'package:file_transfer_flutter/core/services/transfer_service.dart';
 import 'package:file_transfer_flutter/core/services/transfer_record_service.dart';
@@ -52,6 +53,11 @@ final transferRecordServiceProvider =
     Provider<TransferRecordService>((Ref ref) {
   final AppConfig config = ref.watch(appConfigProvider);
   return HttpTransferRecordService(baseUri: config.serverUri);
+});
+
+final networkingServiceProvider = Provider<NetworkingService>((Ref ref) {
+  final AppConfig config = ref.watch(appConfigProvider);
+  return HttpNetworkingService(baseUri: config.serverUri);
 });
 
 class AppConfigController extends Notifier<AppConfig> {

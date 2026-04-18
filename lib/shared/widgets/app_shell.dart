@@ -23,6 +23,11 @@ class AppShell extends StatelessWidget {
       label: '\u5b9e\u65f6\u4f20\u8f93',
     ),
     NavigationDestination(
+      icon: Icon(Icons.hub_outlined),
+      selectedIcon: Icon(Icons.hub),
+      label: '\u5185\u7f51\u7a7f\u900f',
+    ),
+    NavigationDestination(
       icon: Icon(Icons.settings_outlined),
       selectedIcon: Icon(Icons.settings),
       label: '\u8bbe\u7f6e',

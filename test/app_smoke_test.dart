@@ -32,6 +32,9 @@ const AppConfig _testConfig = AppConfig(
   serverUrl: 'http://127.0.0.1:3000',
   deviceId: 'test-device',
   deviceName: 'Test Device',
+  devicePlatform: 'windows',
+  zeroTierNodeId: '',
+  agentToken: '',
   downloadDirectory: 'C:/Downloads',
   autoOnline: true,
 );

@@ -1,5 +1,6 @@
 import 'package:file_transfer_flutter/app/router/app_route_names.dart';
 import 'package:file_transfer_flutter/features/files/presentation/pages/files_page.dart';
+import 'package:file_transfer_flutter/features/networking/presentation/pages/networking_page.dart';
 import 'package:file_transfer_flutter/features/settings/presentation/pages/settings_page.dart';
 import 'package:file_transfer_flutter/features/transfers/presentation/pages/transfers_page.dart';
 import 'package:file_transfer_flutter/shared/widgets/app_shell.dart';
@@ -36,6 +37,17 @@ RouteBase _buildRootShellRoute() {
             name: AppRouteNames.transfers,
             builder: (BuildContext context, GoRouterState state) {
               return const TransfersPage();
+            },
+          ),
+        ],
+      ),
+      StatefulShellBranch(
+        routes: <RouteBase>[
+          GoRoute(
+            path: '/networking',
+            name: AppRouteNames.networking,
+            builder: (BuildContext context, GoRouterState state) {
+              return const NetworkingPage();
             },
           ),
         ],

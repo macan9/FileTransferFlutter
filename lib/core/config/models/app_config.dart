@@ -5,6 +5,9 @@ class AppConfig extends Equatable {
     required this.serverUrl,
     required this.deviceId,
     required this.deviceName,
+    required this.devicePlatform,
+    required this.zeroTierNodeId,
+    required this.agentToken,
     required this.downloadDirectory,
     required this.autoOnline,
   });
@@ -14,6 +17,9 @@ class AppConfig extends Equatable {
       serverUrl: json['serverUrl']?.toString() ?? '',
       deviceId: json['deviceId']?.toString() ?? '',
       deviceName: json['deviceName']?.toString() ?? '',
+      devicePlatform: json['devicePlatform']?.toString() ?? '',
+      zeroTierNodeId: json['zeroTierNodeId']?.toString() ?? '',
+      agentToken: json['agentToken']?.toString() ?? '',
       downloadDirectory: json['downloadDirectory']?.toString() ?? '',
       autoOnline: json['autoOnline'] as bool? ?? true,
     );
@@ -22,6 +28,9 @@ class AppConfig extends Equatable {
   final String serverUrl;
   final String deviceId;
   final String deviceName;
+  final String devicePlatform;
+  final String zeroTierNodeId;
+  final String agentToken;
   final String downloadDirectory;
   final bool autoOnline;
 
@@ -31,6 +40,9 @@ class AppConfig extends Equatable {
     String? serverUrl,
     String? deviceId,
     String? deviceName,
+    String? devicePlatform,
+    String? zeroTierNodeId,
+    String? agentToken,
     String? downloadDirectory,
     bool? autoOnline,
   }) {
@@ -38,6 +50,9 @@ class AppConfig extends Equatable {
       serverUrl: serverUrl ?? this.serverUrl,
       deviceId: deviceId ?? this.deviceId,
       deviceName: deviceName ?? this.deviceName,
+      devicePlatform: devicePlatform ?? this.devicePlatform,
+      zeroTierNodeId: zeroTierNodeId ?? this.zeroTierNodeId,
+      agentToken: agentToken ?? this.agentToken,
       downloadDirectory: downloadDirectory ?? this.downloadDirectory,
       autoOnline: autoOnline ?? this.autoOnline,
     );
@@ -48,6 +63,9 @@ class AppConfig extends Equatable {
       serverUrl: _normalizeServerUrl(serverUrl),
       deviceId: deviceId.trim(),
       deviceName: deviceName.trim(),
+      devicePlatform: devicePlatform.trim(),
+      zeroTierNodeId: zeroTierNodeId.trim(),
+      agentToken: agentToken.trim(),
       downloadDirectory: downloadDirectory.trim(),
       autoOnline: autoOnline,
     );
@@ -58,6 +76,9 @@ class AppConfig extends Equatable {
       'serverUrl': serverUrl,
       'deviceId': deviceId,
       'deviceName': deviceName,
+      'devicePlatform': devicePlatform,
+      'zeroTierNodeId': zeroTierNodeId,
+      'agentToken': agentToken,
       'downloadDirectory': downloadDirectory,
       'autoOnline': autoOnline,
     };
@@ -68,6 +89,9 @@ class AppConfig extends Equatable {
         serverUrl,
         deviceId,
         deviceName,
+        devicePlatform,
+        zeroTierNodeId,
+        agentToken,
         downloadDirectory,
         autoOnline,
       ];

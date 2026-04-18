@@ -58,6 +58,18 @@ class HiveAppConfigRepository implements AppConfigRepository {
       serverUrl: defaults.serverUrl,
       deviceId: _preferPersisted(persisted.deviceId, defaults.deviceId),
       deviceName: _preferPersisted(persisted.deviceName, defaults.deviceName),
+      devicePlatform: _preferPersisted(
+        persisted.devicePlatform,
+        defaults.devicePlatform,
+      ),
+      zeroTierNodeId: _preferPersisted(
+        persisted.zeroTierNodeId,
+        defaults.zeroTierNodeId,
+      ),
+      agentToken: _preferPersisted(
+        persisted.agentToken,
+        defaults.agentToken,
+      ),
       downloadDirectory: _preferPersisted(
         persisted.downloadDirectory,
         defaults.downloadDirectory,

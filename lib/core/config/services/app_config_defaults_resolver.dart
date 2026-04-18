@@ -22,6 +22,7 @@ class AppConfigDefaultsResolver {
 
   Future<AppConfig> resolve() async {
     final String deviceName = await _resolveDeviceName();
+    final String devicePlatform = _resolvePlatform();
     final String downloadDirectory = await _resolveDownloadDirectory();
 
     return AppConfig(
@@ -29,9 +30,31 @@ class AppConfigDefaultsResolver {
           AppNetworkConfig.defaultServerUrl,
       deviceId: _uuid.v4(),
       deviceName: deviceName,
+      devicePlatform: devicePlatform,
+      zeroTierNodeId: '',
+      agentToken: '',
       downloadDirectory: downloadDirectory,
       autoOnline: true,
     );
+  }
+
+  String _resolvePlatform() {
+    if (Platform.isWindows) {
+      return 'windows';
+    }
+    if (Platform.isMacOS) {
+      return 'macos';
+    }
+    if (Platform.isLinux) {
+      return 'linux';
+    }
+    if (Platform.isAndroid) {
+      return 'android';
+    }
+    if (Platform.isIOS) {
+      return 'ios';
+    }
+    return 'unknown';
   }
 
   Future<String> _resolveDeviceName() async {

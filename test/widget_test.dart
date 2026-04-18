@@ -10,7 +10,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  testWidgets('app shows the three expected navigation tabs', (
+  testWidgets('app shows the four expected navigation tabs', (
     WidgetTester tester,
   ) async {
     await tester.pumpWidget(
@@ -26,6 +26,7 @@ void main() {
 
     expect(find.text('\u4e91\u6587\u4ef6'), findsOneWidget);
     expect(find.text('\u5b9e\u65f6\u4f20\u8f93'), findsOneWidget);
+    expect(find.text('\u5185\u7f51\u7a7f\u900f'), findsOneWidget);
     expect(find.text('\u8bbe\u7f6e'), findsOneWidget);
   });
 }
@@ -34,6 +35,9 @@ const AppConfig _testConfig = AppConfig(
   serverUrl: 'http://127.0.0.1:3000',
   deviceId: 'test-device',
   deviceName: 'Test Device',
+  devicePlatform: 'windows',
+  zeroTierNodeId: '',
+  agentToken: '',
   downloadDirectory: 'C:/Downloads',
   autoOnline: true,
 );
