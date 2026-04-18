@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:file_transfer_flutter/core/config/app_network_config.dart';
+import 'package:file_transfer_flutter/core/config/models/launch_environment.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:path_provider/path_provider.dart';
@@ -10,10 +11,13 @@ class AppConfigDefaultsResolver {
   AppConfigDefaultsResolver({
     DeviceInfoPlugin? deviceInfoPlugin,
     Uuid? uuid,
+    LaunchEnvironment? launchEnvironment,
   })  : _deviceInfoPlugin = deviceInfoPlugin ?? DeviceInfoPlugin(),
+        _launchEnvironment = launchEnvironment,
         _uuid = uuid ?? const Uuid();
 
   final DeviceInfoPlugin _deviceInfoPlugin;
+  final LaunchEnvironment? _launchEnvironment;
   final Uuid _uuid;
 
   Future<AppConfig> resolve() async {
@@ -21,7 +25,8 @@ class AppConfigDefaultsResolver {
     final String downloadDirectory = await _resolveDownloadDirectory();
 
     return AppConfig(
-      serverUrl: AppNetworkConfig.defaultServerUrl,
+      serverUrl: _launchEnvironment?.activeServerUrl ??
+          AppNetworkConfig.defaultServerUrl,
       deviceId: _uuid.v4(),
       deviceName: deviceName,
       downloadDirectory: downloadDirectory,

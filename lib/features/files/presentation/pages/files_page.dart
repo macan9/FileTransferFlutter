@@ -5,8 +5,10 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/error/app_exception.dart';
-import 'package:file_transfer_flutter/core/models/cloud_file.dart';
+import 'package:file_transfer_flutter/core/models/cloud_file_list_response.dart';
+import 'package:file_transfer_flutter/core/models/cloud_item.dart';
 import 'package:file_transfer_flutter/core/models/file_storage_limits.dart';
+import 'package:file_transfer_flutter/core/models/trash_item_operation_result.dart';
 import 'package:file_transfer_flutter/core/services/file_repository.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:file_transfer_flutter/shared/widgets/section_card.dart';
@@ -22,17 +24,20 @@ class FilesPage extends ConsumerStatefulWidget {
 }
 
 class _FilesPageState extends ConsumerState<FilesPage> {
-  late Future<List<CloudFile>> _filesFuture;
-  late Future<List<CloudFile>> _trashFilesFuture;
+  late Future<CloudFileListResponse> _filesFuture;
+  late Future<CloudFileListResponse> _trashFuture;
   late Future<FileStorageLimits> _limitsFuture;
 
-  bool _dragging = false;
+  final ScrollController _pageScrollController = ScrollController();
+  String _currentPath = '';
+  String _currentTrashPath = '';
+  bool _draggingUpload = false;
   bool _processingUploadQueue = false;
   bool _clearingTrash = false;
 
   final List<_UploadQueueItem> _uploadQueue = <_UploadQueueItem>[];
-  final Set<int> _busyFileIds = <int>{};
-  final Set<int> _busyTrashFileIds = <int>{};
+  final Set<int> _busyItemIds = <int>{};
+  final Set<int> _busyTrashItemIds = <int>{};
   final Map<int, double> _downloadProgress = <int, double>{};
 
   FileRepository get _repository => ref.read(fileRepositoryProvider);
@@ -47,22 +52,28 @@ class _FilesPageState extends ConsumerState<FilesPage> {
   }
 
   @override
+  void dispose() {
+    _pageScrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   void initState() {
     super.initState();
-    _filesFuture = _repository.fetchFiles();
-    _trashFilesFuture = _repository.fetchTrashFiles();
+    _filesFuture = _repository.fetchFiles(path: _currentPath);
+    _trashFuture = _loadTrashFiles(_currentTrashPath);
     _limitsFuture = _repository.fetchLimits();
   }
 
   void _reloadFiles() {
     setState(() {
-      _filesFuture = _repository.fetchFiles();
+      _filesFuture = _repository.fetchFiles(path: _currentPath);
     });
   }
 
-  void _reloadTrashFiles() {
+  void _reloadTrash() {
     setState(() {
-      _trashFilesFuture = _repository.fetchTrashFiles();
+      _trashFuture = _loadTrashFiles(_currentTrashPath);
     });
   }
 
@@ -74,7 +85,7 @@ class _FilesPageState extends ConsumerState<FilesPage> {
 
   void _reloadPageData() {
     _reloadFiles();
-    _reloadTrashFiles();
+    _reloadTrash();
     _reloadLimits();
   }
 
@@ -83,15 +94,75 @@ class _FilesPageState extends ConsumerState<FilesPage> {
     try {
       await Future.wait(<Future<Object?>>[
         _filesFuture,
-        _trashFilesFuture,
+        _trashFuture,
         _limitsFuture,
       ]);
     } catch (_) {
-      // Keep the refresh gesture responsive even when the local service is offline.
+      // Keep pull-to-refresh responsive when the backend is unavailable.
     }
   }
 
-  Future<void> _uploadFile() async {
+  Future<void> _navigateToPath(String path) async {
+    final String normalizedPath = _normalizePath(path);
+    setState(() {
+      _currentPath = normalizedPath;
+      _filesFuture = _repository.fetchFiles(path: normalizedPath);
+    });
+    try {
+      await _filesFuture;
+    } catch (_) {
+      // Error handling stays inside the FutureBuilder.
+    }
+  }
+
+  Future<void> _goToParent(String? parentPath) async {
+    await _navigateToPath(parentPath ?? '');
+  }
+
+  Future<void> _navigateTrashToPath(String path) async {
+    final String normalizedPath = _normalizePath(path);
+    final double preservedOffset =
+        _pageScrollController.hasClients ? _pageScrollController.offset : 0;
+    setState(() {
+      _currentTrashPath = normalizedPath;
+      _trashFuture = _loadTrashFiles(normalizedPath);
+    });
+    try {
+      await _trashFuture;
+      _restorePageScrollOffset(preservedOffset);
+    } catch (_) {
+      // Error handling stays inside the FutureBuilder.
+    }
+  }
+
+  Future<void> _goToTrashParent(String? parentPath) async {
+    await _navigateTrashToPath(parentPath ?? '');
+  }
+
+  Future<CloudFileListResponse> _loadTrashFiles(
+    String path,
+  ) async {
+    final String normalizedPath = _normalizePath(path);
+    try {
+      return await _repository.fetchTrashFiles(path: normalizedPath);
+    } on AppException catch (error) {
+      if (normalizedPath.isNotEmpty && _isTrashPathMissingError(error)) {
+        final CloudFileListResponse rootResponse =
+            await _repository.fetchTrashFiles();
+        if (mounted) {
+          setState(() {
+            _currentTrashPath = '';
+          });
+        } else {
+          _currentTrashPath = '';
+        }
+        return rootResponse;
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _pickAndUploadFile() async {
     try {
       final FilePickerResult? result = await FilePicker.platform.pickFiles(
         withData: false,
@@ -133,20 +204,20 @@ class _FilesPageState extends ConsumerState<FilesPage> {
       return;
     }
 
-    final List<_UploadQueueItem> items = filePaths
-        .map(
-          (String filePath) => _UploadQueueItem(
-            id: _createUploadQueueId(),
-            filePath: filePath,
-            displayName: _extractFileName(filePath),
-            progress: 0,
-            status: _UploadQueueStatus.pending,
-            source: _UploadSource.dragDrop,
-          ),
-        )
-        .toList();
-
-    await _enqueueUploads(items);
+    await _enqueueUploads(
+      filePaths
+          .map(
+            (String filePath) => _UploadQueueItem(
+              id: _createUploadQueueId(),
+              filePath: filePath,
+              displayName: _extractFileName(filePath),
+              progress: 0,
+              status: _UploadQueueStatus.pending,
+              source: _UploadSource.dragDrop,
+            ),
+          )
+          .toList(),
+    );
   }
 
   Future<void> _enqueueUploads(List<_UploadQueueItem> items) async {
@@ -173,7 +244,6 @@ class _FilesPageState extends ConsumerState<FilesPage> {
                       item?.status == _UploadQueueStatus.pending,
                   orElse: () => null,
                 );
-
         if (nextItem == null) {
           break;
         }
@@ -187,6 +257,7 @@ class _FilesPageState extends ConsumerState<FilesPage> {
         try {
           await _repository.uploadFileFromPath(
             nextItem.filePath,
+            path: _currentPath,
             onProgress: (double progress) {
               if (!mounted) {
                 return;
@@ -194,7 +265,6 @@ class _FilesPageState extends ConsumerState<FilesPage> {
               _updateUploadItem(nextItem.id, progress: progress);
             },
           );
-
           successCount += 1;
           _updateUploadItem(
             nextItem.id,
@@ -224,7 +294,9 @@ class _FilesPageState extends ConsumerState<FilesPage> {
       }
 
       if (mounted && successCount > 0) {
-        _showMessage(successCount == 1 ? '上传完成' : '已完成 $successCount 个文件上传');
+        _showMessage(
+          successCount == 1 ? '上传完成' : '已完成 $successCount 个文件上传',
+        );
       }
     } finally {
       if (mounted) {
@@ -239,18 +311,17 @@ class _FilesPageState extends ConsumerState<FilesPage> {
     }
   }
 
-  Future<void> _downloadFile(CloudFile file) async {
-    _setFileBusy(file.id, true);
-
+  Future<void> _downloadFile(CloudItem item) async {
+    _setItemBusy(item.id, true);
     try {
       final String path = await _repository.downloadFile(
-        file,
+        item,
         onProgress: (double progress) {
           if (!mounted) {
             return;
           }
           setState(() {
-            _downloadProgress[file.id] = progress;
+            _downloadProgress[item.id] = progress;
           });
         },
       );
@@ -259,7 +330,7 @@ class _FilesPageState extends ConsumerState<FilesPage> {
       }
       _showMessage('已下载到 $path');
     } on AppException catch (error) {
-      if (!mounted || error.message == '已取消下载') {
+      if (!mounted) {
         return;
       }
       _showAppException(error);
@@ -270,16 +341,18 @@ class _FilesPageState extends ConsumerState<FilesPage> {
       _showMessage('下载失败: $error', isError: true);
     } finally {
       if (mounted) {
-        _setFileBusy(file.id, false);
+        _setItemBusy(item.id, false);
       }
     }
   }
 
-  Future<void> _moveFileToTrash(CloudFile file) async {
+  Future<void> _moveItemToTrash(CloudItem item) async {
     final bool confirmed = await _showConfirmationDialog(
-          title: '移入回收站',
-          content: '确认将“${file.originalName}”移入回收站吗？移入后会从文件列表中隐藏，但不会立刻从磁盘删除。',
-          confirmLabel: '移入回收站',
+          title: item.isFolder ? '删除文件夹' : '移入回收站',
+          content: item.isFolder
+              ? '确认将“${item.displayName}”及其内容移入回收站吗？'
+              : '确认将“${item.displayName}”移入回收站吗？',
+          confirmLabel: item.isFolder ? '删除文件夹' : '移入回收站',
         ) ??
         false;
 
@@ -287,15 +360,18 @@ class _FilesPageState extends ConsumerState<FilesPage> {
       return;
     }
 
-    _setFileBusy(file.id, true);
-
+    _setItemBusy(item.id, true);
     try {
-      await _repository.deleteFile(file.id);
+      if (item.isFolder) {
+        await _repository.deleteFolder(item.path ?? '');
+      } else {
+        await _repository.deleteFile(item.id);
+      }
       _reloadPageData();
       if (!mounted) {
         return;
       }
-      _showMessage('文件已移入回收站');
+      _showMessage(item.isFolder ? '文件夹已移入回收站' : '文件已移入回收站');
     } on AppException catch (error) {
       if (!mounted) {
         return;
@@ -305,36 +381,160 @@ class _FilesPageState extends ConsumerState<FilesPage> {
       if (!mounted) {
         return;
       }
-      _showMessage('移入回收站失败: $error', isError: true);
+      _showMessage('删除失败: $error', isError: true);
     } finally {
       if (mounted) {
-        _setFileBusy(file.id, false);
+        _setItemBusy(item.id, false);
       }
     }
   }
 
-  Future<void> _deleteTrashFilePermanently(CloudFile file) async {
-    final bool confirmed = await _showConfirmationDialog(
-          title: '彻底删除文件',
-          content: '确认彻底删除“${file.originalName}”吗？这会同时删除回收站记录和磁盘文件，操作不可撤销。',
-          confirmLabel: '彻底删除',
-          destructive: true,
-        ) ??
-        false;
-
-    if (!confirmed) {
+  Future<void> _createFolder() async {
+    final String? folderName = await _showTextInputDialog(
+      title: '新建文件夹',
+      label: '文件夹名称',
+      hintText: '例如：images',
+    );
+    if (folderName == null) {
       return;
     }
 
-    _setTrashFileBusy(file.id, true);
-
     try {
-      await _repository.deleteTrashFilePermanently(file.id);
+      await _repository.createFolder(path: _currentPath, name: folderName);
+      _reloadFiles();
+      if (!mounted) {
+        return;
+      }
+      _showMessage('文件夹已创建');
+    } on AppException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showAppException(error);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showMessage('新建文件夹失败: $error', isError: true);
+    }
+  }
+
+  Future<void> _moveItem(
+    CloudItem item, {
+    required String targetPath,
+    String? newName,
+  }) async {
+    final String normalizedTarget = _normalizePath(targetPath);
+    if (item.isFolder) {
+      final String sourcePath = item.path ?? '';
+      if (normalizedTarget == sourcePath ||
+          (sourcePath.isNotEmpty &&
+              normalizedTarget.startsWith('$sourcePath/'))) {
+        _showMessage('不能把文件夹移动到它自己或子目录中', isError: true);
+        return;
+      }
+    } else {
+      if (normalizedTarget == (item.directoryPath ?? '')) {
+        _showMessage('文件已经在当前目录中');
+        return;
+      }
+    }
+
+    _setItemBusy(item.id, true);
+    try {
+      if (item.isFolder) {
+        await _repository.moveFolder(
+          sourcePath: item.path ?? '',
+          targetPath: normalizedTarget,
+          name: newName,
+        );
+      } else {
+        await _repository.moveFile(item.id, targetPath: normalizedTarget);
+      }
+      _reloadFiles();
+      if (!mounted) {
+        return;
+      }
+      _showMessage(item.isFolder ? '文件夹已移动' : '文件已移动');
+    } on AppException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showAppException(error);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showMessage('移动失败: $error', isError: true);
+    } finally {
+      if (mounted) {
+        _setItemBusy(item.id, false);
+      }
+    }
+  }
+
+  Future<void> _restoreTrashItem(CloudItem item) async {
+    if (item.isFolder) {
+      final bool confirmed = await _showConfirmationDialog(
+            title: '恢复文件夹',
+            content: '确认恢复该文件夹及其内部所有内容吗？',
+            confirmLabel: '恢复整个文件夹',
+          ) ??
+          false;
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    _setTrashItemBusy(item.id, true);
+    try {
+      final TrashItemOperationResult result =
+          await _repository.restoreTrashItem(item.id);
       _reloadPageData();
       if (!mounted) {
         return;
       }
-      _showMessage('文件已彻底删除');
+      _showMessage(_buildRestoreTrashSuccessMessage(item, result));
+    } on AppException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showAppException(error);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showMessage('恢复失败: $error', isError: true);
+    } finally {
+      if (mounted) {
+        _setTrashItemBusy(item.id, false);
+      }
+    }
+  }
+
+  Future<void> _deleteTrashItemPermanently(CloudItem item) async {
+    final bool confirmed = await _showConfirmationDialog(
+          title: '彻底删除',
+          content: item.isFolder
+              ? '确认彻底删除该文件夹及其内部所有内容吗？此操作不可撤销。'
+              : '确认彻底删除“${item.displayName}”吗？此操作不可撤销。',
+          confirmLabel: item.isFolder ? '彻底删除该文件夹及其内部所有内容' : '彻底删除',
+          destructive: true,
+        ) ??
+        false;
+    if (!confirmed) {
+      return;
+    }
+
+    _setTrashItemBusy(item.id, true);
+    try {
+      final TrashItemOperationResult result =
+          await _repository.deleteTrashFilePermanently(item.id);
+      _reloadPageData();
+      if (!mounted) {
+        return;
+      }
+      _showMessage(_buildDeleteTrashSuccessMessage(item, result));
     } on AppException catch (error) {
       if (!mounted) {
         return;
@@ -347,51 +547,23 @@ class _FilesPageState extends ConsumerState<FilesPage> {
       _showMessage('彻底删除失败: $error', isError: true);
     } finally {
       if (mounted) {
-        _setTrashFileBusy(file.id, false);
+        _setTrashItemBusy(item.id, false);
       }
     }
   }
 
-  Future<void> _restoreTrashFile(CloudFile file) async {
-    _setTrashFileBusy(file.id, true);
-
-    try {
-      await _repository.restoreTrashFile(file.id);
-      _reloadPageData();
-      if (!mounted) {
-        return;
-      }
-      _showMessage('文件已从回收站恢复');
-    } on AppException catch (error) {
-      if (!mounted) {
-        return;
-      }
-      _showAppException(error);
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-      _showMessage('恢复文件失败: $error', isError: true);
-    } finally {
-      if (mounted) {
-        _setTrashFileBusy(file.id, false);
-      }
-    }
-  }
-
-  Future<void> _clearTrash(List<CloudFile> trashFiles) async {
-    if (trashFiles.isEmpty || _clearingTrash) {
+  Future<void> _clearTrash(CloudFileListResponse response) async {
+    if (response.items.isEmpty || _clearingTrash) {
       return;
     }
 
     final bool confirmed = await _showConfirmationDialog(
           title: '清空回收站',
-          content: '确认清空回收站吗？共 ${trashFiles.length} 个文件将被彻底删除，此操作不可撤销。',
+          content: '确认清空回收站吗？共 ${response.items.length} 个条目将被彻底删除，此操作不可撤销。',
           confirmLabel: '清空回收站',
           destructive: true,
         ) ??
         false;
-
     if (!confirmed) {
       return;
     }
@@ -459,23 +631,66 @@ class _FilesPageState extends ConsumerState<FilesPage> {
     );
   }
 
-  void _setFileBusy(int fileId, bool isBusy) {
+  Future<String?> _showTextInputDialog({
+    required String title,
+    required String label,
+    String? initialValue,
+    String? hintText,
+  }) async {
+    final TextEditingController controller =
+        TextEditingController(text: initialValue ?? '');
+    final String? result = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text(title),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: label,
+              hintText: hintText,
+            ),
+            onSubmitted: (_) =>
+                Navigator.of(context).pop(controller.text.trim()),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+
+    final String trimmed = result?.trim() ?? '';
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
+  void _setItemBusy(int itemId, bool isBusy) {
     setState(() {
       if (isBusy) {
-        _busyFileIds.add(fileId);
+        _busyItemIds.add(itemId);
       } else {
-        _busyFileIds.remove(fileId);
-        _downloadProgress.remove(fileId);
+        _busyItemIds.remove(itemId);
+        _downloadProgress.remove(itemId);
       }
     });
   }
 
-  void _setTrashFileBusy(int fileId, bool isBusy) {
+  void _setTrashItemBusy(int itemId, bool isBusy) {
     setState(() {
       if (isBusy) {
-        _busyTrashFileIds.add(fileId);
+        _busyTrashItemIds.add(itemId);
       } else {
-        _busyTrashFileIds.remove(fileId);
+        _busyTrashItemIds.remove(itemId);
       }
     });
   }
@@ -507,79 +722,65 @@ class _FilesPageState extends ConsumerState<FilesPage> {
   }
 
   void _showMessage(String message, {bool isError = false}) {
-    final Color? backgroundColor;
-    final Color? foregroundColor;
-
-    if (isError) {
-      backgroundColor = Theme.of(context).colorScheme.error;
-      foregroundColor = Theme.of(context).colorScheme.onError;
-    } else {
-      backgroundColor = null;
-      foregroundColor = null;
-    }
-
+    final ThemeData theme = Theme.of(context);
     final SnackBar snackBar = SnackBar(
-      content: foregroundColor == null
-          ? Text(message)
-          : DefaultTextStyle(
-              style: TextStyle(color: foregroundColor, fontSize: 14),
-              child: Text(message),
-            ),
-      backgroundColor: backgroundColor,
+      content: Text(message),
+      backgroundColor: isError ? theme.colorScheme.error : null,
       behavior: SnackBarBehavior.floating,
       showCloseIcon: true,
-      closeIconColor: foregroundColor,
+      closeIconColor: isError ? theme.colorScheme.onError : null,
     );
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(snackBar);
   }
 
-  void _showWarningMessage(String message) {
-    const Color warningBackground = Color(0xFFFDE68A);
-    const Color warningForeground = Color(0xFF713F12);
-
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: DefaultTextStyle(
-            style: const TextStyle(
-              color: warningForeground,
-              fontSize: 14,
-              fontWeight: FontWeight.w500,
-            ),
-            child: Text(message),
-          ),
-          backgroundColor: warningBackground,
-          behavior: SnackBarBehavior.floating,
-          showCloseIcon: true,
-          closeIconColor: warningForeground,
-        ),
-      );
-  }
-
   void _showAppException(AppException error) {
-    if (_isWarningMessage(error.message)) {
-      _showWarningMessage(error.message);
-      return;
-    }
-
     _showMessage(error.message, isError: true);
   }
 
-  bool _isWarningMessage(String message) {
-    const List<String> warningKeywords = <String>[
-      '服务器容量已满',
-      '存储空间',
-      '单个文件大小不能超过',
-      '上传限制',
-      '容量已满',
-      '200MB',
-      '10GB',
-    ];
+  bool _isTrashPathMissingError(AppException error) {
+    final String message = error.message;
+    return message.contains('Trash folder "') || message.contains('回收站文件夹不存在');
+  }
 
-    return warningKeywords.any(message.contains);
+  void _restorePageScrollOffset(double offset) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_pageScrollController.hasClients) {
+        return;
+      }
+      final ScrollPosition position = _pageScrollController.position;
+      final double target = offset.clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      if ((position.pixels - target).abs() < 1) {
+        return;
+      }
+      _pageScrollController.jumpTo(target);
+    });
+  }
+
+  String _buildRestoreTrashSuccessMessage(
+    CloudItem item,
+    TrashItemOperationResult result,
+  ) {
+    if (!item.isFolder) {
+      return '文件已恢复';
+    }
+
+    return '已恢复文件夹，包含 ${result.restoredFolderCount} 个文件夹、${result.restoredFileCount} 个文件';
+  }
+
+  String _buildDeleteTrashSuccessMessage(
+    CloudItem item,
+    TrashItemOperationResult result,
+  ) {
+    if (!item.isFolder) {
+      return '文件已彻底删除';
+    }
+
+    return '已彻底删除文件夹，包含 ${result.deletedFolderCount} 个文件夹、${result.deletedFileCount} 个文件';
   }
 
   String _extractFileName(String filePath) {
@@ -590,6 +791,17 @@ class _FilesPageState extends ConsumerState<FilesPage> {
 
   String _createUploadQueueId() {
     return '${DateTime.now().microsecondsSinceEpoch}-${_uploadQueue.length}';
+  }
+
+  String _normalizePath(String value) {
+    String normalized = value.trim().replaceAll('\\', '/');
+    while (normalized.startsWith('/')) {
+      normalized = normalized.substring(1);
+    }
+    while (normalized.endsWith('/')) {
+      normalized = normalized.substring(0, normalized.length - 1);
+    }
+    return normalized;
   }
 
   List<_UploadQueueItem> get _visibleUploadItems {
@@ -603,31 +815,81 @@ class _FilesPageState extends ConsumerState<FilesPage> {
         .toList();
   }
 
+  List<Widget> _buildCurrentDirectoryItems(List<CloudItem> items) {
+    return items.map((CloudItem item) {
+      final bool isBusy = _busyItemIds.contains(item.id);
+      final Widget tile = item.isFolder
+          ? _FolderTile(
+              item: item,
+              busy: isBusy,
+              isDropTargetActive: false,
+              onOpen: () => _navigateToPath(item.path ?? ''),
+              onDelete: () => _moveItemToTrash(item),
+            )
+          : _FileTile(
+              item: item,
+              busy: isBusy,
+              progress: _downloadProgress[item.id],
+              onDownload: () => _downloadFile(item),
+              onDelete: () => _moveItemToTrash(item),
+            );
+
+      return _MoveTarget(
+        item: item,
+        currentPath: _currentPath,
+        onMoveHere: (CloudItem draggedItem) async {
+          await _moveItem(
+            draggedItem,
+            targetPath: item.isFolder ? (item.path ?? '') : _currentPath,
+          );
+        },
+        child: _DragSource(item: item, child: tile),
+      );
+    }).toList();
+  }
+
   @override
   Widget build(BuildContext context) {
     final AppConfig config = ref.watch(appConfigProvider);
     final Widget content = RefreshIndicator(
       onRefresh: _refreshPage,
       child: ListView(
+        controller: _pageScrollController,
         padding: const EdgeInsets.all(16),
         children: <Widget>[
-          _UploadHero(
-            uploadItems: _visibleUploadItems,
-            dragging: _dragging,
-            dragEnabled: _dragEnabled,
-            onUploadPressed: _uploadFile,
+          FutureBuilder<FileStorageLimits>(
+            future: _limitsFuture,
+            builder: (
+              BuildContext context,
+              AsyncSnapshot<FileStorageLimits> snapshot,
+            ) {
+              return _UploadHero(
+                currentPath: _currentPath,
+                uploadItems: _visibleUploadItems,
+                dragging: _draggingUpload,
+                dragEnabled: _dragEnabled,
+                limits: snapshot.data,
+                onUploadPressed: _pickAndUploadFile,
+              );
+            },
           ),
           const SizedBox(height: 16),
           SectionCard(
             title: '文件列表',
-            subtitle: '展示服务端当前可用文件，支持下载和移入回收站。',
-            child: FutureBuilder<List<CloudFile>>(
+            subtitle: '点击文件夹进入，支持文件和文件夹长按拖拽移动。',
+            titleAction: FilledButton.tonalIcon(
+              onPressed: _createFolder,
+              icon: const Icon(Icons.create_new_folder_outlined),
+              label: const Text('新建文件夹'),
+            ),
+            child: FutureBuilder<CloudFileListResponse>(
               future: _filesFuture,
               builder: (
                 BuildContext context,
-                AsyncSnapshot<List<CloudFile>> snapshot,
+                AsyncSnapshot<CloudFileListResponse> snapshot,
               ) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
                   return const Padding(
                     padding: EdgeInsets.symmetric(vertical: 8),
                     child: LinearProgressIndicator(),
@@ -636,32 +898,58 @@ class _FilesPageState extends ConsumerState<FilesPage> {
 
                 if (snapshot.hasError) {
                   return _ErrorState(
-                    message:
-                        '加载文件列表失败，请确认 ${config.serverUrl} 服务已启动，且手机可访问这台电脑。',
+                    message: '加载文件列表失败，请确认 ${config.serverUrl} 可访问。',
                     onRetry: _reloadFiles,
                   );
                 }
 
-                final List<CloudFile> files = snapshot.data ?? <CloudFile>[];
-                if (files.isEmpty) {
-                  return const _EmptyState(
-                    icon: Icons.cloud_outlined,
-                    title: '还没有云文件',
-                    description: '点击上方上传区域选择文件，上传后会在这里展示。',
-                  );
-                }
+                final CloudFileListResponse response =
+                    snapshot.data ?? const CloudFileListResponse();
+                final List<CloudItem> items = response.items;
+                final bool isLoading =
+                    snapshot.connectionState == ConnectionState.waiting;
 
-                return Column(
-                  children: files.map((CloudFile file) {
-                    final bool isBusy = _busyFileIds.contains(file.id);
-                    return _CloudFileTile(
-                      file: file,
-                      busy: isBusy,
-                      progress: _downloadProgress[file.id],
-                      onDownload: () => _downloadFile(file),
-                      onDelete: () => _moveFileToTrash(file),
-                    );
-                  }).toList(),
+                return Stack(
+                  children: <Widget>[
+                    AnimatedOpacity(
+                      duration: const Duration(milliseconds: 160),
+                      opacity: isLoading ? 0.82 : 1,
+                      child: Column(
+                        children: <Widget>[
+                          _CurrentPathBar(
+                            currentPath: response.path,
+                            parentPath: response.parentPath,
+                            onGoRoot: () => _navigateToPath(''),
+                            onGoParent: response.parentPath == null
+                                ? null
+                                : () => _goToParent(response.parentPath),
+                            onMoveHere: (CloudItem item) async {
+                              await _moveItem(item, targetPath: response.path);
+                            },
+                          ),
+                          const SizedBox(height: 12),
+                          if (items.isEmpty)
+                            const _EmptyState(
+                              icon: Icons.cloud_outlined,
+                              title: '当前目录为空',
+                              description: '可以上传文件，或在这里新建文件夹。',
+                            )
+                          else
+                            ..._buildCurrentDirectoryItems(items),
+                        ],
+                      ),
+                    ),
+                    if (isLoading)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        top: 0,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(99),
+                          child: const LinearProgressIndicator(minHeight: 4),
+                        ),
+                      ),
+                  ],
                 );
               },
             ),
@@ -669,7 +957,7 @@ class _FilesPageState extends ConsumerState<FilesPage> {
           const SizedBox(height: 16),
           SectionCard(
             title: '存储空间',
-            subtitle: '查看当前已用空间、剩余空间、单文件上限和服务端 2MB/s 传输限速。',
+            subtitle: '查看当前已用空间与剩余空间。',
             child: FutureBuilder<FileStorageLimits>(
               future: _limitsFuture,
               builder: (
@@ -697,18 +985,19 @@ class _FilesPageState extends ConsumerState<FilesPage> {
           const SizedBox(height: 16),
           SectionCard(
             title: '回收站',
-            subtitle: '展示已移入回收站的文件，可恢复、单独彻底删除，也可一键清空。',
-            titleAction: FutureBuilder<List<CloudFile>>(
-              future: _trashFilesFuture,
+            subtitle: '支持浏览已删除文件夹；列表展示当前层级的顶层条目。',
+            titleAction: FutureBuilder<CloudFileListResponse>(
+              future: _trashFuture,
               builder: (
                 BuildContext context,
-                AsyncSnapshot<List<CloudFile>> snapshot,
+                AsyncSnapshot<CloudFileListResponse> snapshot,
               ) {
-                final List<CloudFile> files = snapshot.data ?? <CloudFile>[];
+                final CloudFileListResponse response =
+                    snapshot.data ?? const CloudFileListResponse();
                 return FilledButton.tonalIcon(
-                  onPressed: files.isEmpty || _clearingTrash
+                  onPressed: response.items.isEmpty || _clearingTrash
                       ? null
-                      : () => _clearTrash(files),
+                      : () => _clearTrash(response),
                   icon: _clearingTrash
                       ? const SizedBox(
                           width: 16,
@@ -720,13 +1009,14 @@ class _FilesPageState extends ConsumerState<FilesPage> {
                 );
               },
             ),
-            child: FutureBuilder<List<CloudFile>>(
-              future: _trashFilesFuture,
+            child: FutureBuilder<CloudFileListResponse>(
+              future: _trashFuture,
               builder: (
                 BuildContext context,
-                AsyncSnapshot<List<CloudFile>> snapshot,
+                AsyncSnapshot<CloudFileListResponse> snapshot,
               ) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
                   return const Padding(
                     padding: EdgeInsets.symmetric(vertical: 8),
                     child: LinearProgressIndicator(),
@@ -736,30 +1026,67 @@ class _FilesPageState extends ConsumerState<FilesPage> {
                 if (snapshot.hasError) {
                   return _ErrorState(
                     message: '加载回收站失败，请确认 GET /files/trash 可用。',
-                    onRetry: _reloadTrashFiles,
+                    onRetry: _reloadTrash,
                   );
                 }
 
-                final List<CloudFile> files = snapshot.data ?? <CloudFile>[];
-                if (files.isEmpty) {
-                  return const _EmptyState(
-                    icon: Icons.delete_sweep_outlined,
-                    title: '回收站为空',
-                    description: '从文件列表移入回收站的文件会显示在这里，服务端也会按配置自动清理。',
-                  );
-                }
+                final CloudFileListResponse response =
+                    snapshot.data ?? const CloudFileListResponse();
+                final bool isLoading =
+                    snapshot.connectionState == ConnectionState.waiting;
 
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                return Stack(
                   children: <Widget>[
-                    ...files.map((CloudFile file) {
-                      return _TrashFileTile(
-                        file: file,
-                        busy: _busyTrashFileIds.contains(file.id),
-                        onRestore: () => _restoreTrashFile(file),
-                        onDelete: () => _deleteTrashFilePermanently(file),
-                      );
-                    }),
+                    AnimatedOpacity(
+                      duration: const Duration(milliseconds: 160),
+                      opacity: isLoading ? 0.82 : 1,
+                      child: Column(
+                        children: <Widget>[
+                          _TrashPathBar(
+                            currentPath: response.path,
+                            parentPath: response.parentPath,
+                            onGoRoot: () => _navigateTrashToPath(''),
+                            onGoParent: response.parentPath == null
+                                ? null
+                                : () => _goToTrashParent(response.parentPath),
+                          ),
+                          const SizedBox(height: 12),
+                          if (response.items.isEmpty)
+                            _EmptyState(
+                              icon: Icons.delete_sweep_outlined,
+                              title:
+                                  response.path.isEmpty ? '回收站为空' : '当前回收站目录为空',
+                              description: response.path.isEmpty
+                                  ? '删除的文件和文件夹会出现在这里。'
+                                  : '这个已删除文件夹下当前层级没有直属内容。',
+                            )
+                          else
+                            ...response.items.map((CloudItem item) {
+                              return _TrashItemTile(
+                                item: item,
+                                busy: _busyTrashItemIds.contains(item.id),
+                                onOpen: item.isFolder
+                                    ? () =>
+                                        _navigateTrashToPath(item.path ?? '')
+                                    : null,
+                                onRestore: () => _restoreTrashItem(item),
+                                onDelete: () =>
+                                    _deleteTrashItemPermanently(item),
+                              );
+                            }),
+                        ],
+                      ),
+                    ),
+                    if (isLoading)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        top: 0,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(99),
+                          child: const LinearProgressIndicator(minHeight: 4),
+                        ),
+                      ),
                   ],
                 );
               },
@@ -776,17 +1103,17 @@ class _FilesPageState extends ConsumerState<FilesPage> {
             DropTarget(
               onDragEntered: (_) {
                 setState(() {
-                  _dragging = true;
+                  _draggingUpload = true;
                 });
               },
               onDragExited: (_) {
                 setState(() {
-                  _dragging = false;
+                  _draggingUpload = false;
                 });
               },
               onDragDone: (DropDoneDetails details) async {
                 setState(() {
-                  _dragging = false;
+                  _draggingUpload = false;
                 });
 
                 final List<String> filePaths = details.files
@@ -799,7 +1126,7 @@ class _FilesPageState extends ConsumerState<FilesPage> {
             )
           else
             content,
-          if (_dragging && _dragEnabled)
+          if (_draggingUpload && _dragEnabled)
             IgnorePointer(
               child: Container(
                 margin: const EdgeInsets.all(12),
@@ -843,7 +1170,7 @@ class _FilesPageState extends ConsumerState<FilesPage> {
                         ),
                       ),
                       SizedBox(height: 6),
-                      Text('支持直接把文件拖到当前窗口'),
+                      Text('将文件拖到窗口内会上传到当前目录'),
                     ],
                   ),
                 ),
@@ -901,20 +1228,36 @@ class _UploadQueueItem {
 
 class _UploadHero extends StatelessWidget {
   const _UploadHero({
+    required this.currentPath,
     required this.uploadItems,
     required this.dragging,
     required this.dragEnabled,
+    required this.limits,
     required this.onUploadPressed,
   });
 
+  final String currentPath;
   final List<_UploadQueueItem> uploadItems;
   final bool dragging;
   final bool dragEnabled;
+  final FileStorageLimits? limits;
   final VoidCallback onUploadPressed;
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
+    final bool hideSecondaryInfo = Platform.isAndroid || Platform.isIOS;
+    final String singleFileLimit = limits == null
+        ? '单文件上限'
+        : '单文件上限 ${_formatFileSize(limits!.singleFileLimitBytes)}';
+    final String transferRate = limits == null
+        ? '当前限速'
+        : '当前限速 ${_formatFileSize(limits!.transferRateLimitBytesPerSecond)}/s';
+    final String totalCapacity = limits == null
+        ? '总容量'
+        : '总容量 ${_formatFileSize(limits!.totalUploadsLimitBytes)}';
+    final String dragSupport =
+        dragging ? '正在接收拖拽文件...' : (dragEnabled ? '支持拖拽上传' : '支持选择上传');
 
     return Container(
       padding: const EdgeInsets.all(24),
@@ -937,89 +1280,48 @@ class _UploadHero extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
-              Container(
-                width: 56,
-                height: 56,
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.18),
-                  borderRadius: BorderRadius.circular(18),
-                ),
-                child: const Icon(
-                  Icons.cloud_upload_rounded,
-                  color: Colors.white,
-                  size: 30,
-                ),
-              ),
-              const SizedBox(width: 16),
               Expanded(
                 child: Text(
-                  '上传到云文件',
+                  '上传云文件',
                   style: theme.textTheme.headlineSmall?.copyWith(
                     color: Colors.white,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
               ),
-            ],
-          ),
-          const SizedBox(height: 22),
-          Row(
-            children: <Widget>[
-              _UploadInfoChip(
-                label: dragging ? '正在接收拖拽文件...' : '单文件上限 200MB',
-              ),
               const SizedBox(width: 12),
-              const _UploadInfoChip(label: '总容量 10GB'),
-            ],
-          ),
-          const SizedBox(height: 16),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: <Widget>[
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      child: Text(
-                        '请选择文件上传',
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: Colors.white.withValues(alpha: 0.92),
-                          height: 1.0,
-                        ),
-                      ),
-                    ),
-                    if (dragEnabled)
-                      Text(
-                        '支持拖拽文件到当前窗口上传',
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: Colors.white.withValues(alpha: 0.82),
-                          height: 1.5,
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 16),
               FilledButton.icon(
                 onPressed: onUploadPressed,
                 style: FilledButton.styleFrom(
                   backgroundColor: Colors.white,
                   foregroundColor: const Color(0xFF0F6CBD),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 18,
-                    vertical: 14,
-                  ),
                 ),
-                icon: const Icon(Icons.add_rounded),
+                icon: const Icon(Icons.upload_file_rounded),
                 label: const Text('选择文件'),
               ),
             ],
           ),
+          const SizedBox(height: 8),
+          Text(
+            currentPath.isEmpty ? '当前目录：根目录' : '当前目录：/$currentPath',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: Colors.white.withValues(alpha: 0.88),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _UploadInfoRow(
+            leftLabel: singleFileLimit,
+            rightLabel: transferRate,
+          ),
+          if (!hideSecondaryInfo) ...<Widget>[
+            const SizedBox(height: 12),
+            _UploadInfoRow(
+              leftLabel: totalCapacity,
+              rightLabel: dragSupport,
+            ),
+          ],
           if (uploadItems.isNotEmpty) ...<Widget>[
             const SizedBox(height: 18),
             ...uploadItems.map(
@@ -1045,25 +1347,15 @@ class _UploadProgressTile extends StatelessWidget {
     final bool isUploading = item.status == _UploadQueueStatus.uploading;
     final bool isPending = item.status == _UploadQueueStatus.pending;
     final bool isFailed = item.status == _UploadQueueStatus.failed;
-    final bool isCompleted = item.status == _UploadQueueStatus.completed;
-
-    final Color accentColor = isFailed
-        ? const Color(0xFFFCA5A5)
-        : isCompleted
-            ? const Color(0xFF86EFAC)
-            : Colors.white.withValues(alpha: 0.22);
-
-    final String statusText;
-    if (isUploading) {
-      statusText = '上传中 ${_formatProgress(item.progress)}';
-    } else if (isPending) {
-      statusText = '排队等待上传';
-    } else if (isCompleted) {
-      statusText = '上传完成';
-    } else {
-      statusText =
-          item.errorMessage?.isNotEmpty == true ? item.errorMessage! : '上传失败';
-    }
+    final String statusText = isUploading
+        ? '上传中 ${(item.progress * 100).toStringAsFixed(0)}%'
+        : isPending
+            ? '排队等待上传'
+            : isFailed
+                ? (item.errorMessage?.isNotEmpty == true
+                    ? item.errorMessage!
+                    : '上传失败')
+                : '上传完成';
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -1117,25 +1409,9 @@ class _UploadProgressTile extends StatelessWidget {
                   fontWeight: FontWeight.w500,
                 ),
           ),
-          if (isCompleted)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Container(
-                width: 72,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: accentColor,
-                  borderRadius: BorderRadius.circular(99),
-                ),
-              ),
-            ),
         ],
       ),
     );
-  }
-
-  static String _formatProgress(double progress) {
-    return '${(progress * 100).toStringAsFixed(0)}%';
   }
 }
 
@@ -1146,11 +1422,8 @@ class _UploadInfoChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final ThemeData theme = Theme.of(context);
-
     return Container(
-      width: 160,
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: Colors.white.withValues(alpha: 0.14),
         borderRadius: BorderRadius.circular(18),
@@ -1158,245 +1431,874 @@ class _UploadInfoChip extends StatelessWidget {
       ),
       child: Text(
         label,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: theme.textTheme.bodySmall?.copyWith(
-          color: Colors.white,
-          fontWeight: FontWeight.w600,
-        ),
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Colors.white,
+              fontWeight: FontWeight.w600,
+            ),
       ),
     );
   }
 }
 
-class _CloudFileTile extends StatelessWidget {
-  const _CloudFileTile({
-    required this.file,
-    required this.busy,
-    required this.progress,
-    required this.onDownload,
-    required this.onDelete,
+class _UploadInfoRow extends StatelessWidget {
+  const _UploadInfoRow({
+    required this.leftLabel,
+    required this.rightLabel,
   });
 
-  final CloudFile file;
-  final bool busy;
-  final double? progress;
-  final VoidCallback onDownload;
-  final VoidCallback onDelete;
+  final String leftLabel;
+  final String rightLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double itemWidth = math.min(
+          (constraints.maxWidth - 12) / 2,
+          176,
+        );
+
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            SizedBox(
+                width: itemWidth, child: _UploadInfoChip(label: leftLabel)),
+            const SizedBox(width: 12),
+            SizedBox(
+              width: itemWidth,
+              child: _UploadInfoChip(label: rightLabel),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _CurrentPathBar extends StatelessWidget {
+  const _CurrentPathBar({
+    required this.currentPath,
+    required this.parentPath,
+    required this.onGoRoot,
+    required this.onGoParent,
+    required this.onMoveHere,
+  });
+
+  final String currentPath;
+  final String? parentPath;
+  final VoidCallback onGoRoot;
+  final VoidCallback? onGoParent;
+  final Future<void> Function(CloudItem item) onMoveHere;
+
+  @override
+  Widget build(BuildContext context) {
+    return DragTarget<CloudItem>(
+      onWillAcceptWithDetails: (DragTargetDetails<CloudItem> details) {
+        final CloudItem data = details.data;
+        if (data.isFolder && data.path == currentPath) {
+          return false;
+        }
+        return true;
+      },
+      onAcceptWithDetails: (DragTargetDetails<CloudItem> details) async {
+        await onMoveHere(details.data);
+      },
+      builder: (
+        BuildContext context,
+        List<CloudItem?> candidateData,
+        List<dynamic> rejectedData,
+      ) {
+        final bool isActive = candidateData.isNotEmpty;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: isActive
+                ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.08)
+                : Theme.of(context).colorScheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: isActive
+                  ? Theme.of(context).colorScheme.primary
+                  : Theme.of(context).colorScheme.outlineVariant,
+            ),
+          ),
+          child: Row(
+            children: <Widget>[
+              FilledButton.tonalIcon(
+                onPressed: onGoRoot,
+                icon: const Icon(Icons.home_outlined),
+                label: const Text('根目录'),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  currentPath.isEmpty ? '/' : '/$currentPath',
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filledTonal(
+                onPressed: onGoParent,
+                tooltip: '返回上一级',
+                iconSize: 20,
+                style: IconButton.styleFrom(
+                  padding: const EdgeInsets.all(12),
+                  minimumSize: const Size(44, 44),
+                  shape: const CircleBorder(),
+                  backgroundColor:
+                      Theme.of(context).colorScheme.primary.withValues(
+                            alpha: 0.10,
+                          ),
+                  foregroundColor: Theme.of(context).colorScheme.primary,
+                  side: BorderSide(
+                    color: Theme.of(context).colorScheme.primary.withValues(
+                          alpha: 0.18,
+                        ),
+                  ),
+                ),
+                icon:
+                    const Icon(Icons.subdirectory_arrow_left_rounded, size: 20),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _TrashPathBar extends StatelessWidget {
+  const _TrashPathBar({
+    required this.currentPath,
+    required this.parentPath,
+    required this.onGoRoot,
+    required this.onGoParent,
+  });
+
+  final String currentPath;
+  final String? parentPath;
+  final VoidCallback onGoRoot;
+  final VoidCallback? onGoParent;
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerLowest,
         borderRadius: BorderRadius.circular(18),
         border: Border.all(color: theme.colorScheme.outlineVariant),
       ),
-      child: Column(
+      child: Row(
         children: <Widget>[
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              _FileIconBox(
-                icon: _fileIconForMimeType(file.mimeType),
-                color: theme.colorScheme.primary,
-                background: theme.colorScheme.primary.withValues(alpha: 0.10),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Text(
-                      file.originalName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      '${_formatFileSize(file.size)}  ·  ${_formatMimeTypeLabel(file.mimeType, file.originalName)}',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      _formatCloudTimestamp(
-                        label: '上传时间',
-                        time: file.createdAt,
-                      ),
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              if (busy)
-                SizedBox(
-                  width: 78,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: <Widget>[
-                      const SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(strokeWidth: 2.4),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        progress == null
-                            ? '处理中'
-                            : '${(progress! * 100).toStringAsFixed(0)}%',
-                        style: theme.textTheme.bodySmall,
-                      ),
-                    ],
-                  ),
-                )
-              else
-                Wrap(
-                  spacing: 8,
-                  children: <Widget>[
-                    IconButton.filledTonal(
-                      tooltip: '下载',
-                      onPressed: onDownload,
-                      icon: const Icon(Icons.download_rounded),
-                    ),
-                    IconButton.filledTonal(
-                      tooltip: '移入回收站',
-                      onPressed: onDelete,
-                      style: IconButton.styleFrom(
-                        backgroundColor: const Color(0xFFFFE8D9),
-                        foregroundColor: const Color(0xFFB54708),
-                      ),
-                      icon: const Icon(Icons.delete_outline_rounded),
-                    ),
-                  ],
-                ),
-            ],
+          FilledButton.tonalIcon(
+            onPressed: onGoRoot,
+            icon: const Icon(Icons.delete_sweep_outlined),
+            label: const Text('回收站'),
           ),
-          if (busy) ...<Widget>[
-            const SizedBox(height: 12),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(99),
-              child: LinearProgressIndicator(
-                value: progress == null || progress == 0 ? null : progress,
-                minHeight: 8,
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              currentPath.isEmpty ? '/' : '/$currentPath',
+              style: theme.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w700,
               ),
             ),
-          ],
+          ),
+          const SizedBox(width: 8),
+          IconButton.filledTonal(
+            onPressed: onGoParent,
+            tooltip: '返回上一级',
+            iconSize: 20,
+            style: IconButton.styleFrom(
+              padding: const EdgeInsets.all(12),
+              minimumSize: const Size(44, 44),
+              shape: const CircleBorder(),
+            ),
+            icon: const Icon(Icons.subdirectory_arrow_left_rounded, size: 20),
+          ),
         ],
       ),
     );
   }
 }
 
-class _TrashFileTile extends StatelessWidget {
-  const _TrashFileTile({
-    required this.file,
-    required this.busy,
-    required this.onRestore,
-    required this.onDelete,
+class _DragSource extends StatefulWidget {
+  const _DragSource({
+    required this.item,
+    required this.child,
   });
 
-  final CloudFile file;
-  final bool busy;
-  final VoidCallback onRestore;
-  final VoidCallback onDelete;
+  final CloudItem item;
+  final Widget child;
+
+  @override
+  State<_DragSource> createState() => _DragSourceState();
+}
+
+class _DragSourceState extends State<_DragSource> {
+  bool _pressing = false;
+  bool _dragging = false;
+
+  void _setPressing(bool value) {
+    if (!mounted || _dragging || _pressing == value) {
+      return;
+    }
+    setState(() {
+      _pressing = value;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool showLift = _pressing && !_dragging;
+
+    return LongPressDraggable<CloudItem>(
+      data: widget.item,
+      delay: const Duration(milliseconds: 800),
+      onDragStarted: () {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _dragging = true;
+          _pressing = false;
+        });
+      },
+      onDragEnd: (_) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _dragging = false;
+          _pressing = false;
+        });
+      },
+      feedback: Material(
+        color: Colors.transparent,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(
+            minWidth: 320,
+            maxWidth: 420,
+          ),
+          child: Opacity(
+            opacity: 0.94,
+            child: widget.item.isFolder
+                ? _FolderTile(
+                    item: widget.item,
+                    busy: false,
+                    isDropTargetActive: false,
+                    onOpen: () {},
+                    onDelete: () {},
+                    showActions: false,
+                    compactMetaLayout: true,
+                  )
+                : _FileTile(
+                    item: widget.item,
+                    busy: false,
+                    progress: null,
+                    onDownload: () {},
+                    onDelete: () {},
+                    showActions: false,
+                    compactMetaLayout: true,
+                  ),
+          ),
+        ),
+      ),
+      childWhenDragging: _DraggingPlaceholder(item: widget.item),
+      child: Listener(
+        onPointerDown: (_) => _setPressing(true),
+        onPointerUp: (_) => _setPressing(false),
+        onPointerCancel: (_) => _setPressing(false),
+        child: Stack(
+          children: <Widget>[
+            AnimatedScale(
+              scale: showLift ? 0.985 : 1,
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeOutCubic,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(18),
+                  boxShadow: showLift
+                      ? <BoxShadow>[
+                          BoxShadow(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .primary
+                                .withValues(alpha: 0.16),
+                            blurRadius: 18,
+                            offset: const Offset(0, 8),
+                          ),
+                        ]
+                      : null,
+                ),
+                child: widget.child,
+              ),
+            ),
+            Positioned(
+              left: 24,
+              right: 24,
+              bottom: 12,
+              child: IgnorePointer(
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(99),
+                  child: TweenAnimationBuilder<double>(
+                    tween: Tween<double>(
+                      begin: 0,
+                      end: showLift ? 1 : 0,
+                    ),
+                    duration: Duration(
+                      milliseconds: showLift ? 800 : 180,
+                    ),
+                    curve: showLift ? Curves.easeOutCubic : Curves.easeInCubic,
+                    builder: (
+                      BuildContext context,
+                      double value,
+                      Widget? child,
+                    ) {
+                      return Align(
+                        alignment: Alignment.center,
+                        child: FractionallySizedBox(
+                          widthFactor: value,
+                          child: child,
+                        ),
+                      );
+                    },
+                    child: Container(
+                      height: 4,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: <Color>[
+                            Theme.of(
+                              context,
+                            ).colorScheme.primary.withValues(alpha: 0.30),
+                            Theme.of(context).colorScheme.primary,
+                            Theme.of(
+                              context,
+                            ).colorScheme.primary.withValues(alpha: 0.30),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _DraggingPlaceholder extends StatelessWidget {
+  const _DraggingPlaceholder({required this.item});
+
+  final CloudItem item;
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
-    final DateTime? deletedAt = file.deletedAt;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: const Color(0xFFFFFBF5),
+        color: theme.colorScheme.primary.withValues(alpha: 0.06),
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFFF2D3A5)),
+        border: Border.all(color: theme.colorScheme.primary),
       ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Column(
         children: <Widget>[
-          const _FileIconBox(
-            icon: Icons.delete_sweep_outlined,
-            color: Color(0xFFB54708),
-            background: Color(0xFFFFEDD5),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: <Widget>[
+              _FileIconBox(
+                icon: item.isFolder
+                    ? Icons.folder_open_rounded
+                    : _fileIconForMimeType(item.mimeType),
+                color: item.isFolder
+                    ? const Color(0xFFC67F00)
+                    : theme.colorScheme.primary,
+                background: item.isFolder
+                    ? const Color(0xFFFFF2CC)
+                    : theme.colorScheme.primary.withValues(alpha: 0.10),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _ItemTextBlock(
+                  title: item.displayName,
+                  subtitle: item.isFolder
+                      ? (item.path?.isEmpty == true
+                          ? '/'
+                          : '/${item.path ?? ''}')
+                      : '${_formatFileSize(item.size)}  ·  ${_formatMimeTypeLabel(item.mimeType, item.displayName)}',
+                  meta: '拖拽中...',
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  file.originalName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  '${_formatFileSize(file.size)}  ·  ${_formatMimeTypeLabel(file.mimeType, file.originalName)}',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  deletedAt == null
-                      ? '已移入回收站'
-                      : _formatCloudTimestamp(label: '删除时间', time: deletedAt),
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ),
+          const SizedBox(height: 12),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(99),
+            child: const LinearProgressIndicator(minHeight: 8),
           ),
-          const SizedBox(width: 12),
-          busy
-              ? const SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2.4),
-                )
-              : Wrap(
-                  spacing: 8,
-                  children: <Widget>[
-                    IconButton.filledTonal(
-                      tooltip: '恢复',
-                      onPressed: onRestore,
-                      style: IconButton.styleFrom(
-                        backgroundColor: const Color(0xFFDFF7E2),
-                        foregroundColor: const Color(0xFF166534),
-                      ),
-                      icon: const Icon(Icons.restore_rounded),
-                    ),
-                    IconButton.filled(
-                      tooltip: '彻底删除',
-                      onPressed: onDelete,
-                      style: IconButton.styleFrom(
-                        backgroundColor: const Color(0xFFB42318),
-                        foregroundColor: Colors.white,
-                      ),
-                      icon: const Icon(Icons.delete_forever_rounded),
-                    ),
-                  ],
-                ),
         ],
       ),
+    );
+  }
+}
+
+class _MoveTarget extends StatelessWidget {
+  const _MoveTarget({
+    required this.item,
+    required this.currentPath,
+    required this.onMoveHere,
+    required this.child,
+  });
+
+  final CloudItem item;
+  final String currentPath;
+  final Future<void> Function(CloudItem item) onMoveHere;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!item.isFolder) {
+      return child;
+    }
+
+    return DragTarget<CloudItem>(
+      onWillAcceptWithDetails: (DragTargetDetails<CloudItem> details) {
+        final CloudItem dragged = details.data;
+        final String targetPath = item.path ?? '';
+        if (dragged.id == item.id) {
+          return false;
+        }
+        if (!dragged.isFolder) {
+          return dragged.directoryPath != targetPath;
+        }
+        final String sourcePath = dragged.path ?? '';
+        return targetPath != sourcePath &&
+            !targetPath.startsWith(sourcePath.isEmpty ? '/' : '$sourcePath/');
+      },
+      onAcceptWithDetails: (DragTargetDetails<CloudItem> details) async {
+        await onMoveHere(details.data);
+      },
+      builder: (
+        BuildContext context,
+        List<CloudItem?> candidateData,
+        List<dynamic> rejectedData,
+      ) {
+        final bool isActive = candidateData.isNotEmpty;
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(18),
+            boxShadow: isActive
+                ? <BoxShadow>[
+                    BoxShadow(
+                      color: Theme.of(context)
+                          .colorScheme
+                          .primary
+                          .withValues(alpha: 0.18),
+                      blurRadius: 18,
+                      offset: const Offset(0, 8),
+                    ),
+                  ]
+                : null,
+          ),
+          child: child,
+        );
+      },
+    );
+  }
+}
+
+class _FolderTile extends StatelessWidget {
+  const _FolderTile({
+    required this.item,
+    required this.busy,
+    required this.isDropTargetActive,
+    required this.onOpen,
+    required this.onDelete,
+    this.showActions = true,
+    this.compactMetaLayout = false,
+  });
+
+  final CloudItem item;
+  final bool busy;
+  final bool isDropTargetActive;
+  final VoidCallback onOpen;
+  final VoidCallback onDelete;
+  final bool showActions;
+  final bool compactMetaLayout;
+
+  @override
+  Widget build(BuildContext context) {
+    return _BaseItemTile(
+      icon: Icons.folder_open_rounded,
+      iconColor: const Color(0xFFC67F00),
+      iconBackground: const Color(0xFFFFF2CC),
+      title: item.displayName,
+      subtitle: item.path?.isEmpty == true ? '/' : '/${item.path ?? ''}',
+      meta: _formatCloudTimestamp(label: '创建时间', time: item.createdAt),
+      busy: busy,
+      highlight: isDropTargetActive,
+      compactMetaLayout: compactMetaLayout,
+      onTap: onOpen,
+      actions: showActions
+          ? <Widget>[
+              IconButton.filledTonal(
+                tooltip: '打开文件夹',
+                onPressed: onOpen,
+                icon: const Icon(Icons.folder_open_rounded),
+              ),
+              IconButton.filledTonal(
+                tooltip: '删除文件夹',
+                onPressed: onDelete,
+                style: IconButton.styleFrom(
+                  backgroundColor: const Color(0xFFFEE4E2),
+                  foregroundColor: const Color(0xFFB42318),
+                ),
+                icon: const Icon(Icons.delete_outline_rounded),
+              ),
+            ]
+          : const <Widget>[],
+    );
+  }
+}
+
+class _FileTile extends StatelessWidget {
+  const _FileTile({
+    required this.item,
+    required this.busy,
+    required this.progress,
+    required this.onDownload,
+    required this.onDelete,
+    this.showActions = true,
+    this.compactMetaLayout = false,
+  });
+
+  final CloudItem item;
+  final bool busy;
+  final double? progress;
+  final VoidCallback onDownload;
+  final VoidCallback onDelete;
+  final bool showActions;
+  final bool compactMetaLayout;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+
+    return _BaseItemTile(
+      icon: _fileIconForMimeType(item.mimeType),
+      iconColor: theme.colorScheme.primary,
+      iconBackground: theme.colorScheme.primary.withValues(alpha: 0.10),
+      title: item.displayName,
+      subtitle:
+          '${_formatFileSize(item.size)}  ·  ${_formatMimeTypeLabel(item.mimeType, item.displayName)}',
+      meta: _formatCloudTimestamp(label: '上传时间', time: item.createdAt),
+      busy: busy,
+      progress: progress,
+      compactMetaLayout: compactMetaLayout,
+      actions: showActions
+          ? <Widget>[
+              IconButton.filledTonal(
+                tooltip: '下载',
+                onPressed: onDownload,
+                icon: const Icon(Icons.download_rounded),
+              ),
+              IconButton.filledTonal(
+                tooltip: '移入回收站',
+                onPressed: onDelete,
+                style: IconButton.styleFrom(
+                  backgroundColor: const Color(0xFFFFF4CC),
+                  foregroundColor: const Color(0xFFB54708),
+                ),
+                icon: const Icon(Icons.delete_outline_rounded),
+              ),
+            ]
+          : const <Widget>[],
+    );
+  }
+}
+
+class _TrashItemTile extends StatelessWidget {
+  const _TrashItemTile({
+    required this.item,
+    required this.busy,
+    required this.onOpen,
+    required this.onRestore,
+    required this.onDelete,
+  });
+
+  final CloudItem item;
+  final bool busy;
+  final VoidCallback? onOpen;
+  final VoidCallback onRestore;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final String subtitle = item.isFolder
+        ? '文件夹  ·  /${item.path ?? ''}'
+        : '${_formatFileSize(item.size)}  ·  ${_formatMimeTypeLabel(item.mimeType, item.displayName)}';
+
+    return _BaseItemTile(
+      icon: item.isFolder
+          ? Icons.folder_delete_outlined
+          : Icons.delete_sweep_outlined,
+      iconColor: const Color(0xFFB54708),
+      iconBackground: const Color(0xFFFFEDD5),
+      title: item.displayName,
+      subtitle: subtitle,
+      meta: item.deletedAt == null
+          ? '已移入回收站'
+          : _formatCloudTimestamp(label: '删除时间', time: item.deletedAt),
+      busy: busy,
+      onTap: onOpen,
+      backgroundColor: const Color(0xFFFFFBF5),
+      borderColor: const Color(0xFFF2D3A5),
+      actions: <Widget>[
+        if (item.isFolder)
+          IconButton.filledTonal(
+            tooltip: '打开已删除文件夹',
+            onPressed: onOpen,
+            icon: const Icon(Icons.folder_open_rounded),
+          ),
+        IconButton.filledTonal(
+          tooltip: '恢复',
+          onPressed: onRestore,
+          style: IconButton.styleFrom(
+            backgroundColor: const Color(0xFFDFF7E2),
+            foregroundColor: const Color(0xFF166534),
+          ),
+          icon: const Icon(Icons.restore_rounded),
+        ),
+        IconButton.filled(
+          tooltip: '彻底删除',
+          onPressed: onDelete,
+          style: IconButton.styleFrom(
+            backgroundColor: const Color(0xFFB42318),
+            foregroundColor: Colors.white,
+          ),
+          icon: const Icon(Icons.delete_forever_rounded),
+        ),
+      ],
+    );
+  }
+}
+
+class _BaseItemTile extends StatelessWidget {
+  const _BaseItemTile({
+    required this.icon,
+    required this.iconColor,
+    required this.iconBackground,
+    required this.title,
+    required this.subtitle,
+    required this.meta,
+    required this.busy,
+    required this.actions,
+    this.progress,
+    this.highlight = false,
+    this.compactMetaLayout = false,
+    this.onTap,
+    this.backgroundColor,
+    this.borderColor,
+  });
+
+  final IconData icon;
+  final Color iconColor;
+  final Color iconBackground;
+  final String title;
+  final String subtitle;
+  final String meta;
+  final bool busy;
+  final List<Widget> actions;
+  final double? progress;
+  final bool highlight;
+  final bool compactMetaLayout;
+  final VoidCallback? onTap;
+  final Color? backgroundColor;
+  final Color? borderColor;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(18),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          margin: const EdgeInsets.only(bottom: 12),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: backgroundColor ?? theme.colorScheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: highlight
+                  ? theme.colorScheme.primary
+                  : (borderColor ?? theme.colorScheme.outlineVariant),
+            ),
+          ),
+          child: compactMetaLayout
+              ? _buildCompactContent(theme)
+              : _buildDefaultContent(theme),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDefaultContent(ThemeData theme) {
+    return Column(
+      children: <Widget>[
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: <Widget>[
+            _FileIconBox(
+              icon: icon,
+              color: iconColor,
+              background: iconBackground,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _ItemTextBlock(
+                title: title,
+                subtitle: subtitle,
+                meta: meta,
+              ),
+            ),
+            const SizedBox(width: 12),
+            if (busy)
+              SizedBox(
+                width: 78,
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: <Widget>[
+                    const SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(strokeWidth: 2.4),
+                    ),
+                    if (progress != null) ...<Widget>[
+                      const SizedBox(height: 8),
+                      Text(
+                        '${(progress! * 100).toStringAsFixed(0)}%',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ],
+                  ],
+                ),
+              )
+            else if (actions.isNotEmpty)
+              SizedBox(
+                width: 152,
+                child: Wrap(
+                  alignment: WrapAlignment.center,
+                  runAlignment: WrapAlignment.center,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: actions,
+                ),
+              ),
+          ],
+        ),
+        if (busy && progress != null) ...<Widget>[
+          const SizedBox(height: 12),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(99),
+            child: LinearProgressIndicator(
+              value: progress == 0 ? null : progress,
+              minHeight: 8,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildCompactContent(ThemeData theme) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: <Widget>[
+        _FileIconBox(
+          icon: icon,
+          color: iconColor,
+          background: iconBackground,
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: _ItemTextBlock(
+            title: title,
+            subtitle: subtitle,
+            meta: meta,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ItemTextBlock extends StatelessWidget {
+  const _ItemTextBlock({
+    required this.title,
+    required this.subtitle,
+    required this.meta,
+  });
+
+  final String title;
+  final String subtitle;
+  final String meta;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.titleMedium?.copyWith(
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          subtitle,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        if (meta.isNotEmpty) ...<Widget>[
+          const SizedBox(height: 4),
+          Text(
+            meta,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ],
     );
   }
 }
@@ -1460,9 +2362,9 @@ class _StorageLimitsPanel extends StatelessWidget {
                       Text(
                         '已使用',
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onSurfaceVariant,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant,
                             ),
                       ),
                     ],
@@ -1486,32 +2388,6 @@ class _StorageLimitsPanel extends StatelessWidget {
                     color: const Color(0xFF16A34A),
                   ),
                 ],
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 18),
-        Row(
-          children: <Widget>[
-            Expanded(
-              child: _StatTile(
-                label: '总容量',
-                value: _formatFileSize(limits.totalUploadsLimitBytes),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _StatTile(
-                label: '单文件上限',
-                value: _formatFileSize(limits.singleFileLimitBytes),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _StatTile(
-                label: '当前限速',
-                value:
-                    '${_formatFileSize(limits.transferRateLimitBytesPerSecond)}/s',
               ),
             ),
           ],
@@ -1563,47 +2439,6 @@ class _MetricChip extends StatelessWidget {
   }
 }
 
-class _StatTile extends StatelessWidget {
-  const _StatTile({
-    required this.label,
-    required this.value,
-  });
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    final ThemeData theme = Theme.of(context);
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerLowest,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: theme.colorScheme.outlineVariant),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text(
-            label,
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            value,
-            style: theme.textTheme.titleSmall?.copyWith(
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class _StoragePieChartPainter extends CustomPainter {
   const _StoragePieChartPainter({
     required this.usedRatio,
@@ -1618,7 +2453,7 @@ class _StoragePieChartPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final Offset center = Offset(size.width / 2, size.height / 2);
-    final double strokeWidth = 18;
+    const double strokeWidth = 18;
     final double radius = (math.min(size.width, size.height) - strokeWidth) / 2;
     final Rect rect = Rect.fromCircle(center: center, radius: radius);
 

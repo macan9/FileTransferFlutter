@@ -1,5 +1,8 @@
 abstract final class AppNetworkConfig {
-  static const String defaultServerUrl = 'http://139.196.158.225:3100';
+  static const String launchConfigFileName = 'app_env.json';
+  static const String fallbackDevServerUrl = 'http://localhost:3000';
+  static const String fallbackProServerUrl = 'http://255';
+  static const String defaultServerUrl = fallbackDevServerUrl;
   static const String exampleLanServerUrl = 'http://192.168.1.10:3000';
   static const Set<String> legacyLocalServerUrls = <String>{
     'http://127.0.0.1:3000',
@@ -8,6 +11,10 @@ abstract final class AppNetworkConfig {
   };
 
   static Uri get defaultServerUri => Uri.parse(defaultServerUrl);
+
+  static String normalizeUrl(String value) {
+    return _normalizeUrl(value);
+  }
 
   static bool isLegacyLocalServerUrl(String value) {
     final String normalized = _normalizeUrl(value);

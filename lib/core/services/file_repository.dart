@@ -1,5 +1,3 @@
-// ignore_for_file: dead_code
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -8,8 +6,10 @@ import 'dart:math' as math;
 import 'package:file_picker/file_picker.dart';
 import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:file_transfer_flutter/core/error/app_exception.dart';
-import 'package:file_transfer_flutter/core/models/cloud_file.dart';
+import 'package:file_transfer_flutter/core/models/cloud_file_list_response.dart';
+import 'package:file_transfer_flutter/core/models/cloud_item.dart';
 import 'package:file_transfer_flutter/core/models/file_storage_limits.dart';
+import 'package:file_transfer_flutter/core/models/trash_item_operation_result.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
@@ -17,22 +17,35 @@ typedef TransferProgressCallback = void Function(double progress);
 
 abstract interface class FileRepository {
   Future<List<String>> fetchRecentFiles();
-  Future<List<CloudFile>> fetchFiles();
-  Future<List<CloudFile>> fetchTrashFiles();
+  Future<CloudFileListResponse> fetchFiles({String path = ''});
+  Future<CloudFileListResponse> fetchTrashFiles({String path = ''});
   Future<FileStorageLimits> fetchLimits();
-  Future<CloudFile> uploadFile({
+  Future<CloudItem> uploadFile({
+    String path = '',
     TransferProgressCallback? onProgress,
   });
-  Future<CloudFile> uploadFileFromPath(
+  Future<CloudItem> uploadFileFromPath(
     String filePath, {
+    String path = '',
     TransferProgressCallback? onProgress,
   });
   Future<void> deleteFile(int id);
-  Future<void> restoreTrashFile(int id);
-  Future<void> deleteTrashFilePermanently(int id);
+  Future<void> createFolder({
+    required String path,
+    String? name,
+  });
+  Future<void> deleteFolder(String path);
+  Future<void> moveFile(int id, {required String targetPath});
+  Future<void> moveFolder({
+    required String sourcePath,
+    required String targetPath,
+    String? name,
+  });
+  Future<TrashItemOperationResult> restoreTrashItem(int id);
+  Future<TrashItemOperationResult> deleteTrashFilePermanently(int id);
   Future<void> clearTrash();
   Future<String> downloadFile(
-    CloudFile file, {
+    CloudItem file, {
     TransferProgressCallback? onProgress,
   });
 }
@@ -52,18 +65,33 @@ class HttpFileRepository implements FileRepository {
 
   @override
   Future<List<String>> fetchRecentFiles() async {
-    final List<CloudFile> files = await fetchFiles();
-    return files.take(4).map((CloudFile file) => file.originalName).toList();
+    final CloudFileListResponse response = await fetchFiles();
+    return response.files
+        .take(4)
+        .map((CloudItem file) => file.displayName)
+        .toList();
   }
 
   @override
-  Future<List<CloudFile>> fetchFiles() async {
-    return _fetchFileList('/files', fallbackMessage: '加载文件列表失败');
+  Future<CloudFileListResponse> fetchFiles({String path = ''}) async {
+    return _fetchFileList(
+      '/files',
+      queryParameters: <String, String>{
+        if (path.isNotEmpty) 'path': path,
+      },
+      fallbackMessage: '加载文件列表失败',
+    );
   }
 
   @override
-  Future<List<CloudFile>> fetchTrashFiles() async {
-    return _fetchFileList('/files/trash', fallbackMessage: '加载回收站失败');
+  Future<CloudFileListResponse> fetchTrashFiles({String path = ''}) async {
+    return _fetchFileList(
+      '/files/trash',
+      queryParameters: <String, String>{
+        if (path.isNotEmpty) 'path': path,
+      },
+      fallbackMessage: '加载回收站失败',
+    );
   }
 
   @override
@@ -78,7 +106,8 @@ class HttpFileRepository implements FileRepository {
   }
 
   @override
-  Future<CloudFile> uploadFile({
+  Future<CloudItem> uploadFile({
+    String path = '',
     TransferProgressCallback? onProgress,
   }) async {
     final FilePickerResult? result = await FilePicker.platform.pickFiles(
@@ -89,21 +118,22 @@ class HttpFileRepository implements FileRepository {
       throw const AppException('已取消上传');
     }
 
-    final PlatformFile pickedFile = result.files.single;
-    final String? filePath = pickedFile.path;
+    final String? filePath = result.files.single.path;
     if (filePath == null || filePath.isEmpty) {
       throw const AppException('未能读取所选文件路径');
     }
 
     return uploadFileFromPath(
       filePath,
+      path: path,
       onProgress: onProgress,
     );
   }
 
   @override
-  Future<CloudFile> uploadFileFromPath(
+  Future<CloudItem> uploadFileFromPath(
     String filePath, {
+    String path = '',
     TransferProgressCallback? onProgress,
   }) async {
     final File file = File(filePath);
@@ -119,8 +149,15 @@ class HttpFileRepository implements FileRepository {
       }),
     );
 
-    final http.MultipartRequest request =
-        http.MultipartRequest('POST', _buildUri('/files/upload'));
+    final http.MultipartRequest request = http.MultipartRequest(
+      'POST',
+      _buildUri(
+        '/files/upload',
+        queryParameters: <String, String>{
+          if (path.isNotEmpty) 'path': path,
+        },
+      ),
+    );
     request.files.add(
       http.MultipartFile(
         'file',
@@ -136,7 +173,7 @@ class HttpFileRepository implements FileRepository {
     _ensureSuccess(response, fallbackMessage: '上传文件失败');
     onProgress?.call(1);
 
-    return CloudFile.fromJson(
+    return CloudItem.fromJson(
       jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>,
     );
   }
@@ -149,18 +186,79 @@ class HttpFileRepository implements FileRepository {
   }
 
   @override
-  Future<void> restoreTrashFile(int id) async {
+  Future<void> createFolder({
+    required String path,
+    String? name,
+  }) async {
     final http.Response response = await _client.post(
-      _buildUri('/files/trash/$id/restore'),
+      _buildUri('/files/folders'),
+      headers: const <String, String>{'Content-Type': 'application/json'},
+      body: jsonEncode(<String, dynamic>{
+        'path': path,
+        if (name != null && name.trim().isNotEmpty) 'name': name.trim(),
+      }),
     );
-    _ensureSuccess(response, fallbackMessage: '恢复文件失败');
+    _ensureSuccess(response, fallbackMessage: '新建文件夹失败');
   }
 
   @override
-  Future<void> deleteTrashFilePermanently(int id) async {
+  Future<void> deleteFolder(String path) async {
+    final http.Response response = await _client.delete(
+      _buildUri(
+        '/files/folders',
+        queryParameters: <String, String>{'path': path},
+      ),
+    );
+    _ensureSuccess(response, fallbackMessage: '删除文件夹失败');
+  }
+
+  @override
+  Future<void> moveFile(int id, {required String targetPath}) async {
+    final http.Response response = await _client.post(
+      _buildUri('/files/$id/move'),
+      headers: const <String, String>{'Content-Type': 'application/json'},
+      body: jsonEncode(<String, dynamic>{'targetPath': targetPath}),
+    );
+    _ensureSuccess(response, fallbackMessage: '移动文件失败');
+  }
+
+  @override
+  Future<void> moveFolder({
+    required String sourcePath,
+    required String targetPath,
+    String? name,
+  }) async {
+    final http.Response response = await _client.post(
+      _buildUri('/files/folders/move'),
+      headers: const <String, String>{'Content-Type': 'application/json'},
+      body: jsonEncode(<String, dynamic>{
+        'sourcePath': sourcePath,
+        'targetPath': targetPath,
+        if (name != null && name.trim().isNotEmpty) 'name': name.trim(),
+      }),
+    );
+    _ensureSuccess(response, fallbackMessage: '移动文件夹失败');
+  }
+
+  @override
+  Future<TrashItemOperationResult> restoreTrashItem(int id) async {
+    final http.Response response = await _client.post(
+      _buildUri('/files/trash/$id/restore'),
+    );
+    _ensureSuccess(response, fallbackMessage: '恢复失败');
+    return TrashItemOperationResult.fromJson(
+      jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<TrashItemOperationResult> deleteTrashFilePermanently(int id) async {
     final http.Response response =
         await _client.delete(_buildUri('/files/trash/$id'));
-    _ensureSuccess(response, fallbackMessage: '彻底删除文件失败');
+    _ensureSuccess(response, fallbackMessage: '彻底删除失败');
+    return TrashItemOperationResult.fromJson(
+      jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>,
+    );
   }
 
   @override
@@ -172,9 +270,13 @@ class HttpFileRepository implements FileRepository {
 
   @override
   Future<String> downloadFile(
-    CloudFile file, {
+    CloudItem file, {
     TransferProgressCallback? onProgress,
   }) async {
+    if (!file.isFile) {
+      throw const AppException('文件夹不支持下载');
+    }
+
     final Directory directory = Directory(_downloadDirectory);
     if (!await directory.exists()) {
       await directory.create(recursive: true);
@@ -182,71 +284,40 @@ class HttpFileRepository implements FileRepository {
 
     final String targetPath = await _buildDownloadPath(
       directory,
-      file.originalName,
+      file.displayName,
     );
     return _downloadToPath(file, targetPath, onProgress: onProgress);
-    final String? savePath = await FilePicker.platform.saveFile(
-      dialogTitle: '保存文件',
-      fileName: file.originalName,
-    );
-
-    if (savePath == null || savePath.isEmpty) {
-      throw const AppException('已取消下载');
-    }
-
-    final http.StreamedResponse response = await _client.send(
-      http.Request('GET', _buildUri('/files/${file.id}/download')),
-    );
-
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      final http.Response normalizedResponse =
-          await http.Response.fromStream(response);
-      _ensureSuccess(normalizedResponse, fallbackMessage: '下载文件失败');
-    }
-
-    final File targetFile = File(savePath);
-    final IOSink sink = targetFile.openWrite();
-    final int totalBytes = response.contentLength ?? file.size;
-    int receivedBytes = 0;
-
-    try {
-      await for (final List<int> chunk in response.stream) {
-        sink.add(chunk);
-        receivedBytes += chunk.length;
-        if (totalBytes > 0) {
-          onProgress?.call(
-            math.min(receivedBytes / totalBytes, 1).toDouble(),
-          );
-        }
-      }
-    } finally {
-      await sink.close();
-    }
-
-    onProgress?.call(1);
-    return targetFile.path;
   }
 
-  Future<List<CloudFile>> _fetchFileList(
+  Future<CloudFileListResponse> _fetchFileList(
     String path, {
+    Map<String, String>? queryParameters,
     required String fallbackMessage,
   }) async {
-    final http.Response response = await _client.get(_buildUri(path));
+    final http.Response response = await _client.get(
+      _buildUri(path, queryParameters: queryParameters),
+    );
     _ensureSuccess(response, fallbackMessage: fallbackMessage);
 
-    final List<dynamic> data =
-        jsonDecode(utf8.decode(response.bodyBytes)) as List<dynamic>;
-    return data
-        .map((dynamic item) => CloudFile.fromJson(item as Map<String, dynamic>))
-        .toList();
+    return CloudFileListResponse.fromJson(
+      jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>,
+    );
   }
 
-  Uri _buildUri(String path) {
-    return _baseUri.replace(path: path);
+  Uri _buildUri(
+    String path, {
+    Map<String, String>? queryParameters,
+  }) {
+    return _baseUri.replace(
+      path: path,
+      queryParameters: queryParameters == null || queryParameters.isEmpty
+          ? null
+          : queryParameters,
+    );
   }
 
   Future<String> _downloadToPath(
-    CloudFile file,
+    CloudItem file,
     String savePath, {
     TransferProgressCallback? onProgress,
   }) async {
@@ -257,7 +328,7 @@ class HttpFileRepository implements FileRepository {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       final http.Response normalizedResponse =
           await http.Response.fromStream(response);
-      _ensureSuccess(normalizedResponse, fallbackMessage: '涓嬭浇鏂囦欢澶辫触');
+      _ensureSuccess(normalizedResponse, fallbackMessage: '下载文件失败');
     }
 
     final File targetFile = File(savePath);
@@ -346,15 +417,20 @@ class HttpFileRepository implements FileRepository {
       'Single file size cannot exceed 200MB': '单个文件大小不能超过 200MB',
       'File too large': '单个文件大小不能超过 200MB',
       'Expected maxSize to be': '单个文件大小不能超过 200MB',
-      'Uploads directory cannot exceed 10GB total size': '服务器容量已满，请清理后再上传',
+      'Uploads directory cannot exceed 10GB total size': '服务端容量已满，请清理后再上传',
       'Failed to inspect uploads directory usage': '无法检查服务器存储空间，请稍后重试',
       'Invalid file name': '文件名无效，请重新选择文件',
       'Unexpected field': '上传参数无效，请重新选择文件',
       'File moved to trash.': '文件已移入回收站',
+      'Folder moved to trash.': '文件夹已移入回收站',
       'File restored from trash.': '文件已从回收站恢复',
+      'Folder restored from trash.': '文件夹已从回收站恢复',
       'File is in trash and cannot be downloaded.': '回收站中的文件不支持下载',
       'File not found': '文件不存在',
-      'Trash file not found': '回收站文件不存在',
+      'Folder not found': '文件夹不存在',
+      'Trash file not found': '回收站条目不存在',
+      'Trash folder': '回收站文件夹不存在',
+      'Trash item not found': '回收站条目不存在',
       'Trash cleared successfully': '回收站已清空',
     };
 
