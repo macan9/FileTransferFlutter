@@ -12,22 +12,22 @@ class AppShell extends StatelessWidget {
 
   static const List<NavigationDestination> _destinations =
       <NavigationDestination>[
-        NavigationDestination(
-          icon: Icon(Icons.folder_open_outlined),
-          selectedIcon: Icon(Icons.folder_open),
-          label: '\u4e91\u6587\u4ef6',
-        ),
-        NavigationDestination(
-          icon: Icon(Icons.sync_alt_outlined),
-          selectedIcon: Icon(Icons.sync_alt),
-          label: '\u5b9e\u65f6\u4f20\u8f93',
-        ),
-        NavigationDestination(
-          icon: Icon(Icons.settings_outlined),
-          selectedIcon: Icon(Icons.settings),
-          label: '\u8bbe\u7f6e',
-        ),
-      ];
+    NavigationDestination(
+      icon: Icon(Icons.folder_open_outlined),
+      selectedIcon: Icon(Icons.folder_open),
+      label: '\u4e91\u6587\u4ef6',
+    ),
+    NavigationDestination(
+      icon: Icon(Icons.sync_alt_outlined),
+      selectedIcon: Icon(Icons.sync_alt),
+      label: '\u5b9e\u65f6\u4f20\u8f93',
+    ),
+    NavigationDestination(
+      icon: Icon(Icons.settings_outlined),
+      selectedIcon: Icon(Icons.settings),
+      label: '\u8bbe\u7f6e',
+    ),
+  ];
 
   @override
   Widget build(BuildContext context) {
@@ -55,6 +55,119 @@ class AppShell extends StatelessWidget {
             initialLocation: index == navigationShell.currentIndex,
           );
         },
+      ),
+    );
+  }
+}
+
+class AppShellBranchContainer extends StatefulWidget {
+  const AppShellBranchContainer({
+    super.key,
+    required this.currentIndex,
+    required this.children,
+  });
+
+  final int currentIndex;
+  final List<Widget> children;
+
+  @override
+  State<AppShellBranchContainer> createState() =>
+      _AppShellBranchContainerState();
+}
+
+class _AppShellBranchContainerState extends State<AppShellBranchContainer>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: _transitionDuration,
+  );
+  late final Animation<double> _animation = CurvedAnimation(
+    parent: _controller,
+    curve: Curves.easeOutCubic,
+  );
+  int? _previousIndex;
+  late int _activeIndex = widget.currentIndex;
+  int _direction = 1;
+
+  Duration get _transitionDuration {
+    final bool isDesktop =
+        Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+    return Duration(milliseconds: isDesktop ? 260 : 320);
+  }
+
+  @override
+  void didUpdateWidget(covariant AppShellBranchContainer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (oldWidget.currentIndex == widget.currentIndex) {
+      return;
+    }
+
+    _previousIndex = oldWidget.currentIndex;
+    _activeIndex = widget.currentIndex;
+    _direction = widget.currentIndex > oldWidget.currentIndex ? 1 : -1;
+    _controller
+      ..duration = _transitionDuration
+      ..forward(from: 0);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isAnimating = _controller.isAnimating &&
+        _previousIndex != null &&
+        _previousIndex != _activeIndex;
+
+    return ClipRect(
+      child: AnimatedBuilder(
+        animation: _animation,
+        builder: (BuildContext context, Widget? child) {
+          return Stack(
+            fit: StackFit.expand,
+            children: <Widget>[
+              for (int index = 0; index < widget.children.length; index++)
+                _buildBranch(index, widget.children[index], isAnimating),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildBranch(int index, Widget child, bool isAnimating) {
+    final bool isCurrent = index == _activeIndex;
+    final bool isPrevious = isAnimating && index == _previousIndex;
+    final bool shouldShow = isCurrent || isPrevious;
+
+    if (!shouldShow) {
+      return Offstage(
+        offstage: true,
+        child: TickerMode(enabled: false, child: child),
+      );
+    }
+
+    final Offset offset;
+    if (isPrevious) {
+      offset = Offset(-_direction * _animation.value, 0);
+    } else if (isAnimating) {
+      offset = Offset(_direction * (1 - _animation.value), 0);
+    } else {
+      offset = Offset.zero;
+    }
+
+    return IgnorePointer(
+      ignoring: !isCurrent,
+      child: TickerMode(
+        enabled: isCurrent,
+        child: FractionalTranslation(
+          translation: offset,
+          child: child,
+        ),
       ),
     );
   }
