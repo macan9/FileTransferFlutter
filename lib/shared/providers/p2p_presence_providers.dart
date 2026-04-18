@@ -90,7 +90,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
       'client:connection-request',
       <String, dynamic>{
         'toDeviceId': toDeviceId,
-        'message': message ?? '请求建立直连通道',
+        'message': message ?? '请求建立传输通道',
       },
       ack: (dynamic response) {
         final String? error = _extractAckError(response);
@@ -319,6 +319,7 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
                 socket: socket,
                 selfDeviceId: config.deviceId,
                 downloadDirectory: config.downloadDirectory,
+                serverUri: config.serverUri,
               ),
         );
         _log(

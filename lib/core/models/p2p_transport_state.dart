@@ -1,6 +1,7 @@
 import 'package:equatable/equatable.dart';
 import 'package:file_transfer_flutter/core/models/incoming_transfer_context.dart';
 import 'package:file_transfer_flutter/core/models/outgoing_transfer_context.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
 
 enum TransportLinkStatus {
   idle,
@@ -16,6 +17,7 @@ class P2pSessionTransport extends Equatable {
     required this.peerDeviceId,
     required this.sessionStatus,
     required this.linkStatus,
+    required this.connectionMode,
     required this.dataChannelOpen,
     this.dataChannelLabel,
     this.lastError,
@@ -25,6 +27,7 @@ class P2pSessionTransport extends Equatable {
   final String peerDeviceId;
   final dynamic sessionStatus;
   final TransportLinkStatus linkStatus;
+  final P2pConnectionMode connectionMode;
   final bool dataChannelOpen;
   final String? dataChannelLabel;
   final String? lastError;
@@ -37,6 +40,7 @@ class P2pSessionTransport extends Equatable {
     String? peerDeviceId,
     dynamic sessionStatus,
     TransportLinkStatus? linkStatus,
+    P2pConnectionMode? connectionMode,
     bool? dataChannelOpen,
     String? dataChannelLabel,
     bool clearDataChannelLabel = false,
@@ -48,6 +52,7 @@ class P2pSessionTransport extends Equatable {
       peerDeviceId: peerDeviceId ?? this.peerDeviceId,
       sessionStatus: sessionStatus ?? this.sessionStatus,
       linkStatus: linkStatus ?? this.linkStatus,
+      connectionMode: connectionMode ?? this.connectionMode,
       dataChannelOpen: dataChannelOpen ?? this.dataChannelOpen,
       dataChannelLabel: clearDataChannelLabel
           ? null
@@ -62,6 +67,7 @@ class P2pSessionTransport extends Equatable {
         peerDeviceId,
         sessionStatus,
         linkStatus,
+        connectionMode,
         dataChannelOpen,
         dataChannelLabel,
         lastError,

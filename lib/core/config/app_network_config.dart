@@ -1,5 +1,6 @@
 abstract final class AppNetworkConfig {
   static const String launchConfigFileName = 'app_env.json';
+  static const String launchConfigAssetPath = launchConfigFileName;
   static const String fallbackDevServerUrl = 'http://localhost:3000';
   static const String fallbackProServerUrl = 'http://255';
   static const String defaultServerUrl = fallbackDevServerUrl;

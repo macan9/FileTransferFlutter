@@ -34,9 +34,12 @@ class RealtimePeerConnectionFactory {
 
   Future<RTCPeerConnection> create({
     List<Map<String, dynamic>>? iceServers,
+    String? iceTransportPolicy,
   }) {
     return createPeerConnection(
       <String, dynamic>{
+        if (iceTransportPolicy != null && iceTransportPolicy.trim().isNotEmpty)
+          'iceTransportPolicy': iceTransportPolicy,
         'iceServers': iceServers ??
             const <Map<String, dynamic>>[
               <String, dynamic>{'urls': 'stun:stun.l.google.com:19302'},

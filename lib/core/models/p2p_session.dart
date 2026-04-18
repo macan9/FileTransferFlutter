@@ -10,6 +10,7 @@ class P2pSession extends Equatable {
     required this.status,
     required this.createdByDeviceId,
     required this.createdAt,
+    this.connectionMode,
     this.connectedAt,
     this.closedAt,
     this.closeReason,
@@ -26,6 +27,9 @@ class P2pSession extends Equatable {
       ),
       createdByDeviceId: json['createdByDeviceId']?.toString() ?? '',
       createdAt: _parseRequiredDateTime(json['createdAt'], field: 'createdAt'),
+      connectionMode: P2pConnectionMode.tryParse(
+        json['connectionMode']?.toString(),
+      ),
       connectedAt: _parseDateTime(json['connectedAt']),
       closedAt: _parseDateTime(json['closedAt']),
       closeReason: json['closeReason']?.toString(),
@@ -39,6 +43,7 @@ class P2pSession extends Equatable {
   final P2pSessionStatus status;
   final String createdByDeviceId;
   final DateTime createdAt;
+  final P2pConnectionMode? connectionMode;
   final DateTime? connectedAt;
   final DateTime? closedAt;
   final String? closeReason;
@@ -70,6 +75,8 @@ class P2pSession extends Equatable {
     P2pSessionStatus? status,
     String? createdByDeviceId,
     DateTime? createdAt,
+    P2pConnectionMode? connectionMode,
+    bool clearConnectionMode = false,
     DateTime? connectedAt,
     bool clearConnectedAt = false,
     DateTime? closedAt,
@@ -85,6 +92,8 @@ class P2pSession extends Equatable {
       status: status ?? this.status,
       createdByDeviceId: createdByDeviceId ?? this.createdByDeviceId,
       createdAt: createdAt ?? this.createdAt,
+      connectionMode:
+          clearConnectionMode ? null : connectionMode ?? this.connectionMode,
       connectedAt: clearConnectedAt ? null : connectedAt ?? this.connectedAt,
       closedAt: clearClosedAt ? null : closedAt ?? this.closedAt,
       closeReason: clearCloseReason ? null : closeReason ?? this.closeReason,
@@ -100,6 +109,7 @@ class P2pSession extends Equatable {
       'status': status.value,
       'createdByDeviceId': createdByDeviceId,
       'createdAt': createdAt.toIso8601String(),
+      'connectionMode': connectionMode?.value,
       'connectedAt': connectedAt?.toIso8601String(),
       'closedAt': closedAt?.toIso8601String(),
       'closeReason': closeReason,
@@ -115,6 +125,7 @@ class P2pSession extends Equatable {
         status,
         createdByDeviceId,
         createdAt,
+        connectionMode,
         connectedAt,
         closedAt,
         closeReason,

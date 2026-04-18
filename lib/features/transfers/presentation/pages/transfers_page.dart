@@ -895,6 +895,10 @@ class _PeerActionTile extends ConsumerWidget {
                       _InfoPill(
                           label: '传输通道',
                           value: _transportStatusLabel(transport!)),
+                    if (transport != null)
+                      _InfoPill(
+                          label: '连接方式',
+                          value: _connectionModeLabel(transport!)),
                   ],
                 ),
               ),
@@ -1142,7 +1146,7 @@ class _PeerActionTile extends ConsumerWidget {
       return '连接已建立，可以直接选择文件发送给 $deviceName。';
     }
     if (activeSession?.status == P2pSessionStatus.connecting) {
-      return '双方正在建立直连通道，请稍等片刻。';
+      return '双方正在建立传输通道，请稍等片刻。';
     }
     if (outgoingRequest != null) {
       return '已向 $deviceName 发送邀请，等待对方接受。';
@@ -1213,7 +1217,7 @@ class _LiveRequestDialogBody extends ConsumerWidget {
               Text('设备类型：$remotePlatform'),
               const SizedBox(height: 4),
               Text(
-                incoming ? '接受后会尝试建立直连通道。' : '等待对方处理当前邀请。',
+                incoming ? '接受后会尝试建立传输通道。' : '等待对方处理当前邀请。',
               ),
             ],
           ),
@@ -1790,6 +1794,22 @@ String _transportStatusLabel(P2pSessionTransport transport) {
   };
 
   return linkStatus;
+}
+
+String _connectionModeLabel(P2pSessionTransport transport) {
+  if (transport.linkStatus == TransportLinkStatus.failed) {
+    return '失败';
+  }
+  if (transport.linkStatus == TransportLinkStatus.closed) {
+    return '已关闭';
+  }
+
+  return switch (transport.connectionMode) {
+    P2pConnectionMode.direct => '直连',
+    P2pConnectionMode.relay => 'TURN 中继',
+    P2pConnectionMode.connecting => '建立中',
+    P2pConnectionMode.failed => '失败',
+  };
 }
 
 String _transferStatusLabel(String rawStatus) {

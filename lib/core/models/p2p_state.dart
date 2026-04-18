@@ -124,6 +124,31 @@ enum P2pSessionStatus {
   }
 }
 
+enum P2pConnectionMode {
+  direct('direct'),
+  relay('relay'),
+  connecting('connecting'),
+  failed('failed');
+
+  const P2pConnectionMode(this.value);
+
+  final String value;
+
+  static P2pConnectionMode? tryParse(String? value) {
+    if (value == null) {
+      return null;
+    }
+
+    for (final P2pConnectionMode item in P2pConnectionMode.values) {
+      if (item.value == value) {
+        return item;
+      }
+    }
+
+    return null;
+  }
+}
+
 enum TransferRecordStatus {
   pending('pending'),
   sending('sending'),

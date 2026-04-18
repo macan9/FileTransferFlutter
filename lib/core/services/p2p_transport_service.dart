@@ -11,6 +11,7 @@ import 'package:file_transfer_flutter/core/models/transfer_record.dart';
 import 'package:file_transfer_flutter/core/services/realtime_client_factory.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:socket_io_client/socket_io_client.dart' as io;
 import 'package:uuid/uuid.dart';
@@ -18,8 +19,10 @@ import 'package:uuid/uuid.dart';
 class P2pTransportService {
   P2pTransportService({
     required RealtimePeerConnectionFactory peerConnectionFactory,
+    http.Client? httpClient,
     Uuid? uuid,
   })  : _peerConnectionFactory = peerConnectionFactory,
+        _httpClient = httpClient ?? http.Client(),
         _uuid = uuid ?? const Uuid();
 
   static const int chunkSize = 16 * 1024;
@@ -27,8 +30,10 @@ class P2pTransportService {
   static const Duration incomingTransferTimeout = Duration(minutes: 2);
   static const Duration fileMetaAckTimeout = Duration(seconds: 10);
   static const String _defaultChannelLabel = 'file-transfer';
+  static const Duration _statsProbeTimeout = Duration(seconds: 3);
 
   final RealtimePeerConnectionFactory _peerConnectionFactory;
+  final http.Client _httpClient;
   final Uuid _uuid;
   final StreamController<P2pTransportState> _stateController =
       StreamController<P2pTransportState>.broadcast();
@@ -42,6 +47,8 @@ class P2pTransportService {
   io.Socket? _socket;
   String? _selfDeviceId;
   String? _downloadDirectory;
+  Uri? _serverUri;
+  Future<_WebrtcConfig>? _webrtcConfigFuture;
 
   Stream<P2pTransportState> get stream => _stateController.stream;
   P2pTransportState get state => _state;
@@ -50,6 +57,7 @@ class P2pTransportService {
     required io.Socket socket,
     required String selfDeviceId,
     required String downloadDirectory,
+    required Uri serverUri,
   }) async {
     _log(
       'attach self=$selfDeviceId downloadDirectory=$downloadDirectory socketId=${socket.id}',
@@ -57,6 +65,8 @@ class P2pTransportService {
     _socket = socket;
     _selfDeviceId = selfDeviceId;
     _downloadDirectory = downloadDirectory;
+    _serverUri = serverUri;
+    _webrtcConfigFuture = null;
   }
 
   Future<void> detach() async {
@@ -66,6 +76,8 @@ class P2pTransportService {
     _socket = null;
     _selfDeviceId = null;
     _downloadDirectory = null;
+    _serverUri = null;
+    _webrtcConfigFuture = null;
     for (final _PeerLink link in _links.values) {
       await link.dispose();
     }
@@ -191,6 +203,9 @@ class P2pTransportService {
     _log('handleRemoteCandidate target=$targetDeviceId');
     final _PeerLink link = await _findLinkByPeer(targetDeviceId);
     final Map<String, dynamic> candidate = _normalizeMap(payload['candidate']);
+    link.remoteCandidateTypes.addAll(
+      _extractCandidateTypes(candidate['candidate']?.toString()),
+    );
     _log(
       'handleRemoteCandidate addCandidate session=${link.session.sessionId} sdpMid=${candidate["sdpMid"]} sdpMLineIndex=${candidate["sdpMLineIndex"]}',
     );
@@ -334,23 +349,27 @@ class P2pTransportService {
     final _PeerLink? existing = _links[session.sessionId];
     if (existing != null) {
       _log('ensureLink reuse session=${session.sessionId} peer=$peerDeviceId');
+      existing.session = session;
+      if (session.connectionMode != null) {
+        existing.connectionMode = session.connectionMode!;
+      }
       return existing;
     }
 
+    final _WebrtcConfig rtcConfig = await _loadWebrtcConfig();
     _log(
         'ensureLink createPeerConnection session=${session.sessionId} peer=$peerDeviceId');
     final RTCPeerConnection peerConnection =
         await _peerConnectionFactory.create(
-      iceServers: const <Map<String, dynamic>>[
-        <String, dynamic>{'urls': 'stun:stun.l.google.com:19302'},
-        <String, dynamic>{'urls': 'stun:stun1.l.google.com:19302'},
-      ],
+      iceServers: rtcConfig.iceServers,
+      iceTransportPolicy: rtcConfig.iceTransportPolicy,
     );
 
     final _PeerLink link = _PeerLink(
       session: session,
       peerDeviceId: peerDeviceId,
       peerConnection: peerConnection,
+      connectionMode: session.connectionMode ?? P2pConnectionMode.connecting,
     );
     _links[session.sessionId] = link;
     _bindPeerConnection(link);
@@ -398,6 +417,8 @@ class P2pTransportService {
         _log('onIceCandidate null-candidate session=${link.session.sessionId}');
         return;
       }
+      link.localCandidateTypes
+          .addAll(_extractCandidateTypes(candidate.candidate));
       _log(
         'onIceCandidate session=${link.session.sessionId} sdpMid=${candidate.sdpMid} sdpMLineIndex=${candidate.sdpMLineIndex}',
       );
@@ -428,9 +449,14 @@ class P2pTransportService {
         case RTCPeerConnectionState.RTCPeerConnectionStateConnected:
           link.linkStatus = TransportLinkStatus.connected;
           link.lastError = null;
+          if (link.session.connectionMode == null) {
+            link.connectionMode = P2pConnectionMode.connecting;
+          }
+          unawaited(_refreshConnectionMode(link));
           break;
         case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
           link.linkStatus = TransportLinkStatus.failed;
+          link.connectionMode = P2pConnectionMode.failed;
           link.lastError = 'PeerConnection failed';
           unawaited(
             _cleanupIncomingBuffersForSession(
@@ -451,6 +477,9 @@ class P2pTransportService {
           break;
         default:
           link.linkStatus = TransportLinkStatus.negotiating;
+          if (link.session.connectionMode == null) {
+            link.connectionMode = P2pConnectionMode.connecting;
+          }
       }
       _refreshSessionTransports();
     };
@@ -499,6 +528,10 @@ class P2pTransportService {
       if (link.dataChannelOpen) {
         link.linkStatus = TransportLinkStatus.connected;
         link.lastError = null;
+        if (link.session.connectionMode == null) {
+          link.connectionMode = P2pConnectionMode.connecting;
+        }
+        unawaited(_refreshConnectionMode(link));
       } else if (state == RTCDataChannelState.RTCDataChannelClosed) {
         link.linkStatus = TransportLinkStatus.closed;
       }
@@ -782,7 +815,11 @@ class P2pTransportService {
     if (channel.state == RTCDataChannelState.RTCDataChannelOpen) {
       link.dataChannelOpen = true;
       link.linkStatus = TransportLinkStatus.connected;
+      if (link.session.connectionMode == null) {
+        link.connectionMode = P2pConnectionMode.connecting;
+      }
       _refreshSessionTransports();
+      unawaited(_refreshConnectionMode(link));
       return;
     }
     throw const RealtimeError(
@@ -1165,6 +1202,277 @@ class P2pTransportService {
     _emit(_state.copyWith(incomingTransfers: items, clearLastError: true));
   }
 
+  P2pConnectionMode _effectiveConnectionMode(_PeerLink link) {
+    final P2pConnectionMode? sessionMode = link.session.connectionMode;
+    if (sessionMode != null) {
+      return sessionMode;
+    }
+    if (link.linkStatus == TransportLinkStatus.failed) {
+      return P2pConnectionMode.failed;
+    }
+    if (link.linkStatus != TransportLinkStatus.connected ||
+        !link.dataChannelOpen) {
+      return P2pConnectionMode.connecting;
+    }
+    return link.connectionMode;
+  }
+
+  Future<void> _refreshConnectionMode(_PeerLink link) async {
+    final P2pConnectionMode? sessionMode = link.session.connectionMode;
+    if (sessionMode != null) {
+      if (link.connectionMode != sessionMode) {
+        link.connectionMode = sessionMode;
+        _refreshSessionTransports();
+      }
+      return;
+    }
+    if (link.linkStatus == TransportLinkStatus.failed) {
+      if (link.connectionMode != P2pConnectionMode.failed) {
+        link.connectionMode = P2pConnectionMode.failed;
+        _refreshSessionTransports();
+      }
+      return;
+    }
+    if (link.linkStatus != TransportLinkStatus.connected ||
+        !link.dataChannelOpen) {
+      if (link.connectionMode != P2pConnectionMode.connecting) {
+        link.connectionMode = P2pConnectionMode.connecting;
+        _refreshSessionTransports();
+      }
+      return;
+    }
+
+    final P2pConnectionMode detected = await _detectConnectionMode(link);
+    if (link.connectionMode != detected) {
+      link.connectionMode = detected;
+      _refreshSessionTransports();
+    }
+  }
+
+  Future<P2pConnectionMode> _detectConnectionMode(_PeerLink link) async {
+    final P2pConnectionMode? fromStats = await _detectConnectionModeFromStats(
+      link,
+    );
+    if (fromStats != null) {
+      return fromStats;
+    }
+
+    final Set<String> allTypes = <String>{
+      ...link.localCandidateTypes,
+      ...link.remoteCandidateTypes,
+    };
+    if (allTypes.contains('relay')) {
+      return P2pConnectionMode.relay;
+    }
+    if (allTypes.any(_isDirectCandidateType)) {
+      return P2pConnectionMode.direct;
+    }
+    return P2pConnectionMode.connecting;
+  }
+
+  Future<P2pConnectionMode?> _detectConnectionModeFromStats(
+      _PeerLink link) async {
+    try {
+      final List<StatsReport> reports =
+          await link.peerConnection.getStats().timeout(_statsProbeTimeout);
+      if (reports.isEmpty) {
+        return null;
+      }
+
+      final Map<String, StatsReport> reportsById = <String, StatsReport>{
+        for (final StatsReport report in reports) report.id: report,
+      };
+
+      for (final StatsReport report in reports) {
+        final String type = report.type.toLowerCase();
+        if (type != 'candidate-pair' && type != 'googcandidatepair') {
+          continue;
+        }
+
+        final Map<String, dynamic> values =
+            _normalizeStatsValues(report.values);
+        final bool selected = _isSelectedCandidatePair(values);
+        if (!selected) {
+          continue;
+        }
+
+        final String? localType = _extractSelectedCandidateType(
+          candidateReportId: values['localCandidateId']?.toString(),
+          candidateTypeKey: 'localCandidateType',
+          reportsById: reportsById,
+          values: values,
+        );
+        final String? remoteType = _extractSelectedCandidateType(
+          candidateReportId: values['remoteCandidateId']?.toString(),
+          candidateTypeKey: 'remoteCandidateType',
+          reportsById: reportsById,
+          values: values,
+        );
+
+        final Set<String> selectedTypes = <String>{
+          if (localType != null && localType.isNotEmpty) localType,
+          if (remoteType != null && remoteType.isNotEmpty) remoteType,
+        };
+        if (selectedTypes.contains('relay')) {
+          return P2pConnectionMode.relay;
+        }
+        if (selectedTypes.any(_isDirectCandidateType)) {
+          return P2pConnectionMode.direct;
+        }
+      }
+    } catch (error) {
+      _log(
+        'detectConnectionModeFromStats error session=${link.session.sessionId} error=$error',
+      );
+    }
+    return null;
+  }
+
+  String? _extractSelectedCandidateType({
+    required String? candidateReportId,
+    required String candidateTypeKey,
+    required Map<String, StatsReport> reportsById,
+    required Map<String, dynamic> values,
+  }) {
+    final String? inlineType =
+        values[candidateTypeKey]?.toString().toLowerCase();
+    if (inlineType != null && inlineType.isNotEmpty) {
+      return inlineType;
+    }
+    if (candidateReportId == null || candidateReportId.isEmpty) {
+      return null;
+    }
+    final StatsReport? report = reportsById[candidateReportId];
+    if (report == null) {
+      return null;
+    }
+    final Map<String, dynamic> reportValues =
+        _normalizeStatsValues(report.values);
+    return reportValues['candidateType']?.toString().toLowerCase();
+  }
+
+  bool _isSelectedCandidatePair(Map<String, dynamic> values) {
+    if (_statsValueAsBool(values['selected']) == true ||
+        _statsValueAsBool(values['nominated']) == true) {
+      return true;
+    }
+
+    final String state = values['state']?.toString().toLowerCase() ?? '';
+    return state == 'succeeded' || state == 'in-progress';
+  }
+
+  Map<String, dynamic> _normalizeStatsValues(Map<dynamic, dynamic> value) {
+    return value.map(
+      (dynamic key, dynamic item) => MapEntry(key.toString(), item),
+    );
+  }
+
+  bool? _statsValueAsBool(dynamic value) {
+    if (value is bool) {
+      return value;
+    }
+    if (value is num) {
+      return value != 0;
+    }
+    if (value is String) {
+      final String normalized = value.trim().toLowerCase();
+      if (normalized == 'true') {
+        return true;
+      }
+      if (normalized == 'false') {
+        return false;
+      }
+      if (normalized == '1') {
+        return true;
+      }
+      if (normalized == '0') {
+        return false;
+      }
+    }
+    return null;
+  }
+
+  Set<String> _extractCandidateTypes(String? rawCandidate) {
+    if (rawCandidate == null || rawCandidate.trim().isEmpty) {
+      return const <String>{};
+    }
+    final Iterable<RegExpMatch> matches = RegExp(
+      r' typ ([a-zA-Z0-9_]+)',
+      caseSensitive: false,
+    ).allMatches(rawCandidate);
+    return matches
+        .map((RegExpMatch match) => match.group(1)?.toLowerCase() ?? '')
+        .where((String value) => value.isNotEmpty)
+        .toSet();
+  }
+
+  bool _isDirectCandidateType(String value) {
+    return value == 'host' || value == 'srflx' || value == 'prflx';
+  }
+
+  Future<_WebrtcConfig> _loadWebrtcConfig() {
+    final Future<_WebrtcConfig>? existing = _webrtcConfigFuture;
+    if (existing != null) {
+      return existing;
+    }
+
+    final Future<_WebrtcConfig> future = _fetchWebrtcConfig();
+    _webrtcConfigFuture = future;
+    return future;
+  }
+
+  Future<_WebrtcConfig> _fetchWebrtcConfig() async {
+    final Uri? serverUri = _serverUri;
+    if (serverUri == null) {
+      return _defaultWebrtcConfig();
+    }
+
+    final Uri endpoint = serverUri.replace(
+      path: _appendPath(serverUri.path, 'signaling/webrtc-config'),
+      queryParameters: null,
+      fragment: null,
+    );
+
+    try {
+      final http.Response response =
+          await _httpClient.get(endpoint).timeout(const Duration(seconds: 5));
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final dynamic decoded = jsonDecode(response.body);
+        if (decoded is Map) {
+          final Map<String, dynamic> json = decoded.map(
+            (dynamic key, dynamic value) => MapEntry(key.toString(), value),
+          );
+          final _WebrtcConfig config = _WebrtcConfig.fromJson(json);
+          if (config.iceServers.isNotEmpty) {
+            return config;
+          }
+        }
+      }
+    } catch (error) {
+      _log('fetchWebrtcConfig fallback error=$error');
+    }
+
+    return _defaultWebrtcConfig();
+  }
+
+  _WebrtcConfig _defaultWebrtcConfig() {
+    return const _WebrtcConfig(
+      iceTransportPolicy: 'all',
+      iceServers: <Map<String, dynamic>>[
+        <String, dynamic>{'urls': 'stun:stun.l.google.com:19302'},
+        <String, dynamic>{'urls': 'stun:stun1.l.google.com:19302'},
+      ],
+    );
+  }
+
+  String _appendPath(String basePath, String extraPath) {
+    final List<String> segments = <String>[
+      ...basePath.split('/').where((String item) => item.isNotEmpty),
+      ...extraPath.split('/').where((String item) => item.isNotEmpty),
+    ];
+    return '/${segments.join('/')}';
+  }
+
   void _refreshSessionTransports() {
     final List<P2pSessionTransport> items = _links.values
         .map(
@@ -1173,6 +1481,7 @@ class P2pTransportService {
             peerDeviceId: link.peerDeviceId,
             sessionStatus: link.session.status,
             linkStatus: link.linkStatus,
+            connectionMode: _effectiveConnectionMode(link),
             dataChannelOpen: link.dataChannelOpen,
             dataChannelLabel: link.dataChannelLabel,
             lastError: link.lastError,
@@ -1261,6 +1570,7 @@ class _PeerLink {
     required this.session,
     required this.peerDeviceId,
     required this.peerConnection,
+    required this.connectionMode,
   });
 
   P2pSession session;
@@ -1271,6 +1581,9 @@ class _PeerLink {
   String? dataChannelLabel;
   bool negotiationStarted = false;
   TransportLinkStatus linkStatus = TransportLinkStatus.idle;
+  P2pConnectionMode connectionMode;
+  final Set<String> localCandidateTypes = <String>{};
+  final Set<String> remoteCandidateTypes = <String>{};
   String? lastError;
   Future<void> messageQueue = Future<void>.value();
 
@@ -1278,6 +1591,49 @@ class _PeerLink {
     await dataChannel?.close();
     await peerConnection.close();
   }
+}
+
+class _WebrtcConfig {
+  const _WebrtcConfig({
+    required this.iceTransportPolicy,
+    required this.iceServers,
+  });
+
+  factory _WebrtcConfig.fromJson(Map<String, dynamic> json) {
+    final dynamic rawServers = json['iceServers'];
+    final List<Map<String, dynamic>> iceServers = rawServers is List
+        ? rawServers
+            .whereType<Map>()
+            .map(
+              (Map item) => item.map(
+                (dynamic key, dynamic value) => MapEntry(key.toString(), value),
+              ),
+            )
+            .where((Map<String, dynamic> item) {
+            final dynamic urls = item['urls'];
+            if (urls is String) {
+              return urls.trim().isNotEmpty;
+            }
+            if (urls is List) {
+              return urls.isNotEmpty;
+            }
+            return false;
+          }).toList()
+        : const <Map<String, dynamic>>[];
+
+    final String iceTransportPolicy =
+        json['iceTransportPolicy']?.toString().trim().isNotEmpty == true
+            ? json['iceTransportPolicy']!.toString().trim()
+            : 'all';
+
+    return _WebrtcConfig(
+      iceTransportPolicy: iceTransportPolicy,
+      iceServers: iceServers,
+    );
+  }
+
+  final String iceTransportPolicy;
+  final List<Map<String, dynamic>> iceServers;
 }
 
 class _IncomingBuffer {
