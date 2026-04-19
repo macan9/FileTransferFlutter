@@ -3,6 +3,9 @@ import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
+import 'package:file_transfer_flutter/core/models/zerotier_network_state.dart';
+import 'package:file_transfer_flutter/core/models/zerotier_runtime_event.dart';
+import 'package:file_transfer_flutter/core/models/zerotier_runtime_status.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_agent_provider.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_providers.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
@@ -29,7 +32,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     super.initState();
     _networkCodeController = TextEditingController();
     _networkNameController = TextEditingController(text: 'My Private Network');
-    _networkDescriptionController = TextEditingController(text: 'Private mesh');
+    _networkDescriptionController =
+        TextEditingController(text: 'Private mesh for trusted devices');
   }
 
   @override
@@ -42,6 +46,23 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
 
   @override
   Widget build(BuildContext context) {
+    ref.listen<NetworkingAgentRuntimeState>(
+      networkingAgentRuntimeProvider,
+      (NetworkingAgentRuntimeState? previous,
+          NetworkingAgentRuntimeState next) {
+        final ZeroTierRuntimeEvent? nextEvent = next.lastRuntimeEvent;
+        if (nextEvent != null && nextEvent != previous?.lastRuntimeEvent) {
+          _showPageMessage(_eventMessage(nextEvent));
+        }
+        final String? nextError = next.lastError;
+        if (nextError != null &&
+            nextError.trim().isNotEmpty &&
+            nextError != previous?.lastError) {
+          _showPageMessage(nextError);
+        }
+      },
+    );
+
     final AppConfig config = ref.watch(appConfigProvider);
     final AsyncValue<NetworkingDashboardState> networkingAsync =
         ref.watch(networkingProvider);
@@ -49,104 +70,129 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         networkingAsync.valueOrNull ?? const NetworkingDashboardState.initial();
     final NetworkingAgentRuntimeState agentState =
         ref.watch(networkingAgentRuntimeProvider);
+    final ZeroTierRuntimeStatus runtimeStatus = agentState.runtimeStatus;
 
     final bool isRegistered = config.agentToken.trim().isNotEmpty &&
-        config.zeroTierNodeId.trim().isNotEmpty;
+        config.zeroTierNodeId.trim().isNotEmpty &&
+        config.deviceId.trim().isNotEmpty;
 
     return DefaultTabController(
       length: 2,
       child: RefreshIndicator(
-        onRefresh: () async {
-          await ref.read(networkingAgentRuntimeProvider.notifier).refreshNow();
-          await ref.read(networkingProvider.notifier).refresh();
-        },
+        onRefresh: _refreshAll,
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: <Widget>[
-            _AgentOverviewCard(
-              config: config,
+            _HeroStatusCard(
+              runtimeStatus: runtimeStatus,
               agentState: agentState,
+              config: config,
               isRegistered: isRegistered,
-              onRetry: () async {
-                await ref
-                    .read(networkingAgentRuntimeProvider.notifier)
-                    .refreshNow();
-                await ref.read(networkingProvider.notifier).refresh();
-              },
+              onRefresh: _refreshAll,
               onCopyToken: config.agentToken.trim().isEmpty
                   ? null
                   : () => _copyToClipboard(
                         config.agentToken,
-                        successMessage: 'agentToken 已复制。',
+                        successMessage: '已复制 Agent Token',
                       ),
             ),
             const SizedBox(height: 16),
-            if (networkingAsync.hasError)
-              _ErrorCard(
-                title: '控制面加载失败',
-                message: _errorText(networkingAsync.error),
-                onRetry: () => ref.read(networkingProvider.notifier).refresh(),
-              )
-            else ...<Widget>[
-              _NetworkingDocReviewCard(
-                defaultNetwork: dashboard.defaultNetwork,
-                managedNetworkCount: dashboard.managedNetworks.length,
-                deviceIdentity: dashboard.deviceIdentity,
-                agentState: agentState,
+            _RuntimeInsightCard(
+              runtimeStatus: runtimeStatus,
+              recentEvents: agentState.recentRuntimeEvents,
+              onRefresh: _refreshAll,
+            ),
+            const SizedBox(height: 16),
+            if (agentState.lastError != null &&
+                agentState.lastError!.trim().isNotEmpty) ...<Widget>[
+              _InlineBanner(
+                icon: Icons.error_outline_rounded,
+                color: const Color(0xFFB45309),
+                background: const Color(0xFFFFF4E8),
+                title: '最近错误',
+                message: agentState.lastError!,
               ),
               const SizedBox(height: 16),
-              Container(
-                padding: const EdgeInsets.all(6),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(
-                    color: Theme.of(context).colorScheme.outlineVariant,
-                  ),
-                ),
-                child: const TabBar(
-                  indicatorSize: TabBarIndicatorSize.tab,
-                  dividerColor: Colors.transparent,
-                  indicator: BoxDecoration(
-                    color: Color(0xFFFFE9D6),
-                    borderRadius: BorderRadius.all(Radius.circular(18)),
-                  ),
-                  labelColor: Color(0xFFB45309),
-                  unselectedLabelColor: Color(0xFF6B7280),
-                  tabs: <Widget>[
-                    Tab(text: '一键组网'),
-                    Tab(text: '私域组网'),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-              SizedBox(
-                height: 800,
-                child: TabBarView(
-                  children: <Widget>[
-                    _OneClickNetworkingTab(
-                      defaultNetwork: dashboard.defaultNetwork,
-                      isBusy: dashboard.isSubmitting,
-                      isRegistered: isRegistered,
-                      onPressed: () => _joinDefaultNetwork(config),
-                    ),
-                    _PrivateNetworkingTab(
-                      codeController: _networkCodeController,
-                      nameController: _networkNameController,
-                      descriptionController: _networkDescriptionController,
-                      generatedCode: _generatedNetworkCode,
-                      isBusy: dashboard.isSubmitting,
-                      isRegistered: isRegistered,
-                      onJoinPressed: () => _joinByInviteCode(config),
-                      onHostPressed: () => _createPrivateNetwork(config),
-                      managedNetworks: dashboard.managedNetworks,
-                    ),
-                  ],
-                ),
-              ),
             ],
-            if (networkingAsync.isLoading &&
-                networkingAsync.valueOrNull == null)
+            if (networkingAsync.hasError) ...<Widget>[
+              _InlineBanner(
+                icon: Icons.cloud_off_rounded,
+                color: const Color(0xFFB91C1C),
+                background: const Color(0xFFFFE9E9),
+                title: '服务端编排加载失败',
+                message: _errorText(networkingAsync.error),
+                trailing: FilledButton.icon(
+                  onPressed: () => ref.read(networkingProvider.notifier).refresh(),
+                  icon: const Icon(Icons.refresh_rounded),
+                  label: const Text('重试'),
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
+            _NetworkingAlignmentCard(
+              defaultNetwork: dashboard.defaultNetwork,
+              managedNetworks: dashboard.managedNetworks,
+              deviceIdentity: dashboard.deviceIdentity,
+              runtimeStatus: runtimeStatus,
+            ),
+            const SizedBox(height: 16),
+            _LocalNetworksCard(
+              runtimeStatus: runtimeStatus,
+              managedNetworks: dashboard.managedNetworks,
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(22),
+                border: Border.all(
+                  color: Theme.of(context).colorScheme.outlineVariant,
+                ),
+              ),
+              child: const TabBar(
+                indicatorSize: TabBarIndicatorSize.tab,
+                dividerColor: Colors.transparent,
+                indicator: BoxDecoration(
+                  color: Color(0xFFFFE9D6),
+                  borderRadius: BorderRadius.all(Radius.circular(18)),
+                ),
+                labelColor: Color(0xFFB45309),
+                unselectedLabelColor: Color(0xFF6B7280),
+                tabs: <Widget>[
+                  Tab(text: '默认网络'),
+                  Tab(text: '私有组网'),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            SizedBox(
+              height: 920,
+              child: TabBarView(
+                children: <Widget>[
+                  _OneClickNetworkingTab(
+                    defaultNetwork: dashboard.defaultNetwork,
+                    isBusy: dashboard.isSubmitting,
+                    isRegistered: isRegistered,
+                    runtimeStatus: runtimeStatus,
+                    onPressed: () => _joinDefaultNetwork(config),
+                  ),
+                  _PrivateNetworkingTab(
+                    codeController: _networkCodeController,
+                    nameController: _networkNameController,
+                    descriptionController: _networkDescriptionController,
+                    generatedCode: _generatedNetworkCode,
+                    isBusy: dashboard.isSubmitting,
+                    isRegistered: isRegistered,
+                    managedNetworks: dashboard.managedNetworks,
+                    runtimeStatus: runtimeStatus,
+                    onJoinPressed: () => _joinByInviteCode(config),
+                    onHostPressed: () => _createPrivateNetwork(config),
+                  ),
+                ],
+              ),
+            ),
+            if (networkingAsync.isLoading && networkingAsync.valueOrNull == null)
               const Padding(
                 padding: EdgeInsets.only(top: 18),
                 child: Center(child: CircularProgressIndicator()),
@@ -155,6 +201,11 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         ),
       ),
     );
+  }
+
+  Future<void> _refreshAll() async {
+    await ref.read(networkingAgentRuntimeProvider.notifier).refreshNow();
+    await ref.read(networkingProvider.notifier).refresh();
   }
 
   Future<void> _joinDefaultNetwork(AppConfig config) async {
@@ -166,7 +217,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       await ref
           .read(networkingProvider.notifier)
           .joinDefaultNetwork(deviceId: config.deviceId);
-      _showPageMessage('已向服务端发起一键组网请求，等待本机 agent 执行加网命令。');
+      _showPageMessage('默认网络入网请求已提交，等待本机 Agent 执行 join。');
     } on RealtimeError catch (error) {
       _showPageMessage(error.message);
     }
@@ -188,7 +239,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             code: code,
             deviceId: config.deviceId,
           );
-      _showPageMessage('已提交邀请码入网请求，等待本机 agent 执行加网命令。');
+      _showPageMessage('邀请码组网请求已提交，等待本机 Agent 执行 join。');
     } on RealtimeError catch (error) {
       _showPageMessage(error.message);
     }
@@ -202,7 +253,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     final String name = _networkNameController.text.trim();
     final String description = _networkDescriptionController.text.trim();
     if (name.isEmpty) {
-      _showPageMessage('请先输入私域网络名称。');
+      _showPageMessage('请先输入私有网络名称。');
       return;
     }
 
@@ -216,7 +267,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       setState(() {
         _generatedNetworkCode = result.inviteCode.code;
       });
-      _showPageMessage('私域网络已创建，邀请码 ${result.inviteCode.code} 已生成。');
+      _showPageMessage('私有网络已创建，邀请码 ${result.inviteCode.code} 已生成。');
     } on RealtimeError catch (error) {
       _showPageMessage(error.message);
     }
@@ -226,7 +277,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     if (config.deviceId.trim().isEmpty ||
         config.zeroTierNodeId.trim().isEmpty ||
         config.agentToken.trim().isEmpty) {
-      _showPageMessage('客户端还未完成自动注册，请先等待 ZeroTier 检测和 bootstrap 完成。');
+      _showPageMessage('设备尚未完成自动注册，请先等待 ZeroTier 初始化和 bootstrap 完成。');
       return false;
     }
     return true;
@@ -241,6 +292,28 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       return;
     }
     _showPageMessage(successMessage);
+  }
+
+  String _eventMessage(ZeroTierRuntimeEvent event) {
+    final String networkSuffix = event.networkId == null
+        ? ''
+        : ' (${event.networkId})';
+    final String defaultMessage = switch (event.type) {
+      ZeroTierRuntimeEventType.environmentReady => 'Windows ZeroTier 环境已准备完成。',
+      ZeroTierRuntimeEventType.permissionRequired => 'ZeroTier 需要额外权限或手动设置。',
+      ZeroTierRuntimeEventType.nodeStarted => 'ZeroTier 节点已启动。',
+      ZeroTierRuntimeEventType.nodeStopped => 'ZeroTier 节点已停止。',
+      ZeroTierRuntimeEventType.networkJoining => '正在加入 ZeroTier 网络$networkSuffix。',
+      ZeroTierRuntimeEventType.networkWaitingAuthorization =>
+        '网络$networkSuffix 仍在等待授权。',
+      ZeroTierRuntimeEventType.networkOnline => '网络$networkSuffix 已在线。',
+      ZeroTierRuntimeEventType.networkLeft => '已离开网络$networkSuffix。',
+      ZeroTierRuntimeEventType.ipAssigned => '网络$networkSuffix 已分配托管地址。',
+      ZeroTierRuntimeEventType.error => 'ZeroTier 运行时返回错误。',
+    };
+    return event.message?.trim().isNotEmpty == true
+        ? event.message!
+        : defaultMessage;
   }
 
   void _showPageMessage(String message) {
@@ -263,104 +336,129 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   }
 }
 
-class _AgentOverviewCard extends StatelessWidget {
-  const _AgentOverviewCard({
-    required this.config,
+class _HeroStatusCard extends StatelessWidget {
+  const _HeroStatusCard({
+    required this.runtimeStatus,
     required this.agentState,
+    required this.config,
     required this.isRegistered,
-    required this.onRetry,
+    required this.onRefresh,
     required this.onCopyToken,
   });
 
-  final AppConfig config;
+  final ZeroTierRuntimeStatus runtimeStatus;
   final NetworkingAgentRuntimeState agentState;
+  final AppConfig config;
   final bool isRegistered;
-  final VoidCallback onRetry;
+  final Future<void> Function() onRefresh;
   final VoidCallback? onCopyToken;
 
   @override
   Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
     return SectionCard(
-      title: '本机 Agent',
-      subtitle: '应用会自动探测本机 ZeroTier、自动 bootstrap，并持续执行心跳、命令轮询和回执。',
+      title: 'ZeroTier Agent 实况',
+      subtitle: '页面直接消费统一 ZeroTierFacade 与 provider 状态流，展示本机节点、网络与事件回流。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           Wrap(
-            spacing: 12,
-            runSpacing: 12,
+            spacing: 10,
+            runSpacing: 10,
             children: <Widget>[
+              _InfoPill(label: '运行状态', value: _serviceStateLabel(runtimeStatus)),
               _InfoPill(
-                label: 'ZeroTier CLI',
-                value: agentState.zeroTierStatus.cliAvailable ? '已检测到' : '未检测到',
+                label: '节点',
+                value: runtimeStatus.isNodeRunning ? '运行中' : '未运行',
               ),
-              _InfoPill(label: '设备 ID', value: config.deviceId),
-              _InfoPill(label: '平台', value: config.devicePlatform),
               _InfoPill(
                 label: '注册状态',
                 value: isRegistered ? '已注册' : '未注册',
               ),
+              _InfoPill(
+                label: '防火墙',
+                value: runtimeStatus.permissionState.isFirewallSupported
+                    ? '支持'
+                    : '未知',
+              ),
             ],
           ),
           const SizedBox(height: 16),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: <Color>[Color(0xFFFFF3E7), Color(0xFFFFDFC3)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(24),
+            ),
+            child: Wrap(
+              runSpacing: 16,
+              spacing: 24,
+              children: <Widget>[
+                _MetricBlock(
+                  label: 'Node ID',
+                  value: runtimeStatus.nodeId.isEmpty ? '等待初始化' : runtimeStatus.nodeId,
+                ),
+                _MetricBlock(
+                  label: 'Runtime Version',
+                  value: runtimeStatus.version ?? '等待回报',
+                ),
+                _MetricBlock(
+                  label: '本地网络数',
+                  value: '${runtimeStatus.joinedNetworks.length}',
+                ),
+                _MetricBlock(
+                  label: '最近心跳',
+                  value: _timeOrDash(agentState.lastHeartbeatAt),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
           _LabeledBlock(
-            label: 'ZeroTier Node ID',
-            value: agentState.zeroTierStatus.nodeId.trim().isEmpty
-                ? '尚未自动探测到'
-                : agentState.zeroTierStatus.nodeId,
+            label: 'Device ID',
+            value: config.deviceId.trim().isEmpty ? '等待 bootstrap' : config.deviceId,
           ),
           const SizedBox(height: 12),
           _LabeledBlock(
             label: 'Agent Token',
-            value:
-                config.agentToken.trim().isEmpty ? '尚未获取' : config.agentToken,
+            value: config.agentToken.trim().isEmpty ? '尚未下发' : config.agentToken,
             action: onCopyToken == null
                 ? null
                 : IconButton(
-                    tooltip: '复制 agentToken',
+                    tooltip: '复制 Agent Token',
                     onPressed: onCopyToken,
                     icon: const Icon(Icons.copy_rounded),
                   ),
           ),
           const SizedBox(height: 12),
           _LabeledBlock(
-            label: '最近心跳',
-            value: agentState.lastHeartbeatAt?.toLocal().toString() ?? '-',
+            label: '权限摘要',
+            value: runtimeStatus.permissionState.summary ?? 'Windows libzt 运行时已接入。',
           ),
           const SizedBox(height: 12),
           _LabeledBlock(
             label: '最近命令',
-            value: agentState.lastCommandSummary ?? '-',
+            value: agentState.lastCommandSummary ?? '暂无',
           ),
-          if (agentState.lastError != null &&
-              agentState.lastError!.trim().isNotEmpty) ...<Widget>[
-            const SizedBox(height: 12),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: const Color(0xFFFFF4E8),
-                borderRadius: BorderRadius.circular(18),
-              ),
-              child: Text(
-                agentState.lastError!,
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: const Color(0xFFB45309),
-                      fontWeight: FontWeight.w600,
-                    ),
-              ),
-            ),
-          ],
           const SizedBox(height: 16),
           Align(
             alignment: Alignment.centerRight,
-            child: OutlinedButton.icon(
-              onPressed: onRetry,
+            child: FilledButton.icon(
+              onPressed: () => onRefresh(),
               icon: const Icon(Icons.sync_rounded),
               label: Text(
                 agentState.isBootstrapping || agentState.isPolling
-                    ? '处理中...'
-                    : '立即重试',
+                    ? '同步中...'
+                    : '立即同步',
+                style: theme.textTheme.labelLarge?.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
           ),
@@ -370,69 +468,61 @@ class _AgentOverviewCard extends StatelessWidget {
   }
 }
 
-class _LabeledBlock extends StatelessWidget {
-  const _LabeledBlock({
-    required this.label,
-    required this.value,
-    this.action,
+class _RuntimeInsightCard extends StatelessWidget {
+  const _RuntimeInsightCard({
+    required this.runtimeStatus,
+    required this.recentEvents,
+    required this.onRefresh,
   });
 
-  final String label;
-  final String value;
-  final Widget? action;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        Text(label, style: Theme.of(context).textTheme.labelLarge),
-        const SizedBox(height: 8),
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surfaceContainerLowest,
-            borderRadius: BorderRadius.circular(14),
-            border:
-                Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-          ),
-          child: Row(
-            children: <Widget>[
-              Expanded(child: SelectableText(value)),
-              if (action != null) action!,
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _ErrorCard extends StatelessWidget {
-  const _ErrorCard({
-    required this.title,
-    required this.message,
-    required this.onRetry,
-  });
-
-  final String title;
-  final String message;
-  final VoidCallback onRetry;
+  final ZeroTierRuntimeStatus runtimeStatus;
+  final List<ZeroTierRuntimeEvent> recentEvents;
+  final Future<void> Function() onRefresh;
 
   @override
   Widget build(BuildContext context) {
     return SectionCard(
-      title: title,
+      title: '运行时事件回流',
+      subtitle: '以下事件来自 Windows 原生 EventChannel，反映 libzt 节点生命周期与网络状态变化。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Text(message),
-          const SizedBox(height: 12),
-          FilledButton.icon(
-            onPressed: onRetry,
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: <Widget>[
+              _InfoPill(label: 'Service State', value: runtimeStatus.serviceState),
+              _InfoPill(
+                label: 'Last Updated',
+                value: _timeOrDash(runtimeStatus.updatedAt),
+              ),
+              _InfoPill(
+                label: 'Last Error',
+                value: runtimeStatus.lastError ?? '无',
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          if (recentEvents.isEmpty)
+            _EmptyStateBox(
+              message: '当前还没有收到运行时事件。可以先点击“立即同步”，或发起一次入网联调。',
+            )
+          else
+            Column(
+              children: recentEvents
+                  .map(
+                    (ZeroTierRuntimeEvent event) => Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _RuntimeEventTile(event: event),
+                    ),
+                  )
+                  .toList(),
+            ),
+          const SizedBox(height: 8),
+          TextButton.icon(
+            onPressed: () => onRefresh(),
             icon: const Icon(Icons.refresh_rounded),
-            label: const Text('重新加载'),
+            label: const Text('刷新运行时状态'),
           ),
         ],
       ),
@@ -440,55 +530,57 @@ class _ErrorCard extends StatelessWidget {
   }
 }
 
-class _NetworkingDocReviewCard extends StatelessWidget {
-  const _NetworkingDocReviewCard({
+class _NetworkingAlignmentCard extends StatelessWidget {
+  const _NetworkingAlignmentCard({
     required this.defaultNetwork,
-    required this.managedNetworkCount,
+    required this.managedNetworks,
     required this.deviceIdentity,
-    required this.agentState,
+    required this.runtimeStatus,
   });
 
   final ManagedNetwork? defaultNetwork;
-  final int managedNetworkCount;
+  final List<ManagedNetwork> managedNetworks;
   final NetworkDeviceIdentity? deviceIdentity;
-  final NetworkingAgentRuntimeState agentState;
+  final ZeroTierRuntimeStatus runtimeStatus;
 
   @override
   Widget build(BuildContext context) {
     return SectionCard(
-      title: '能力对齐',
-      subtitle:
-          '客户端现在按“自动发现 ZeroTier -> 自动 bootstrap -> agent 心跳/轮询/回执”的方式工作，更贴近你要的快速组网工具。',
+      title: '架构联动状态',
+      subtitle: '这里同时展示服务端编排层和本地 ZeroTier 运行时，方便校准状态映射是否一致。',
       child: Column(
         children: <Widget>[
           _CapabilityItem(
-            label: agentState.zeroTierStatus.cliAvailable
-                ? '本机 ZeroTier CLI 已可用，Node ID 自动发现已开启。'
-                : '尚未检测到 ZeroTier CLI，本机无法自动入网。',
-            tone: agentState.zeroTierStatus.cliAvailable
+            tone: runtimeStatus.cliAvailable
                 ? _CapabilityTone.ready
                 : _CapabilityTone.warning,
+            label: runtimeStatus.cliAvailable
+                ? 'Windows libzt 运行时可用，Node ID 与网络状态会通过统一接口回流。'
+                : '当前 ZeroTier 运行时仍不可用，本机无法执行真实入网动作。',
           ),
           const SizedBox(height: 10),
           _CapabilityItem(
-            label: deviceIdentity == null
-                ? '当前还没拿到服务端注册身份，agent 正在自动 bootstrap。'
-                : '服务端设备身份已就绪：${deviceIdentity!.id}',
             tone: deviceIdentity == null
                 ? _CapabilityTone.warning
                 : _CapabilityTone.ready,
+            label: deviceIdentity == null
+                ? '设备还未完成服务端 bootstrap，Agent Token 与 Device ID 尚未就绪。'
+                : '设备身份已建立：${deviceIdentity!.id} / ${deviceIdentity!.zeroTierNodeId}',
           ),
           const SizedBox(height: 10),
           _CapabilityItem(
+            tone: defaultNetwork == null
+                ? _CapabilityTone.warning
+                : _CapabilityTone.info,
             label: defaultNetwork == null
-                ? '默认网络信息正在等待服务端返回。'
-                : '默认网络已可读取：${defaultNetwork!.name} (${defaultNetwork!.status})',
-            tone: _CapabilityTone.ready,
+                ? '默认网络信息尚未从服务端加载完成。'
+                : '默认网络已加载：${defaultNetwork!.name} (${defaultNetwork!.status})',
           ),
           const SizedBox(height: 10),
           _CapabilityItem(
-            label: '当前已加载 $managedNetworkCount 条长期网络，并支持邀请码加入。',
-            tone: _CapabilityTone.ready,
+            tone: _CapabilityTone.info,
+            label:
+                '服务端编排网络 ${managedNetworks.length} 个，本地已知 ZeroTier 网络 ${runtimeStatus.joinedNetworks.length} 个。',
           ),
         ],
       ),
@@ -496,63 +588,57 @@ class _NetworkingDocReviewCard extends StatelessWidget {
   }
 }
 
-enum _CapabilityTone { ready, warning, info }
-
-class _CapabilityItem extends StatelessWidget {
-  const _CapabilityItem({
-    required this.label,
-    required this.tone,
+class _LocalNetworksCard extends StatelessWidget {
+  const _LocalNetworksCard({
+    required this.runtimeStatus,
+    required this.managedNetworks,
   });
 
-  final String label;
-  final _CapabilityTone tone;
+  final ZeroTierRuntimeStatus runtimeStatus;
+  final List<ManagedNetwork> managedNetworks;
 
   @override
   Widget build(BuildContext context) {
-    final ThemeData theme = Theme.of(context);
-    final ({Color background, Color foreground, IconData icon}) style =
-        switch (tone) {
-      _CapabilityTone.ready => (
-          background: const Color(0xFFEAF8EF),
-          foreground: const Color(0xFF15803D),
-          icon: Icons.check_circle_rounded,
-        ),
-      _CapabilityTone.warning => (
-          background: const Color(0xFFFFF4E8),
-          foreground: const Color(0xFFB45309),
-          icon: Icons.error_rounded,
-        ),
-      _CapabilityTone.info => (
-          background: const Color(0xFFEAF2FF),
-          foreground: const Color(0xFF1D4ED8),
-          icon: Icons.info_rounded,
-        ),
-    };
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: style.background,
-        borderRadius: BorderRadius.circular(18),
-      ),
-      child: Row(
+    return SectionCard(
+      title: '本地 ZeroTier 网络',
+      subtitle: 'join/list/detail 已切到真实网络状态。这里优先展示本机运行时返回的网络与地址。',
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Icon(style.icon, color: style.foreground, size: 20),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              label,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: style.foreground,
-                fontWeight: FontWeight.w600,
-              ),
+          if (runtimeStatus.joinedNetworks.isEmpty)
+            const _EmptyStateBox(
+              message: '本机还没有检测到已加入的 ZeroTier 网络。',
+            )
+          else
+            Column(
+              children: runtimeStatus.joinedNetworks
+                  .map(
+                    (ZeroTierNetworkState network) => Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: _LocalNetworkCard(
+                        network: network,
+                        managedNetwork: _matchManagedNetwork(network, managedNetworks),
+                      ),
+                    ),
+                  )
+                  .toList(),
             ),
-          ),
         ],
       ),
     );
+  }
+
+  ManagedNetwork? _matchManagedNetwork(
+    ZeroTierNetworkState network,
+    List<ManagedNetwork> managedNetworks,
+  ) {
+    for (final ManagedNetwork managed in managedNetworks) {
+      if (managed.zeroTierNetworkId?.trim().toLowerCase() ==
+          network.networkId.trim().toLowerCase()) {
+        return managed;
+      }
+    }
+    return null;
   }
 }
 
@@ -561,25 +647,28 @@ class _OneClickNetworkingTab extends StatelessWidget {
     required this.defaultNetwork,
     required this.isBusy,
     required this.isRegistered,
+    required this.runtimeStatus,
     required this.onPressed,
   });
 
   final ManagedNetwork? defaultNetwork;
   final bool isBusy;
   final bool isRegistered;
+  final ZeroTierRuntimeStatus runtimeStatus;
   final VoidCallback onPressed;
 
   @override
   Widget build(BuildContext context) {
     return SectionCard(
-      title: '一键组网',
-      subtitle: '把当前设备加入默认长期网络，真正执行动作由本机 agent 处理。',
+      title: '默认网络编排',
+      subtitle: '向服务端提交加入默认网络请求，再由本机 Agent 执行真实 join 并等待地址分配。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: <Widget>[
           if (defaultNetwork != null) ...<Widget>[
-            _NetworkSummaryCard(
+            _ManagedNetworkCard(
               network: defaultNetwork!,
+              localState: _findLocal(runtimeStatus, defaultNetwork!),
               accentColor: const Color(0xFFF97316),
             ),
             const SizedBox(height: 18),
@@ -587,25 +676,33 @@ class _OneClickNetworkingTab extends StatelessWidget {
           _NetworkingActionOrb(
             label: isBusy ? '提交中' : '一键组网',
             icon: isBusy ? Icons.hourglass_top_rounded : Icons.flash_on_rounded,
-            subtitle: isRegistered ? '连接后台服务\n组进默认网络' : '等待自动注册完成',
+            subtitle: isRegistered ? '发送默认网络请求\n等待本机 Agent 执行' : '等待设备注册完成',
             onTap: isBusy || !isRegistered ? null : onPressed,
           ),
-          const SizedBox(height: 24),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: const Color(0xFFFFF4E8),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: const Text(
-              '服务端收到请求后会下发 join_zerotier_network，本机 agent 会自动 join 并等待拿到 IP。',
-              textAlign: TextAlign.center,
-            ),
+          const SizedBox(height: 20),
+          _InlineHint(
+            message:
+                '联调建议：点击后一边观察上方“运行时事件回流”，一边确认本地 ZeroTier 网络列表是否出现对应 networkId 与托管地址。',
           ),
         ],
       ),
     );
+  }
+
+  ZeroTierNetworkState? _findLocal(
+    ZeroTierRuntimeStatus runtimeStatus,
+    ManagedNetwork network,
+  ) {
+    final String targetId = network.zeroTierNetworkId?.trim().toLowerCase() ?? '';
+    if (targetId.isEmpty) {
+      return null;
+    }
+    for (final ZeroTierNetworkState state in runtimeStatus.joinedNetworks) {
+      if (state.networkId.trim().toLowerCase() == targetId) {
+        return state;
+      }
+    }
+    return null;
   }
 }
 
@@ -617,9 +714,10 @@ class _PrivateNetworkingTab extends StatelessWidget {
     required this.generatedCode,
     required this.isBusy,
     required this.isRegistered,
+    required this.managedNetworks,
+    required this.runtimeStatus,
     required this.onJoinPressed,
     required this.onHostPressed,
-    required this.managedNetworks,
   });
 
   final TextEditingController codeController;
@@ -628,15 +726,16 @@ class _PrivateNetworkingTab extends StatelessWidget {
   final String? generatedCode;
   final bool isBusy;
   final bool isRegistered;
+  final List<ManagedNetwork> managedNetworks;
+  final ZeroTierRuntimeStatus runtimeStatus;
   final VoidCallback onJoinPressed;
   final VoidCallback onHostPressed;
-  final List<ManagedNetwork> managedNetworks;
 
   @override
   Widget build(BuildContext context) {
     return SectionCard(
-      title: '私域组网',
-      subtitle: '支持创建长期私域网络、生成邀请码，以及通过邀请码加入已有网络。',
+      title: '私有网络编排',
+      subtitle: '支持创建私有网络、生成邀请码，以及通过邀请码向服务端发起组网请求。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
@@ -644,7 +743,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
             controller: nameController,
             enabled: !isBusy,
             decoration: const InputDecoration(
-              labelText: '私域网络名称',
+              labelText: '私有网络名称',
               hintText: '例如 My Private Network',
               prefixIcon: Icon(Icons.drive_file_rename_outline_rounded),
             ),
@@ -655,7 +754,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
             enabled: !isBusy,
             decoration: const InputDecoration(
               labelText: '网络说明',
-              hintText: '例如 Private mesh',
+              hintText: '例如 Private mesh for trusted devices',
               prefixIcon: Icon(Icons.notes_rounded),
             ),
           ),
@@ -666,7 +765,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
             textInputAction: TextInputAction.done,
             decoration: const InputDecoration(
               labelText: '邀请码',
-              hintText: '请输入服务端返回的邀请码',
+              hintText: '输入服务端返回的邀请码',
               prefixIcon: Icon(Icons.password_rounded),
             ),
           ),
@@ -677,9 +776,8 @@ class _PrivateNetworkingTab extends StatelessWidget {
             children: <Widget>[
               _NetworkingActionOrb(
                 label: isBusy ? '处理中' : '加入网络',
-                icon:
-                    isBusy ? Icons.hourglass_top_rounded : Icons.login_rounded,
-                subtitle: isRegistered ? '输入邀请码\n加入指定网络' : '等待自动注册完成',
+                icon: isBusy ? Icons.hourglass_top_rounded : Icons.login_rounded,
+                subtitle: isRegistered ? '按邀请码发起请求\n等待本机 Agent 执行' : '等待设备注册完成',
                 diameter: 190,
                 onTap: isBusy || !isRegistered ? null : onJoinPressed,
               ),
@@ -688,7 +786,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
                 icon: isBusy
                     ? Icons.hourglass_top_rounded
                     : Icons.wifi_tethering_rounded,
-                subtitle: isRegistered ? '创建网络\n返回邀请码' : '等待自动注册完成',
+                subtitle: isRegistered ? '创建私有网络\n返回邀请码' : '等待设备注册完成',
                 diameter: 190,
                 onTap: isBusy || !isRegistered ? null : onHostPressed,
               ),
@@ -701,21 +799,11 @@ class _PrivateNetworkingTab extends StatelessWidget {
               padding: const EdgeInsets.all(18),
               decoration: BoxDecoration(
                 gradient: const LinearGradient(
-                  colors: <Color>[
-                    Color(0xFFFFF1E6),
-                    Color(0xFFFFE0BF),
-                  ],
+                  colors: <Color>[Color(0xFFFFF1E6), Color(0xFFFFE0BF)],
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight,
                 ),
                 borderRadius: BorderRadius.circular(22),
-                boxShadow: const <BoxShadow>[
-                  BoxShadow(
-                    color: Color(0x1AFF8A00),
-                    blurRadius: 24,
-                    offset: Offset(0, 12),
-                  ),
-                ],
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -731,36 +819,35 @@ class _PrivateNetworkingTab extends StatelessWidget {
                     generatedCode!,
                     style: Theme.of(context).textTheme.headlineMedium?.copyWith(
                           fontWeight: FontWeight.w800,
-                          letterSpacing: 6,
+                          letterSpacing: 4,
                           color: const Color(0xFF7C2D12),
                         ),
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    '这是服务端真实返回的邀请码，可用于其他设备通过邀请码入网。',
-                  ),
+                  const Text('可将该邀请码分发给其他设备，通过同一编排链路接入私有网络。'),
                 ],
               ),
             ),
           ],
           const SizedBox(height: 22),
           Text(
-            '当前长期网络',
+            '服务端托管网络',
             style: Theme.of(context).textTheme.titleSmall?.copyWith(
                   fontWeight: FontWeight.w800,
                 ),
           ),
           const SizedBox(height: 12),
           if (managedNetworks.isEmpty)
-            const _EmptyManagedNetworksState()
+            const _EmptyStateBox(message: '当前设备还没有服务端侧的托管网络记录。')
           else
             Column(
               children: managedNetworks
                   .map(
                     (ManagedNetwork network) => Padding(
                       padding: const EdgeInsets.only(bottom: 12),
-                      child: _NetworkSummaryCard(
+                      child: _ManagedNetworkCard(
                         network: network,
+                        localState: _findLocal(runtimeStatus, network),
                         accentColor: network.isDefault
                             ? const Color(0xFF2563EB)
                             : const Color(0xFFEA580C),
@@ -773,15 +860,33 @@ class _PrivateNetworkingTab extends StatelessWidget {
       ),
     );
   }
+
+  ZeroTierNetworkState? _findLocal(
+    ZeroTierRuntimeStatus runtimeStatus,
+    ManagedNetwork network,
+  ) {
+    final String targetId = network.zeroTierNetworkId?.trim().toLowerCase() ?? '';
+    if (targetId.isEmpty) {
+      return null;
+    }
+    for (final ZeroTierNetworkState state in runtimeStatus.joinedNetworks) {
+      if (state.networkId.trim().toLowerCase() == targetId) {
+        return state;
+      }
+    }
+    return null;
+  }
 }
 
-class _NetworkSummaryCard extends StatelessWidget {
-  const _NetworkSummaryCard({
+class _ManagedNetworkCard extends StatelessWidget {
+  const _ManagedNetworkCard({
     required this.network,
+    required this.localState,
     required this.accentColor,
   });
 
   final ManagedNetwork network;
+  final ZeroTierNetworkState? localState;
   final Color accentColor;
 
   @override
@@ -820,8 +925,7 @@ class _NetworkSummaryCard extends StatelessWidget {
               ),
             ],
           ),
-          if (network.description != null &&
-              network.description!.trim().isNotEmpty) ...<Widget>[
+          if (network.description?.trim().isNotEmpty == true) ...<Widget>[
             const SizedBox(height: 8),
             Text(network.description!),
           ],
@@ -831,17 +935,164 @@ class _NetworkSummaryCard extends StatelessWidget {
             runSpacing: 10,
             children: <Widget>[
               _InfoPill(label: '类型', value: network.type),
-              if (network.zeroTierNetworkName != null)
-                _InfoPill(
-                  label: 'ZeroTier 名称',
-                  value: network.zeroTierNetworkName!,
-                ),
-              if (network.zeroTierNetworkId != null)
-                _InfoPill(
-                  label: 'ZeroTier ID',
-                  value: network.zeroTierNetworkId!,
-                ),
+              if (network.zeroTierNetworkName?.trim().isNotEmpty == true)
+                _InfoPill(label: 'ZeroTier 名称', value: network.zeroTierNetworkName!),
+              if (network.zeroTierNetworkId?.trim().isNotEmpty == true)
+                _InfoPill(label: 'ZeroTier ID', value: network.zeroTierNetworkId!),
+              _InfoPill(
+                label: '本地映射',
+                value: localState == null ? '未发现' : localState!.status,
+              ),
             ],
+          ),
+          if (localState != null && localState!.assignedAddresses.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            _AddressWrap(addresses: localState!.assignedAddresses),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _LocalNetworkCard extends StatelessWidget {
+  const _LocalNetworkCard({
+    required this.network,
+    required this.managedNetwork,
+  });
+
+  final ZeroTierNetworkState network;
+  final ManagedNetwork? managedNetwork;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color accentColor =
+        network.isConnected ? const Color(0xFF15803D) : const Color(0xFFB45309);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: accentColor.withValues(alpha: 0.22)),
+        boxShadow: <BoxShadow>[
+          BoxShadow(
+            color: accentColor.withValues(alpha: 0.06),
+            blurRadius: 20,
+            offset: const Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  network.networkName.isEmpty ? network.networkId : network.networkName,
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                ),
+              ),
+              _StatusChip(label: network.status, color: accentColor),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: <Widget>[
+              _InfoPill(label: 'Network ID', value: network.networkId),
+              _InfoPill(label: 'Authorized', value: network.isAuthorized ? 'Yes' : 'No'),
+              _InfoPill(label: 'Connected', value: network.isConnected ? 'Yes' : 'No'),
+              if (managedNetwork != null)
+                _InfoPill(label: '服务端网络', value: managedNetwork!.name),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (network.assignedAddresses.isEmpty)
+            const Text('暂未分配托管地址。')
+          else
+            _AddressWrap(addresses: network.assignedAddresses),
+        ],
+      ),
+    );
+  }
+}
+
+class _RuntimeEventTile extends StatelessWidget {
+  const _RuntimeEventTile({
+    required this.event,
+  });
+
+  final ZeroTierRuntimeEvent event;
+
+  @override
+  Widget build(BuildContext context) {
+    final ({Color background, Color foreground, IconData icon}) style =
+        switch (event.type) {
+      ZeroTierRuntimeEventType.error => (
+          background: const Color(0xFFFFE9E9),
+          foreground: const Color(0xFFB91C1C),
+          icon: Icons.error_outline_rounded,
+        ),
+      ZeroTierRuntimeEventType.networkOnline ||
+      ZeroTierRuntimeEventType.ipAssigned ||
+      ZeroTierRuntimeEventType.nodeStarted => (
+          background: const Color(0xFFEAF8EF),
+          foreground: const Color(0xFF15803D),
+          icon: Icons.check_circle_rounded,
+        ),
+      _ => (
+          background: const Color(0xFFEAF2FF),
+          foreground: const Color(0xFF1D4ED8),
+          icon: Icons.timeline_rounded,
+        ),
+    };
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: style.background,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(style.icon, color: style.foreground, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  event.type.name,
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        color: style.foreground,
+                        fontWeight: FontWeight.w700,
+                      ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  event.message?.trim().isNotEmpty == true
+                      ? event.message!
+                      : '事件已回流到 Flutter 编排层。',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: style.foreground,
+                      ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '${_timeOrDash(event.occurredAt)}${event.networkId == null ? '' : ' · ${event.networkId}'}',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: style.foreground.withValues(alpha: 0.82),
+                      ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -849,8 +1100,169 @@ class _NetworkSummaryCard extends StatelessWidget {
   }
 }
 
-class _EmptyManagedNetworksState extends StatelessWidget {
-  const _EmptyManagedNetworksState();
+class _MetricBlock extends StatelessWidget {
+  const _MetricBlock({
+    required this.label,
+    required this.value,
+  });
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 220,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            label,
+            style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                  color: const Color(0xFF9A3412),
+                ),
+          ),
+          const SizedBox(height: 8),
+          SelectableText(
+            value,
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w800,
+                  color: const Color(0xFF7C2D12),
+                ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LabeledBlock extends StatelessWidget {
+  const _LabeledBlock({
+    required this.label,
+    required this.value,
+    this.action,
+  });
+
+  final String label;
+  final String value;
+  final Widget? action;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(label, style: Theme.of(context).textTheme.labelLarge),
+        const SizedBox(height: 8),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: Theme.of(context).colorScheme.outlineVariant,
+            ),
+          ),
+          child: Row(
+            children: <Widget>[
+              Expanded(child: SelectableText(value)),
+              if (action != null) action!,
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _InlineBanner extends StatelessWidget {
+  const _InlineBanner({
+    required this.icon,
+    required this.color,
+    required this.background,
+    required this.title,
+    required this.message,
+    this.trailing,
+  });
+
+  final IconData icon;
+  final Color color;
+  final Color background;
+  final String title;
+  final String message;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(icon, color: color),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  title,
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        color: color,
+                        fontWeight: FontWeight.w800,
+                      ),
+                ),
+                const SizedBox(height: 6),
+                Text(message),
+              ],
+            ),
+          ),
+          if (trailing != null) ...<Widget>[
+            const SizedBox(width: 12),
+            trailing!,
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _InlineHint extends StatelessWidget {
+  const _InlineHint({
+    required this.message,
+  });
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF4E8),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(
+        message,
+        textAlign: TextAlign.center,
+      ),
+    );
+  }
+}
+
+class _EmptyStateBox extends StatelessWidget {
+  const _EmptyStateBox({
+    required this.message,
+  });
+
+  final String message;
 
   @override
   Widget build(BuildContext context) {
@@ -861,10 +1273,103 @@ class _EmptyManagedNetworksState extends StatelessWidget {
         color: Theme.of(context).colorScheme.surfaceContainerLowest,
         borderRadius: BorderRadius.circular(18),
       ),
-      child: const Text(
-        '当前设备还没有查到已加入的长期网络。可以先主持一个私域网络，或下拉刷新。',
+      child: Text(
+        message,
         textAlign: TextAlign.center,
       ),
+    );
+  }
+}
+
+enum _CapabilityTone { ready, warning, info }
+
+class _CapabilityItem extends StatelessWidget {
+  const _CapabilityItem({
+    required this.label,
+    required this.tone,
+  });
+
+  final String label;
+  final _CapabilityTone tone;
+
+  @override
+  Widget build(BuildContext context) {
+    final ({Color background, Color foreground, IconData icon}) style =
+        switch (tone) {
+      _CapabilityTone.ready => (
+          background: const Color(0xFFEAF8EF),
+          foreground: const Color(0xFF15803D),
+          icon: Icons.check_circle_rounded,
+        ),
+      _CapabilityTone.warning => (
+          background: const Color(0xFFFFF4E8),
+          foreground: const Color(0xFFB45309),
+          icon: Icons.error_rounded,
+        ),
+      _CapabilityTone.info => (
+          background: const Color(0xFFEAF2FF),
+          foreground: const Color(0xFF1D4ED8),
+          icon: Icons.info_rounded,
+        ),
+    };
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: style.background,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(style.icon, color: style.foreground, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              label,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: style.foreground,
+                    fontWeight: FontWeight.w600,
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AddressWrap extends StatelessWidget {
+  const _AddressWrap({
+    required this.addresses,
+  });
+
+  final List<String> addresses;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: addresses
+          .map(
+            (String address) => Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFFEAF2FF),
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(
+                address,
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      color: const Color(0xFF1D4ED8),
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+            ),
+          )
+          .toList(),
     );
   }
 }
@@ -901,10 +1406,7 @@ class _NetworkingActionOrb extends StatelessWidget {
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               gradient: const LinearGradient(
-                colors: <Color>[
-                  Color(0xFFFFC36B),
-                  Color(0xFFF97316),
-                ],
+                colors: <Color>[Color(0xFFFFC36B), Color(0xFFF97316)],
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),
@@ -1009,5 +1511,33 @@ class _InfoPill extends StatelessWidget {
       ),
       child: Text('$label: $value'),
     );
+  }
+}
+
+String _timeOrDash(DateTime? time) {
+  if (time == null) {
+    return '-';
+  }
+  final DateTime local = time.toLocal();
+  return '${local.year.toString().padLeft(4, '0')}-'
+      '${local.month.toString().padLeft(2, '0')}-'
+      '${local.day.toString().padLeft(2, '0')} '
+      '${local.hour.toString().padLeft(2, '0')}:'
+      '${local.minute.toString().padLeft(2, '0')}:'
+      '${local.second.toString().padLeft(2, '0')}';
+}
+
+String _serviceStateLabel(ZeroTierRuntimeStatus status) {
+  switch (status.serviceState) {
+    case 'running':
+      return '运行中';
+    case 'starting':
+      return '启动中';
+    case 'prepared':
+      return '已准备';
+    case 'unavailable':
+      return '不可用';
+    default:
+      return status.serviceState;
   }
 }

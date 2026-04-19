@@ -1,0 +1,89 @@
+#ifndef FLUTTER_RUNNER_ZEROTIER_WINDOWS_RUNTIME_H_
+#define FLUTTER_RUNNER_ZEROTIER_WINDOWS_RUNTIME_H_
+
+#include <flutter/encodable_value.h>
+
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+struct ZeroTierWindowsNetworkRecord {
+  uint64_t network_id = 0;
+  std::string network_name;
+  std::string status = "UNKNOWN";
+  std::vector<std::string> assigned_addresses;
+  bool is_authorized = false;
+  bool is_connected = false;
+};
+
+class ZeroTierWindowsRuntime {
+ public:
+  using EventCallback = std::function<void(const flutter::EncodableMap&)>;
+
+  ZeroTierWindowsRuntime();
+
+  flutter::EncodableMap DetectStatus() const;
+  flutter::EncodableMap PrepareEnvironment();
+  flutter::EncodableMap StartNode();
+  flutter::EncodableMap StopNode();
+
+  void SetEventCallback(EventCallback callback);
+  void ClearEventCallback();
+
+  bool JoinNetworkAndWaitForIp(uint64_t network_id, int timeout_ms,
+                               std::string* error_message);
+  bool LeaveNetwork(uint64_t network_id, std::string* error_message);
+
+  flutter::EncodableList ListNetworks() const;
+  std::optional<flutter::EncodableMap> GetNetworkDetail(uint64_t network_id) const;
+
+ private:
+  static void HandleLibztEvent(void* message_ptr);
+
+  flutter::EncodableMap BuildStatus() const;
+  flutter::EncodableMap BuildEvent(const std::string& type,
+                                   const std::string& message = "",
+                                   const std::string& network_id = "",
+                                   const flutter::EncodableMap& payload =
+                                       flutter::EncodableMap{}) const;
+  flutter::EncodableMap BuildNetworkMap(
+      const ZeroTierWindowsNetworkRecord& network) const;
+
+  bool EnsurePrepared(std::string* error_message);
+  bool EnsureNodeReady(std::string* error_message);
+  void ProcessEvent(void* message_ptr);
+  void UpdateNetworkFromLibztMessage(const void* message_ptr);
+  void UpdateAddressFromLibztMessage(const void* message_ptr);
+  void EmitEvent(const flutter::EncodableMap& event) const;
+  void EmitError(const std::string& message,
+                 const std::string& network_id = "") const;
+
+  std::string RuntimeRootPath() const;
+  std::string NodeStoragePath() const;
+  std::string LogsPath() const;
+  std::string ToHexNetworkId(uint64_t network_id) const;
+
+  mutable std::mutex mutex_;
+  mutable std::condition_variable state_cv_;
+  std::map<uint64_t, ZeroTierWindowsNetworkRecord> networks_;
+  EventCallback event_callback_;
+  std::string last_error_;
+  std::string storage_path_;
+  std::string logs_path_;
+  uint64_t node_id_ = 0;
+  int node_port_ = 0;
+  bool environment_prepared_ = false;
+  bool handler_registered_ = false;
+  bool node_started_ = false;
+  bool node_online_ = false;
+  bool stop_requested_ = false;
+  int major_version_ = 0;
+  int minor_version_ = 0;
+};
+
+#endif  // FLUTTER_RUNNER_ZEROTIER_WINDOWS_RUNTIME_H_

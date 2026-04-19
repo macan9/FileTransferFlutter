@@ -49,6 +49,12 @@ endfunction()
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
 
+set(BUILD_HOST ON CACHE BOOL "" FORCE)
+set(ZTS_DISABLE_CENTRAL_API TRUE CACHE BOOL "" FORCE)
+set(FLUTTER_EMBEDDED_BUILD TRUE CACHE BOOL "" FORCE)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libzt"
+  "${CMAKE_CURRENT_BINARY_DIR}/third_party/libzt")
+
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 
@@ -79,6 +85,9 @@ install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}
   COMPONENT Runtime)
 
 install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  COMPONENT Runtime)
+
+install(FILES "$<TARGET_FILE:zt-shared>" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
 if(PLUGIN_BUNDLED_LIBRARIES)
