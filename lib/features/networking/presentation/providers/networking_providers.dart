@@ -2,6 +2,7 @@ import 'package:equatable/equatable.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
+import 'package:file_transfer_flutter/core/models/pairing_session.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:file_transfer_flutter/core/services/networking_service.dart';
@@ -17,6 +18,7 @@ class NetworkingDashboardState extends Equatable {
   const NetworkingDashboardState({
     required this.defaultNetwork,
     required this.managedNetworks,
+    required this.pairingSessions,
     required this.deviceIdentity,
     this.isSubmitting = false,
     this.activeAction,
@@ -25,12 +27,14 @@ class NetworkingDashboardState extends Equatable {
   const NetworkingDashboardState.initial()
       : defaultNetwork = null,
         managedNetworks = const <ManagedNetwork>[],
+        pairingSessions = const <PairingSession>[],
         deviceIdentity = null,
         isSubmitting = false,
         activeAction = null;
 
   final ManagedNetwork? defaultNetwork;
   final List<ManagedNetwork> managedNetworks;
+  final List<PairingSession> pairingSessions;
   final NetworkDeviceIdentity? deviceIdentity;
   final bool isSubmitting;
   final String? activeAction;
@@ -39,6 +43,7 @@ class NetworkingDashboardState extends Equatable {
     ManagedNetwork? defaultNetwork,
     bool clearDefaultNetwork = false,
     List<ManagedNetwork>? managedNetworks,
+    List<PairingSession>? pairingSessions,
     NetworkDeviceIdentity? deviceIdentity,
     bool clearDeviceIdentity = false,
     bool? isSubmitting,
@@ -49,6 +54,7 @@ class NetworkingDashboardState extends Equatable {
       defaultNetwork:
           clearDefaultNetwork ? null : defaultNetwork ?? this.defaultNetwork,
       managedNetworks: managedNetworks ?? this.managedNetworks,
+      pairingSessions: pairingSessions ?? this.pairingSessions,
       deviceIdentity:
           clearDeviceIdentity ? null : deviceIdentity ?? this.deviceIdentity,
       isSubmitting: isSubmitting ?? this.isSubmitting,
@@ -61,6 +67,7 @@ class NetworkingDashboardState extends Equatable {
   List<Object?> get props => <Object?>[
         defaultNetwork,
         managedNetworks,
+        pairingSessions,
         deviceIdentity,
         isSubmitting,
         activeAction,
@@ -107,6 +114,65 @@ class NetworkingController extends AsyncNotifier<NetworkingDashboardState> {
     );
   }
 
+  Future<PairingSession> createPairingSession({
+    required String initiatorDeviceId,
+    required String targetDeviceId,
+    required List<Map<String, dynamic>> allowedPorts,
+    int expiresInMinutes = 60,
+    String? note,
+  }) async {
+    late final PairingSession result;
+    await _runAction(
+      action: 'create-pairing-session',
+      run: () async {
+        result = await _service.createPairingSession(
+          initiatorDeviceId: initiatorDeviceId,
+          targetDeviceId: targetDeviceId,
+          allowedPorts: allowedPorts,
+          expiresInMinutes: expiresInMinutes,
+          note: note,
+        );
+      },
+    );
+    return result;
+  }
+
+  Future<PairingSession> joinPairingSession({
+    required String sessionId,
+    required String deviceId,
+  }) async {
+    late final PairingSession result;
+    await _runAction(
+      action: 'join-pairing-session',
+      run: () async {
+        result = await _service.joinPairingSession(
+          sessionId: sessionId,
+          deviceId: deviceId,
+        );
+      },
+    );
+    return result;
+  }
+
+  Future<PairingSession> cancelPairingSession({
+    required String sessionId,
+    required String deviceId,
+    String? reason,
+  }) async {
+    late final PairingSession result;
+    await _runAction(
+      action: 'cancel-pairing-session',
+      run: () async {
+        result = await _service.cancelPairingSession(
+          sessionId: sessionId,
+          deviceId: deviceId,
+          reason: reason,
+        );
+      },
+    );
+    return result;
+  }
+
   Future<PrivateNetworkCreationResult> createPrivateNetwork({
     required String ownerDeviceId,
     required String name,
@@ -149,6 +215,12 @@ class NetworkingController extends AsyncNotifier<NetworkingDashboardState> {
                 config.zeroTierNodeId.trim().isEmpty
             ? const <ManagedNetwork>[]
             : await _service.fetchManagedNetworks(deviceId: config.deviceId);
+    final List<PairingSession> pairingSessions =
+        config.deviceId.trim().isEmpty ||
+                config.agentToken.trim().isEmpty ||
+                config.zeroTierNodeId.trim().isEmpty
+            ? const <PairingSession>[]
+            : await _service.fetchPairingSessions(deviceId: config.deviceId);
 
     final NetworkDeviceIdentity? deviceIdentity =
         config.deviceId.trim().isEmpty ||
@@ -169,6 +241,7 @@ class NetworkingController extends AsyncNotifier<NetworkingDashboardState> {
     return NetworkingDashboardState(
       defaultNetwork: defaultNetwork,
       managedNetworks: managedNetworks,
+      pairingSessions: pairingSessions,
       deviceIdentity: deviceIdentity,
     );
   }

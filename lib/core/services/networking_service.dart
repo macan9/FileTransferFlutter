@@ -4,6 +4,7 @@ import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_agent_command.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
 import 'package:file_transfer_flutter/core/models/network_invite_code.dart';
+import 'package:file_transfer_flutter/core/models/pairing_session.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:http/http.dart' as http;
@@ -37,7 +38,27 @@ abstract class NetworkingService {
     String? deviceId,
     String? type,
   });
+  Future<List<PairingSession>> fetchPairingSessions({
+    String? deviceId,
+  });
+  Future<PairingSession> fetchPairingSession({required String sessionId});
   Future<void> joinDefaultNetwork({required String deviceId});
+  Future<PairingSession> createPairingSession({
+    required String initiatorDeviceId,
+    required String targetDeviceId,
+    required List<Map<String, dynamic>> allowedPorts,
+    int expiresInMinutes,
+    String? note,
+  });
+  Future<PairingSession> joinPairingSession({
+    required String sessionId,
+    required String deviceId,
+  });
+  Future<PairingSession> cancelPairingSession({
+    required String sessionId,
+    required String deviceId,
+    String? reason,
+  });
   Future<PrivateNetworkCreationResult> createPrivateNetwork({
     required String ownerDeviceId,
     required String name,
@@ -175,6 +196,37 @@ class HttpNetworkingService implements NetworkingService {
   }
 
   @override
+  Future<List<PairingSession>> fetchPairingSessions({
+    String? deviceId,
+  }) async {
+    final http.Response response = await _client.get(
+      _buildUri(
+        '/networking/sessions',
+        queryParameters: <String, String>{
+          if (deviceId != null && deviceId.trim().isNotEmpty)
+            'deviceId': deviceId.trim(),
+        },
+      ),
+    );
+    final dynamic decoded = _decodeResponse(response);
+    final List<Map<String, dynamic>> items = _extractMapList(
+      decoded,
+      listKeys: const <String>['items', 'data', 'sessions'],
+    );
+    return items.map(PairingSession.fromJson).toList();
+  }
+
+  @override
+  Future<PairingSession> fetchPairingSession(
+      {required String sessionId}) async {
+    final http.Response response = await _client.get(
+      _buildUri('/networking/sessions/$sessionId'),
+    );
+    final dynamic decoded = _decodeResponse(response);
+    return _extractPairingSession(decoded);
+  }
+
+  @override
   Future<void> joinDefaultNetwork({required String deviceId}) async {
     final http.Response response = await _client.post(
       _buildUri('/networking/default-network/join'),
@@ -184,6 +236,63 @@ class HttpNetworkingService implements NetworkingService {
       }),
     );
     _decodeResponse(response);
+  }
+
+  @override
+  Future<PairingSession> createPairingSession({
+    required String initiatorDeviceId,
+    required String targetDeviceId,
+    required List<Map<String, dynamic>> allowedPorts,
+    int expiresInMinutes = 60,
+    String? note,
+  }) async {
+    final http.Response response = await _client.post(
+      _buildUri('/networking/sessions'),
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{
+        'initiatorDeviceId': initiatorDeviceId,
+        'targetDeviceId': targetDeviceId,
+        'expiresInMinutes': expiresInMinutes,
+        if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+        'allowedPorts': allowedPorts,
+      }),
+    );
+    final dynamic decoded = _decodeResponse(response);
+    return _extractPairingSession(decoded);
+  }
+
+  @override
+  Future<PairingSession> joinPairingSession({
+    required String sessionId,
+    required String deviceId,
+  }) async {
+    final http.Response response = await _client.post(
+      _buildUri('/networking/sessions/$sessionId/join'),
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{
+        'deviceId': deviceId,
+      }),
+    );
+    final dynamic decoded = _decodeResponse(response);
+    return _extractPairingSession(decoded);
+  }
+
+  @override
+  Future<PairingSession> cancelPairingSession({
+    required String sessionId,
+    required String deviceId,
+    String? reason,
+  }) async {
+    final http.Response response = await _client.post(
+      _buildUri('/networking/sessions/$sessionId/cancel'),
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{
+        'deviceId': deviceId,
+        if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
+      }),
+    );
+    final dynamic decoded = _decodeResponse(response);
+    return _extractPairingSession(decoded);
   }
 
   @override
@@ -308,16 +417,34 @@ class HttpNetworkingService implements NetworkingService {
     return NetworkInviteCode.fromJson(nested ?? map);
   }
 
-  List<Map<String, dynamic>> _extractMapList(dynamic decoded) {
+  PairingSession _extractPairingSession(dynamic decoded) {
+    final Map<String, dynamic>? map = _extractMap(decoded);
+    if (map == null) {
+      throw const RealtimeError('Temporary session response is invalid.');
+    }
+
+    final Map<String, dynamic>? nested = _extractMap(map['item']) ??
+        _extractMap(map['data']) ??
+        _extractMap(map['session']) ??
+        _extractMap(map['pairingSession']);
+
+    return PairingSession.fromJson(nested ?? map);
+  }
+
+  List<Map<String, dynamic>> _extractMapList(
+    dynamic decoded, {
+    List<String> listKeys = const <String>['items', 'data', 'networks'],
+  }) {
     if (decoded is List) {
       return decoded.whereType<Map>().map(_stringMap).toList();
     }
 
     if (decoded is Map) {
-      final dynamic items =
-          decoded['items'] ?? decoded['data'] ?? decoded['networks'];
-      if (items is List) {
-        return items.whereType<Map>().map(_stringMap).toList();
+      for (final String key in listKeys) {
+        final dynamic items = decoded[key];
+        if (items is List) {
+          return items.whereType<Map>().map(_stringMap).toList();
+        }
       }
     }
 

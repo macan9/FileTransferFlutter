@@ -242,7 +242,8 @@ class NetworkingAgentRuntimeController
     _runtimeEventSubscription = null;
 
     ZeroTierRuntimeStatus status = state.runtimeStatus;
-    if (!skipNativeStop && (_started || status.isNodeRunning || status.hasNodeId)) {
+    if (!skipNativeStop &&
+        (_started || status.isNodeRunning || status.hasNodeId)) {
       try {
         status = await _zeroTierService.stopNode();
       } catch (_) {
@@ -428,6 +429,17 @@ class NetworkingAgentRuntimeController
       }
 
       for (final NetworkAgentCommand command in commands) {
+        if (command.isCancelled) {
+          state = state.copyWith(
+            lastCommandAt: DateTime.now(),
+            lastCommandSummary: 'Skipped cancelled ${command.type}',
+            clearLastError: true,
+          );
+          continue;
+        }
+        if (command.isFinal) {
+          continue;
+        }
         await _executeCommand(config, command);
       }
       await _refreshRuntimeStatus();
@@ -446,6 +458,22 @@ class NetworkingAgentRuntimeController
     AppConfig config,
     NetworkAgentCommand command,
   ) async {
+    try {
+      await _networkingService.ackAgentCommand(
+        commandId: command.id,
+        deviceId: config.deviceId,
+        agentToken: config.agentToken,
+        status: 'processing',
+      );
+    } catch (error) {
+      state = state.copyWith(
+        lastCommandAt: DateTime.now(),
+        lastCommandSummary: 'Skipped ${command.type}',
+        lastError: error is RealtimeError ? error.message : '$error',
+      );
+      return;
+    }
+
     try {
       switch (command.type) {
         case 'join_zerotier_network':

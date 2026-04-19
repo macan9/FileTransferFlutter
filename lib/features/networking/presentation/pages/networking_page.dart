@@ -1,4 +1,4 @@
-﻿import 'package:file_transfer_flutter/core/config/models/app_config.dart';
+import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
@@ -35,7 +35,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     _networkDescriptionController =
         TextEditingController(text: 'Private mesh for trusted devices');
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(networkingAgentRuntimeProvider.notifier).initializeLocalRuntime();
+      ref
+          .read(networkingAgentRuntimeProvider.notifier)
+          .initializeLocalRuntime();
     });
   }
 
@@ -126,7 +128,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                 title: '服务端编排加载失败',
                 message: _errorText(networkingAsync.error),
                 trailing: FilledButton.icon(
-                  onPressed: () => ref.read(networkingProvider.notifier).refresh(),
+                  onPressed: () =>
+                      ref.read(networkingProvider.notifier).refresh(),
                   icon: const Icon(Icons.refresh_rounded),
                   label: const Text('重试'),
                 ),
@@ -181,7 +184,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                     isLocalReady: isLocalReady,
                     runtimeStatus: runtimeStatus,
                     onJoin: () => _joinDefaultNetwork(config),
-                    onLeave: () => _leaveDefaultNetwork(dashboard.defaultNetwork),
+                    onLeave: () =>
+                        _leaveDefaultNetwork(dashboard.defaultNetwork),
                     onCopyIp: (String ip) => _copyToClipboard(
                       ip,
                       successMessage: '已复制虚拟 IP',
@@ -203,7 +207,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                 ],
               ),
             ),
-            if (networkingAsync.isLoading && networkingAsync.valueOrNull == null)
+            if (networkingAsync.isLoading &&
+                networkingAsync.valueOrNull == null)
               const Padding(
                 padding: EdgeInsets.only(top: 18),
                 child: Center(child: CircularProgressIndicator()),
@@ -336,15 +341,15 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   }
 
   String _eventMessage(ZeroTierRuntimeEvent event) {
-    final String networkSuffix = event.networkId == null
-        ? ''
-        : ' (${event.networkId})';
+    final String networkSuffix =
+        event.networkId == null ? '' : ' (${event.networkId})';
     final String defaultMessage = switch (event.type) {
       ZeroTierRuntimeEventType.environmentReady => 'Windows ZeroTier 环境已准备完成。',
       ZeroTierRuntimeEventType.permissionRequired => 'ZeroTier 需要额外权限或手动设置。',
       ZeroTierRuntimeEventType.nodeStarted => 'ZeroTier 节点已启动。',
       ZeroTierRuntimeEventType.nodeStopped => 'ZeroTier 节点已停止。',
-      ZeroTierRuntimeEventType.networkJoining => '正在加入 ZeroTier 网络$networkSuffix。',
+      ZeroTierRuntimeEventType.networkJoining =>
+        '正在加入 ZeroTier 网络$networkSuffix。',
       ZeroTierRuntimeEventType.networkWaitingAuthorization =>
         '网络$networkSuffix 仍在等待授权。',
       ZeroTierRuntimeEventType.networkOnline => '网络$networkSuffix 已在线。',
@@ -407,7 +412,8 @@ class _HeroStatusCard extends StatelessWidget {
             spacing: 10,
             runSpacing: 10,
             children: <Widget>[
-              _InfoPill(label: '运行状态', value: _serviceStateLabel(runtimeStatus)),
+              _InfoPill(
+                  label: '运行状态', value: _serviceStateLabel(runtimeStatus)),
               _InfoPill(
                 label: '节点',
                 value: runtimeStatus.isNodeRunning ? '运行中' : '未运行',
@@ -442,7 +448,9 @@ class _HeroStatusCard extends StatelessWidget {
               children: <Widget>[
                 _MetricBlock(
                   label: 'Node ID',
-                  value: runtimeStatus.nodeId.isEmpty ? '等待初始化' : runtimeStatus.nodeId,
+                  value: runtimeStatus.nodeId.isEmpty
+                      ? '等待初始化'
+                      : runtimeStatus.nodeId,
                 ),
                 _MetricBlock(
                   label: 'Runtime Version',
@@ -462,12 +470,15 @@ class _HeroStatusCard extends StatelessWidget {
           const SizedBox(height: 16),
           _LabeledBlock(
             label: 'Device ID',
-            value: config.deviceId.trim().isEmpty ? '等待 bootstrap' : config.deviceId,
+            value: config.deviceId.trim().isEmpty
+                ? '等待 bootstrap'
+                : config.deviceId,
           ),
           const SizedBox(height: 12),
           _LabeledBlock(
             label: 'Agent Token',
-            value: config.agentToken.trim().isEmpty ? '尚未下发' : config.agentToken,
+            value:
+                config.agentToken.trim().isEmpty ? '尚未下发' : config.agentToken,
             action: onCopyToken == null
                 ? null
                 : IconButton(
@@ -479,7 +490,8 @@ class _HeroStatusCard extends StatelessWidget {
           const SizedBox(height: 12),
           _LabeledBlock(
             label: '权限摘要',
-            value: runtimeStatus.permissionState.summary ?? 'Windows libzt 运行时已接入。',
+            value: runtimeStatus.permissionState.summary ??
+                'Windows libzt 运行时已接入。',
           ),
           const SizedBox(height: 12),
           _LabeledBlock(
@@ -532,7 +544,8 @@ class _RuntimeInsightCard extends StatelessWidget {
             spacing: 10,
             runSpacing: 10,
             children: <Widget>[
-              _InfoPill(label: 'Service State', value: runtimeStatus.serviceState),
+              _InfoPill(
+                  label: 'Service State', value: runtimeStatus.serviceState),
               _InfoPill(
                 label: 'Last Updated',
                 value: _timeOrDash(runtimeStatus.updatedAt),
@@ -658,7 +671,8 @@ class _LocalNetworksCard extends StatelessWidget {
                       padding: const EdgeInsets.only(bottom: 12),
                       child: _LocalNetworkCard(
                         network: network,
-                        managedNetwork: _matchManagedNetwork(network, managedNetworks),
+                        managedNetwork:
+                            _matchManagedNetwork(network, managedNetworks),
                       ),
                     ),
                   )
@@ -762,10 +776,12 @@ class _OneClickNetworkingTab extends StatelessWidget {
                         : '本地准备完成后\n点击开始接入默认网络')),
             tone: orbTone,
             spinning: isConnecting,
-            onTap:
-                isDisabled ? null : ((isGrouped || isConnecting) ? onLeave : onJoin),
+            onTap: isDisabled
+                ? null
+                : ((isGrouped || isConnecting) ? onLeave : onJoin),
           ),
-          if (localState != null && localState.assignedAddresses.isNotEmpty) ...<Widget>[
+          if (localState != null &&
+              localState.assignedAddresses.isNotEmpty) ...<Widget>[
             const SizedBox(height: 16),
             _VirtualIpPanel(
               addresses: localState.assignedAddresses,
@@ -791,7 +807,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
     ZeroTierRuntimeStatus runtimeStatus,
     ManagedNetwork network,
   ) {
-    final String targetId = network.zeroTierNetworkId?.trim().toLowerCase() ?? '';
+    final String targetId =
+        network.zeroTierNetworkId?.trim().toLowerCase() ?? '';
     if (targetId.isEmpty) {
       return null;
     }
@@ -880,10 +897,16 @@ class _PrivateNetworkingTab extends StatelessWidget {
                 label: isDisabled ? '本地初始化' : (isBusy ? '处理中' : '加入网络'),
                 icon: isDisabled
                     ? Icons.power_settings_new_rounded
-                    : (isBusy ? Icons.hourglass_top_rounded : Icons.login_rounded),
-                subtitle: isDisabled ? '等待本地 ZeroTier 初始化' : '按邀请码发起请求\n等待本机 Agent 执行',
+                    : (isBusy
+                        ? Icons.hourglass_top_rounded
+                        : Icons.login_rounded),
+                subtitle: isDisabled
+                    ? '等待本地 ZeroTier 初始化'
+                    : '按邀请码发起请求\n等待本机 Agent 执行',
                 diameter: 190,
-                tone: isDisabled ? _NetworkingOrbTone.disabled : _NetworkingOrbTone.idle,
+                tone: isDisabled
+                    ? _NetworkingOrbTone.disabled
+                    : _NetworkingOrbTone.idle,
                 onTap: isBusy || isDisabled ? null : onJoinPressed,
               ),
               _NetworkingActionOrb(
@@ -895,7 +918,9 @@ class _PrivateNetworkingTab extends StatelessWidget {
                         : Icons.wifi_tethering_rounded),
                 subtitle: isDisabled ? '等待本地 ZeroTier 初始化' : '创建私有网络\n返回邀请码',
                 diameter: 190,
-                tone: isDisabled ? _NetworkingOrbTone.disabled : _NetworkingOrbTone.idle,
+                tone: isDisabled
+                    ? _NetworkingOrbTone.disabled
+                    : _NetworkingOrbTone.idle,
                 onTap: isBusy || isDisabled ? null : onHostPressed,
               ),
             ],
@@ -973,7 +998,8 @@ class _PrivateNetworkingTab extends StatelessWidget {
     ZeroTierRuntimeStatus runtimeStatus,
     ManagedNetwork network,
   ) {
-    final String targetId = network.zeroTierNetworkId?.trim().toLowerCase() ?? '';
+    final String targetId =
+        network.zeroTierNetworkId?.trim().toLowerCase() ?? '';
     if (targetId.isEmpty) {
       return null;
     }
@@ -1044,16 +1070,21 @@ class _ManagedNetworkCard extends StatelessWidget {
             children: <Widget>[
               _InfoPill(label: '类型', value: network.type),
               if (network.zeroTierNetworkName?.trim().isNotEmpty == true)
-                _InfoPill(label: 'ZeroTier 名称', value: network.zeroTierNetworkName!),
+                _InfoPill(
+                    label: 'ZeroTier 名称', value: network.zeroTierNetworkName!),
               if (network.zeroTierNetworkId?.trim().isNotEmpty == true)
-                _InfoPill(label: 'ZeroTier ID', value: network.zeroTierNetworkId!),
+                _InfoPill(
+                    label: 'ZeroTier ID', value: network.zeroTierNetworkId!),
               _InfoPill(
                 label: '本地映射',
                 value: localState == null ? '未发现' : localState!.status,
               ),
             ],
           ),
-          if (localState != null && localState!.assignedAddresses.isNotEmpty) ...<Widget>[
+          if (localState != null &&
+              localState!.assignedAddresses.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            _NetworkSegmentPanel(addresses: localState!.assignedAddresses),
             const SizedBox(height: 12),
             _AddressWrap(addresses: localState!.assignedAddresses),
           ],
@@ -1098,7 +1129,9 @@ class _LocalNetworkCard extends StatelessWidget {
             children: <Widget>[
               Expanded(
                 child: Text(
-                  network.networkName.isEmpty ? network.networkId : network.networkName,
+                  network.networkName.isEmpty
+                      ? network.networkId
+                      : network.networkName,
                   style: Theme.of(context).textTheme.titleSmall?.copyWith(
                         fontWeight: FontWeight.w800,
                       ),
@@ -1113,8 +1146,12 @@ class _LocalNetworkCard extends StatelessWidget {
             runSpacing: 10,
             children: <Widget>[
               _InfoPill(label: 'Network ID', value: network.networkId),
-              _InfoPill(label: 'Authorized', value: network.isAuthorized ? 'Yes' : 'No'),
-              _InfoPill(label: 'Connected', value: network.isConnected ? 'Yes' : 'No'),
+              _InfoPill(
+                  label: 'Authorized',
+                  value: network.isAuthorized ? 'Yes' : 'No'),
+              _InfoPill(
+                  label: 'Connected',
+                  value: network.isConnected ? 'Yes' : 'No'),
               if (managedNetwork != null)
                 _InfoPill(label: '服务端网络', value: managedNetwork!.name),
             ],
@@ -1122,8 +1159,11 @@ class _LocalNetworkCard extends StatelessWidget {
           const SizedBox(height: 12),
           if (network.assignedAddresses.isEmpty)
             const Text('暂未分配托管地址。')
-          else
+          else ...<Widget>[
+            _NetworkSegmentPanel(addresses: network.assignedAddresses),
+            const SizedBox(height: 12),
             _AddressWrap(addresses: network.assignedAddresses),
+          ],
         ],
       ),
     );
@@ -1148,7 +1188,8 @@ class _RuntimeEventTile extends StatelessWidget {
         ),
       ZeroTierRuntimeEventType.networkOnline ||
       ZeroTierRuntimeEventType.ipAssigned ||
-      ZeroTierRuntimeEventType.nodeStarted => (
+      ZeroTierRuntimeEventType.nodeStarted =>
+        (
           background: const Color(0xFFEAF8EF),
           foreground: const Color(0xFF15803D),
           icon: Icons.check_circle_rounded,
@@ -1493,6 +1534,8 @@ class _VirtualIpPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final List<String> segments = _derivedSegmentsFromAddresses(addresses);
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
@@ -1511,12 +1554,23 @@ class _VirtualIpPanel extends StatelessWidget {
                   fontWeight: FontWeight.w800,
                 ),
           ),
+          if (segments.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 8),
+            Text(
+              '共享网段：${segments.join(' / ')}',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF166534),
+                    fontWeight: FontWeight.w600,
+                  ),
+            ),
+          ],
           const SizedBox(height: 12),
           ...addresses.map(
             (String address) => Padding(
               padding: const EdgeInsets.only(bottom: 8),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(14),
@@ -1542,6 +1596,70 @@ class _VirtualIpPanel extends StatelessWidget {
                 ),
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _NetworkSegmentPanel extends StatelessWidget {
+  const _NetworkSegmentPanel({
+    required this.addresses,
+  });
+
+  final List<String> addresses;
+
+  @override
+  Widget build(BuildContext context) {
+    final List<String> segments = _derivedSegmentsFromAddresses(addresses);
+    if (segments.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFEAF2FF),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFFBFDBFE)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            '共享网段',
+            style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                  color: const Color(0xFF1D4ED8),
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: segments
+                .map(
+                  (String segment) => Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      segment,
+                      style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                            color: const Color(0xFF1D4ED8),
+                            fontWeight: FontWeight.w700,
+                          ),
+                    ),
+                  ),
+                )
+                .toList(),
           ),
         ],
       ),
@@ -1638,7 +1756,8 @@ class _NetworkingActionOrb extends StatelessWidget {
                   AnimatedRotation(
                     turns: spinning ? 1 : 0,
                     duration: const Duration(milliseconds: 1200),
-                    child: Icon(icon, size: diameter * 0.18, color: Colors.white),
+                    child:
+                        Icon(icon, size: diameter * 0.18, color: Colors.white),
                   ),
                   SizedBox(height: diameter * 0.06),
                   Text(
@@ -1728,6 +1847,58 @@ String _timeOrDash(DateTime? time) {
       '${local.hour.toString().padLeft(2, '0')}:'
       '${local.minute.toString().padLeft(2, '0')}:'
       '${local.second.toString().padLeft(2, '0')}';
+}
+
+List<String> _derivedSegmentsFromAddresses(List<String> addresses) {
+  final Set<String> segments = <String>{};
+  for (final String address in addresses) {
+    final String? segment = _deriveSegmentFromAddress(address);
+    if (segment != null && segment.isNotEmpty) {
+      segments.add(segment);
+    }
+  }
+  return segments.toList(growable: false);
+}
+
+String? _deriveSegmentFromAddress(String rawAddress) {
+  final String address = rawAddress.trim();
+  if (address.isEmpty) {
+    return null;
+  }
+
+  final List<String> cidrParts = address.split('/');
+  final String host = cidrParts.first.trim();
+  final int? prefixLength =
+      cidrParts.length > 1 ? int.tryParse(cidrParts[1].trim()) : null;
+
+  if (host.contains('.')) {
+    final List<String> octets = host.split('.');
+    if (octets.length != 4) {
+      return prefixLength == null ? null : '$host/$prefixLength';
+    }
+    final List<int> values = octets.map(int.tryParse).nonNulls.toList();
+    if (values.length != 4) {
+      return prefixLength == null ? null : '$host/$prefixLength';
+    }
+    final int normalizedPrefix =
+        prefixLength == null ? 24 : prefixLength.clamp(0, 32);
+    final int mask = normalizedPrefix == 0
+        ? 0
+        : (0xffffffff << (32 - normalizedPrefix)) & 0xffffffff;
+    final int ip =
+        (values[0] << 24) | (values[1] << 16) | (values[2] << 8) | values[3];
+    final int network = ip & mask;
+    return '${(network >> 24) & 0xff}.'
+        '${(network >> 16) & 0xff}.'
+        '${(network >> 8) & 0xff}.'
+        '${network & 0xff}/$normalizedPrefix';
+  }
+
+  if (host.contains(':')) {
+    return prefixLength == null ? host : '$host/$prefixLength';
+  }
+
+  return null;
 }
 
 String _serviceStateLabel(ZeroTierRuntimeStatus status) {

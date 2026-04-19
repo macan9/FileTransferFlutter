@@ -9,6 +9,9 @@ class NetworkAgentCommand extends Equatable {
     this.deviceId,
     this.sessionId,
     this.errorMessage,
+    this.createdAt,
+    this.deliveredAt,
+    this.acknowledgedAt,
   });
 
   factory NetworkAgentCommand.fromJson(Map<String, dynamic> json) {
@@ -24,6 +27,9 @@ class NetworkAgentCommand extends Equatable {
       deviceId: json['deviceId']?.toString(),
       sessionId: json['sessionId']?.toString(),
       errorMessage: json['errorMessage']?.toString(),
+      createdAt: _parseDateTime(json['createdAt']),
+      deliveredAt: _parseDateTime(json['deliveredAt']),
+      acknowledgedAt: _parseDateTime(json['acknowledgedAt']),
     );
   }
 
@@ -34,6 +40,13 @@ class NetworkAgentCommand extends Equatable {
   final String? deviceId;
   final String? sessionId;
   final String? errorMessage;
+  final DateTime? createdAt;
+  final DateTime? deliveredAt;
+  final DateTime? acknowledgedAt;
+
+  bool get isCancelled => status == 'cancelled';
+  bool get isFinal =>
+      status == 'acknowledged' || status == 'failed' || status == 'cancelled';
 
   @override
   List<Object?> get props => <Object?>[
@@ -44,5 +57,16 @@ class NetworkAgentCommand extends Equatable {
         deviceId,
         sessionId,
         errorMessage,
+        createdAt,
+        deliveredAt,
+        acknowledgedAt,
       ];
+}
+
+DateTime? _parseDateTime(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+
+  return DateTime.tryParse(value.toString());
 }
