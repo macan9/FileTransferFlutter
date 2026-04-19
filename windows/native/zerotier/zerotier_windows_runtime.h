@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -61,7 +62,7 @@ class ZeroTierWindowsRuntime {
   void UpdateAddressFromLibztMessage(const void* message_ptr);
   void EmitEvent(const flutter::EncodableMap& event) const;
   void EmitError(const std::string& message,
-                 const std::string& network_id = "") const;
+                 const std::string& network_id = "");
 
   std::string RuntimeRootPath() const;
   std::string NodeStoragePath() const;
@@ -71,6 +72,7 @@ class ZeroTierWindowsRuntime {
   mutable std::mutex mutex_;
   mutable std::condition_variable state_cv_;
   std::map<uint64_t, ZeroTierWindowsNetworkRecord> networks_;
+  std::set<uint64_t> leaving_networks_;
   EventCallback event_callback_;
   std::string last_error_;
   std::string storage_path_;

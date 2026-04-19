@@ -40,6 +40,8 @@ final networkingAgentRuntimeProvider = NotifierProvider<
 class NetworkingAgentRuntimeState extends Equatable {
   const NetworkingAgentRuntimeState({
     required this.runtimeStatus,
+    this.isActivated = false,
+    this.isLocalInitializing = false,
     this.isBootstrapping = false,
     this.isHeartbeating = false,
     this.isPolling = false,
@@ -53,6 +55,8 @@ class NetworkingAgentRuntimeState extends Equatable {
 
   const NetworkingAgentRuntimeState.initial()
       : runtimeStatus = const ZeroTierRuntimeStatus.unavailable(),
+        isActivated = false,
+        isLocalInitializing = false,
         isBootstrapping = false,
         isHeartbeating = false,
         isPolling = false,
@@ -64,6 +68,8 @@ class NetworkingAgentRuntimeState extends Equatable {
         lastError = null;
 
   final ZeroTierRuntimeStatus runtimeStatus;
+  final bool isActivated;
+  final bool isLocalInitializing;
   final bool isBootstrapping;
   final bool isHeartbeating;
   final bool isPolling;
@@ -76,9 +82,13 @@ class NetworkingAgentRuntimeState extends Equatable {
 
   bool get isReady =>
       runtimeStatus.cliAvailable && runtimeStatus.nodeId.trim().isNotEmpty;
+  bool get isLocalReady =>
+      runtimeStatus.cliAvailable && runtimeStatus.serviceState != 'unavailable';
 
   NetworkingAgentRuntimeState copyWith({
     ZeroTierRuntimeStatus? runtimeStatus,
+    bool? isActivated,
+    bool? isLocalInitializing,
     bool? isBootstrapping,
     bool? isHeartbeating,
     bool? isPolling,
@@ -96,6 +106,8 @@ class NetworkingAgentRuntimeState extends Equatable {
   }) {
     return NetworkingAgentRuntimeState(
       runtimeStatus: runtimeStatus ?? this.runtimeStatus,
+      isActivated: isActivated ?? this.isActivated,
+      isLocalInitializing: isLocalInitializing ?? this.isLocalInitializing,
       isBootstrapping: isBootstrapping ?? this.isBootstrapping,
       isHeartbeating: isHeartbeating ?? this.isHeartbeating,
       isPolling: isPolling ?? this.isPolling,
@@ -117,6 +129,8 @@ class NetworkingAgentRuntimeState extends Equatable {
   @override
   List<Object?> get props => <Object?>[
         runtimeStatus,
+        isActivated,
+        isLocalInitializing,
         isBootstrapping,
         isHeartbeating,
         isPolling,
@@ -145,33 +159,122 @@ class NetworkingAgentRuntimeController
   @override
   NetworkingAgentRuntimeState build() {
     ref.onDispose(_dispose);
-    ref.listen<AppConfig>(appConfigProvider,
-        (AppConfig? previous, AppConfig next) {
-      if (previous?.agentToken != next.agentToken ||
-          previous?.deviceId != next.deviceId ||
-          previous?.zeroTierNodeId != next.zeroTierNodeId) {
-        Future<void>.microtask(_ensureStarted);
-      }
-    });
-    Future<void>.microtask(_ensureStarted);
     return const NetworkingAgentRuntimeState.initial();
   }
 
   Future<void> refreshNow() async {
+    if (!_started) {
+      await _refreshRuntimeStatus();
+      return;
+    }
     await _initializeIdentity();
     await _sendHeartbeat();
     await _pollCommands();
     await _refreshRuntimeStatus();
   }
 
+  Future<void> activate() async {
+    await _ensureStarted();
+    await refreshNow();
+  }
+
+  Future<void> initializeLocalRuntime() async {
+    if (_busyBootstrapping || state.isLocalReady) {
+      await _refreshRuntimeStatus();
+      return;
+    }
+
+    state = state.copyWith(
+      isLocalInitializing: true,
+      clearLastError: true,
+    );
+
+    try {
+      ZeroTierRuntimeStatus status = await _zeroTierService.detectStatus();
+      state = state.copyWith(runtimeStatus: status);
+
+      status = await _zeroTierService.prepareEnvironment();
+      state = state.copyWith(runtimeStatus: status);
+
+      if (!status.cliAvailable) {
+        state = state.copyWith(
+          isLocalInitializing: false,
+          lastError: status.lastError ?? 'ZeroTier runtime is not ready yet.',
+        );
+        return;
+      }
+      state = state.copyWith(
+        runtimeStatus: status,
+        isLocalInitializing: false,
+        clearLastError: true,
+      );
+    } catch (error) {
+      state = state.copyWith(
+        isLocalInitializing: false,
+        lastError: error is RealtimeError ? error.message : '$error',
+      );
+    }
+  }
+
+  Future<void> leaveNetwork(
+    String networkId, {
+    bool deactivateWhenIdle = false,
+  }) async {
+    if (networkId.trim().isEmpty) {
+      return;
+    }
+
+    await _zeroTierService.leaveNetwork(networkId);
+    await _refreshRuntimeStatus();
+    if (deactivateWhenIdle && state.runtimeStatus.joinedNetworks.isEmpty) {
+      await deactivate(skipNativeStop: Platform.isWindows);
+    }
+  }
+
+  Future<void> deactivate({
+    bool skipNativeStop = false,
+  }) async {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    await _runtimeEventSubscription?.cancel();
+    _runtimeEventSubscription = null;
+
+    ZeroTierRuntimeStatus status = state.runtimeStatus;
+    if (!skipNativeStop && (_started || status.isNodeRunning || status.hasNodeId)) {
+      try {
+        status = await _zeroTierService.stopNode();
+      } catch (_) {
+        // Preserve the last known status if the local runtime is already gone.
+      }
+    }
+
+    _started = false;
+    _busyBootstrapping = false;
+    _busyPolling = false;
+    state = state.copyWith(
+      runtimeStatus: status,
+      isActivated: false,
+      isLocalInitializing: false,
+      isBootstrapping: false,
+      isHeartbeating: false,
+      isPolling: false,
+      clearLastRuntimeEvent: true,
+      recentRuntimeEvents: const <ZeroTierRuntimeEvent>[],
+    );
+  }
+
   Future<void> _ensureStarted() async {
     if (_started) {
+      state = state.copyWith(isActivated: true);
       return;
     }
     _started = true;
+    state = state.copyWith(isActivated: true);
     _runtimeEventSubscription = _zeroTierService.watchRuntimeEvents().listen(
-      _handleRuntimeEvent,
-    );
+          _handleRuntimeEvent,
+        );
     await _initializeIdentity();
     _heartbeatTimer?.cancel();
     _pollTimer?.cancel();
@@ -206,8 +309,7 @@ class NetworkingAgentRuntimeController
       if (!status.cliAvailable) {
         state = state.copyWith(
           isBootstrapping: false,
-          lastError: status.lastError ??
-              'ZeroTier runtime is not ready yet.',
+          lastError: status.lastError ?? 'ZeroTier runtime is not ready yet.',
         );
         return;
       }
@@ -348,62 +450,64 @@ class NetworkingAgentRuntimeController
       switch (command.type) {
         case 'join_zerotier_network':
           {
-          final String networkId =
-              command.payload['networkId']?.toString() ?? '';
-          if (networkId.isEmpty) {
-            throw const RealtimeError('Command payload is missing networkId.');
-          }
-          await _zeroTierService.joinNetworkAndWaitForIp(networkId);
-          await _waitForNetworkReady(networkId);
-          break;
+            final String networkId =
+                command.payload['networkId']?.toString() ?? '';
+            if (networkId.isEmpty) {
+              throw const RealtimeError(
+                  'Command payload is missing networkId.');
+            }
+            await _zeroTierService.joinNetworkAndWaitForIp(networkId);
+            await _waitForNetworkReady(networkId);
+            break;
           }
         case 'leave_zerotier_network':
           {
-          final String networkId =
-              command.payload['networkId']?.toString() ?? '';
-          if (networkId.isEmpty) {
-            throw const RealtimeError('Command payload is missing networkId.');
-          }
-          await _zeroTierService.leaveNetwork(networkId);
-          break;
+            final String networkId =
+                command.payload['networkId']?.toString() ?? '';
+            if (networkId.isEmpty) {
+              throw const RealtimeError(
+                  'Command payload is missing networkId.');
+            }
+            await _zeroTierService.leaveNetwork(networkId);
+            break;
           }
         case 'apply_firewall_rules':
           {
-          final String scopeId = (command.payload['sessionId'] ??
-                  command.payload['managedNetworkId'] ??
-                  command.sessionId ??
-                  command.id)
-              .toString();
-          final String peerIp =
-              command.payload['peerZeroTierIp']?.toString() ?? '';
-          final List<Map<String, dynamic>> ports =
-              ((command.payload['allowedInboundPorts'] as List?) ??
-                      const <dynamic>[])
-                  .whereType<Map>()
-                  .map(
-                    (Map<dynamic, dynamic> item) => item.map(
-                      (dynamic key, dynamic value) =>
-                          MapEntry(key.toString(), value),
-                    ),
-                  )
-                  .toList();
-          await _zeroTierService.applyFirewallRules(
-            ruleScopeId: scopeId,
-            peerZeroTierIp: peerIp,
-            allowedInboundPorts: ports,
-          );
-          break;
+            final String scopeId = (command.payload['sessionId'] ??
+                    command.payload['managedNetworkId'] ??
+                    command.sessionId ??
+                    command.id)
+                .toString();
+            final String peerIp =
+                command.payload['peerZeroTierIp']?.toString() ?? '';
+            final List<Map<String, dynamic>> ports =
+                ((command.payload['allowedInboundPorts'] as List?) ??
+                        const <dynamic>[])
+                    .whereType<Map>()
+                    .map(
+                      (Map<dynamic, dynamic> item) => item.map(
+                        (dynamic key, dynamic value) =>
+                            MapEntry(key.toString(), value),
+                      ),
+                    )
+                    .toList();
+            await _zeroTierService.applyFirewallRules(
+              ruleScopeId: scopeId,
+              peerZeroTierIp: peerIp,
+              allowedInboundPorts: ports,
+            );
+            break;
           }
         case 'remove_firewall_rules':
           {
-          final String scopeId = (command.payload['sessionId'] ??
-                  command.payload['managedNetworkId'] ??
-                  command.payload['networkId'] ??
-                  command.sessionId ??
-                  command.id)
-              .toString();
-          await _zeroTierService.removeFirewallRules(ruleScopeId: scopeId);
-          break;
+            final String scopeId = (command.payload['sessionId'] ??
+                    command.payload['managedNetworkId'] ??
+                    command.payload['networkId'] ??
+                    command.sessionId ??
+                    command.id)
+                .toString();
+            await _zeroTierService.removeFirewallRules(ruleScopeId: scopeId);
+            break;
           }
         default:
           throw RealtimeError('Unsupported command type: ${command.type}');
@@ -439,7 +543,8 @@ class NetworkingAgentRuntimeController
 
   Future<void> _refreshRuntimeStatus() async {
     try {
-      final ZeroTierRuntimeStatus status = await _zeroTierService.detectStatus();
+      final ZeroTierRuntimeStatus status =
+          await _zeroTierService.detectStatus();
       state = state.copyWith(
         runtimeStatus: status,
         lastError: status.lastError,
@@ -466,7 +571,8 @@ class NetworkingAgentRuntimeController
   Future<void> _waitForNetworkReady(String networkId) async {
     for (int attempt = 0; attempt < 60; attempt += 1) {
       await Future<void>.delayed(const Duration(milliseconds: 500));
-      final ZeroTierRuntimeStatus status = await _zeroTierService.detectStatus();
+      final ZeroTierRuntimeStatus status =
+          await _zeroTierService.detectStatus();
       final ZeroTierNetworkState? network = status.joinedNetworks
           .where((ZeroTierNetworkState item) => item.networkId == networkId)
           .cast<ZeroTierNetworkState?>()
@@ -474,15 +580,24 @@ class NetworkingAgentRuntimeController
             (ZeroTierNetworkState? item) => item != null,
             orElse: () => null,
           );
-      if (status.lastError?.trim().isNotEmpty == true) {
-        throw RealtimeError(status.lastError!);
-      }
       if (network == null) {
+        if (status.lastError?.trim().isNotEmpty == true &&
+            !status.isNodeRunning &&
+            status.serviceState == 'unavailable') {
+          throw RealtimeError(status.lastError!);
+        }
         continue;
       }
       if (network.status == 'ACCESS_DENIED') {
         throw const RealtimeError(
           'ZeroTier network authorization is still pending.',
+        );
+      }
+      if (_isTerminalNetworkFailure(network.status)) {
+        throw RealtimeError(
+          status.lastError?.trim().isNotEmpty == true
+              ? status.lastError!
+              : 'ZeroTier network failed with status ${network.status}.',
         );
       }
       if (network.assignedAddresses.isNotEmpty || network.isConnected) {
@@ -494,11 +609,22 @@ class NetworkingAgentRuntimeController
     );
   }
 
+  bool _isTerminalNetworkFailure(String status) {
+    switch (status) {
+      case 'NOT_FOUND':
+      case 'PORT_ERROR':
+      case 'CLIENT_TOO_OLD':
+        return true;
+      default:
+        return false;
+    }
+  }
+
   void _handleRuntimeEvent(ZeroTierRuntimeEvent event) {
-    final List<ZeroTierRuntimeEvent> recentEvents =
-        <ZeroTierRuntimeEvent>[event, ...state.recentRuntimeEvents]
-            .take(8)
-            .toList(growable: false);
+    final List<ZeroTierRuntimeEvent> recentEvents = <ZeroTierRuntimeEvent>[
+      event,
+      ...state.recentRuntimeEvents
+    ].take(8).toList(growable: false);
     state = state.copyWith(
       lastRuntimeEvent: event,
       recentRuntimeEvents: recentEvents,

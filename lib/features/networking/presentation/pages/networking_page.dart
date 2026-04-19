@@ -1,4 +1,4 @@
-import 'package:file_transfer_flutter/core/config/models/app_config.dart';
+﻿import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
@@ -34,6 +34,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     _networkNameController = TextEditingController(text: 'My Private Network');
     _networkDescriptionController =
         TextEditingController(text: 'Private mesh for trusted devices');
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.read(networkingAgentRuntimeProvider.notifier).initializeLocalRuntime();
+    });
   }
 
   @override
@@ -71,6 +74,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     final NetworkingAgentRuntimeState agentState =
         ref.watch(networkingAgentRuntimeProvider);
     final ZeroTierRuntimeStatus runtimeStatus = agentState.runtimeStatus;
+    final bool isLocalReady = agentState.isLocalReady;
 
     final bool isRegistered = config.agentToken.trim().isNotEmpty &&
         config.zeroTierNodeId.trim().isNotEmpty &&
@@ -172,18 +176,25 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                 children: <Widget>[
                   _OneClickNetworkingTab(
                     defaultNetwork: dashboard.defaultNetwork,
+                    agentState: agentState,
                     isBusy: dashboard.isSubmitting,
-                    isRegistered: isRegistered,
+                    isLocalReady: isLocalReady,
                     runtimeStatus: runtimeStatus,
-                    onPressed: () => _joinDefaultNetwork(config),
+                    onJoin: () => _joinDefaultNetwork(config),
+                    onLeave: () => _leaveDefaultNetwork(dashboard.defaultNetwork),
+                    onCopyIp: (String ip) => _copyToClipboard(
+                      ip,
+                      successMessage: '已复制虚拟 IP',
+                    ),
                   ),
                   _PrivateNetworkingTab(
                     codeController: _networkCodeController,
                     nameController: _networkNameController,
                     descriptionController: _networkDescriptionController,
                     generatedCode: _generatedNetworkCode,
+                    agentState: agentState,
                     isBusy: dashboard.isSubmitting,
-                    isRegistered: isRegistered,
+                    isLocalReady: isLocalReady,
                     managedNetworks: dashboard.managedNetworks,
                     runtimeStatus: runtimeStatus,
                     onJoinPressed: () => _joinByInviteCode(config),
@@ -209,22 +220,49 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   }
 
   Future<void> _joinDefaultNetwork(AppConfig config) async {
-    if (!_ensureRegistered(config)) {
+    await ref.read(networkingAgentRuntimeProvider.notifier).activate();
+    final AppConfig readyConfig = ref.read(appConfigProvider);
+    if (!_ensureRegistered(readyConfig)) {
       return;
     }
 
     try {
       await ref
           .read(networkingProvider.notifier)
-          .joinDefaultNetwork(deviceId: config.deviceId);
+          .joinDefaultNetwork(deviceId: readyConfig.deviceId);
+      await ref.read(networkingAgentRuntimeProvider.notifier).refreshNow();
+      await ref.read(networkingProvider.notifier).refresh();
       _showPageMessage('默认网络入网请求已提交，等待本机 Agent 执行 join。');
     } on RealtimeError catch (error) {
       _showPageMessage(error.message);
     }
   }
 
+  Future<void> _leaveDefaultNetwork(ManagedNetwork? defaultNetwork) async {
+    final String networkId = defaultNetwork?.zeroTierNetworkId?.trim() ?? '';
+    if (networkId.isEmpty) {
+      _showPageMessage('当前默认网络缺少 ZeroTier Network ID，无法取消组网。');
+      return;
+    }
+
+    try {
+      await ref.read(networkingAgentRuntimeProvider.notifier).leaveNetwork(
+            networkId,
+            deactivateWhenIdle: true,
+          );
+      await ref.read(networkingProvider.notifier).refresh();
+      _showPageMessage('已取消默认网络组网。');
+    } on RealtimeError catch (error) {
+      _showPageMessage(error.message);
+    } catch (error) {
+      _showPageMessage('$error');
+    }
+  }
+
   Future<void> _joinByInviteCode(AppConfig config) async {
-    if (!_ensureRegistered(config)) {
+    await ref.read(networkingAgentRuntimeProvider.notifier).activate();
+    final AppConfig readyConfig = ref.read(appConfigProvider);
+    if (!_ensureRegistered(readyConfig)) {
       return;
     }
 
@@ -237,8 +275,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     try {
       await ref.read(networkingProvider.notifier).joinByInviteCode(
             code: code,
-            deviceId: config.deviceId,
+            deviceId: readyConfig.deviceId,
           );
+      await ref.read(networkingAgentRuntimeProvider.notifier).refreshNow();
       _showPageMessage('邀请码组网请求已提交，等待本机 Agent 执行 join。');
     } on RealtimeError catch (error) {
       _showPageMessage(error.message);
@@ -246,7 +285,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   }
 
   Future<void> _createPrivateNetwork(AppConfig config) async {
-    if (!_ensureRegistered(config)) {
+    await ref.read(networkingAgentRuntimeProvider.notifier).activate();
+    final AppConfig readyConfig = ref.read(appConfigProvider);
+    if (!_ensureRegistered(readyConfig)) {
       return;
     }
 
@@ -260,7 +301,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     try {
       final PrivateNetworkCreationResult result =
           await ref.read(networkingProvider.notifier).createPrivateNetwork(
-                ownerDeviceId: config.deviceId,
+                ownerDeviceId: readyConfig.deviceId,
                 name: name,
                 description: description,
               );
@@ -645,44 +686,101 @@ class _LocalNetworksCard extends StatelessWidget {
 class _OneClickNetworkingTab extends StatelessWidget {
   const _OneClickNetworkingTab({
     required this.defaultNetwork,
+    required this.agentState,
     required this.isBusy,
-    required this.isRegistered,
+    required this.isLocalReady,
     required this.runtimeStatus,
-    required this.onPressed,
+    required this.onJoin,
+    required this.onLeave,
+    required this.onCopyIp,
   });
 
   final ManagedNetwork? defaultNetwork;
+  final NetworkingAgentRuntimeState agentState;
   final bool isBusy;
-  final bool isRegistered;
+  final bool isLocalReady;
   final ZeroTierRuntimeStatus runtimeStatus;
-  final VoidCallback onPressed;
+  final VoidCallback onJoin;
+  final VoidCallback onLeave;
+  final ValueChanged<String> onCopyIp;
 
   @override
   Widget build(BuildContext context) {
+    final ZeroTierNetworkState? localState = defaultNetwork == null
+        ? null
+        : _findLocal(runtimeStatus, defaultNetwork!);
+    final bool isGrouped = localState != null &&
+        (localState.isConnected ||
+            localState.assignedAddresses.isNotEmpty ||
+            localState.status == 'OK');
+    final bool isConnecting = !isGrouped &&
+        (isBusy ||
+            agentState.isBootstrapping ||
+            localState?.status == 'REQUESTING_CONFIGURATION');
+    final bool isDisabled = agentState.isLocalInitializing || !isLocalReady;
+    final _NetworkingOrbTone orbTone = isDisabled
+        ? _NetworkingOrbTone.disabled
+        : (isGrouped
+            ? _NetworkingOrbTone.success
+            : (isConnecting
+                ? _NetworkingOrbTone.active
+                : _NetworkingOrbTone.idle));
+
     return SectionCard(
       title: '默认网络编排',
-      subtitle: '向服务端提交加入默认网络请求，再由本机 Agent 执行真实 join 并等待地址分配。',
+      subtitle: isGrouped
+          ? '当前设备已接入默认网络，点击绿色按钮即可取消组网。'
+          : '应用启动时只完成本地 ZeroTier 初始化；点击开始组网后才会接入后台编排。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: <Widget>[
           if (defaultNetwork != null) ...<Widget>[
             _ManagedNetworkCard(
               network: defaultNetwork!,
-              localState: _findLocal(runtimeStatus, defaultNetwork!),
+              localState: localState,
               accentColor: const Color(0xFFF97316),
             ),
             const SizedBox(height: 18),
           ],
           _NetworkingActionOrb(
-            label: isBusy ? '提交中' : '一键组网',
-            icon: isBusy ? Icons.hourglass_top_rounded : Icons.flash_on_rounded,
-            subtitle: isRegistered ? '发送默认网络请求\n等待本机 Agent 执行' : '等待设备注册完成',
-            onTap: isBusy || !isRegistered ? null : onPressed,
+            label: isDisabled
+                ? '本地初始化'
+                : (isGrouped ? '已组网' : (isConnecting ? '组网中' : '开始组网')),
+            icon: isDisabled
+                ? Icons.power_settings_new_rounded
+                : (isGrouped
+                    ? Icons.check_circle_rounded
+                    : (isConnecting
+                        ? Icons.sync_rounded
+                        : Icons.flash_on_rounded)),
+            subtitle: isDisabled
+                ? '等待本地 ZeroTier 初始化完成'
+                : (isGrouped
+                    ? '按钮为绿色\n点击即可取消组网'
+                    : (isConnecting
+                        ? '按钮为蓝色\n点击即可中止组网'
+                        : '本地准备完成后\n点击开始接入默认网络')),
+            tone: orbTone,
+            spinning: isConnecting,
+            onTap:
+                isDisabled ? null : ((isGrouped || isConnecting) ? onLeave : onJoin),
           ),
+          if (localState != null && localState.assignedAddresses.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 16),
+            _VirtualIpPanel(
+              addresses: localState.assignedAddresses,
+              onCopy: onCopyIp,
+            ),
+          ],
           const SizedBox(height: 20),
           _InlineHint(
-            message:
-                '联调建议：点击后一边观察上方“运行时事件回流”，一边确认本地 ZeroTier 网络列表是否出现对应 networkId 与托管地址。',
+            message: isDisabled
+                ? '未完成本地初始化前，圆形开始组网按钮会保持灰色。'
+                : (isGrouped
+                    ? '绿色表示已经组网成功。'
+                    : (isConnecting
+                        ? '蓝色表示正在组网，可直接点击取消。'
+                        : '点击开始组网后，应用才会启动 Agent、完成注册并接入后台编排。')),
           ),
         ],
       ),
@@ -712,8 +810,9 @@ class _PrivateNetworkingTab extends StatelessWidget {
     required this.nameController,
     required this.descriptionController,
     required this.generatedCode,
+    required this.agentState,
     required this.isBusy,
-    required this.isRegistered,
+    required this.isLocalReady,
     required this.managedNetworks,
     required this.runtimeStatus,
     required this.onJoinPressed,
@@ -724,8 +823,9 @@ class _PrivateNetworkingTab extends StatelessWidget {
   final TextEditingController nameController;
   final TextEditingController descriptionController;
   final String? generatedCode;
+  final NetworkingAgentRuntimeState agentState;
   final bool isBusy;
-  final bool isRegistered;
+  final bool isLocalReady;
   final List<ManagedNetwork> managedNetworks;
   final ZeroTierRuntimeStatus runtimeStatus;
   final VoidCallback onJoinPressed;
@@ -733,15 +833,17 @@ class _PrivateNetworkingTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final bool isDisabled = agentState.isLocalInitializing || !isLocalReady;
+
     return SectionCard(
       title: '私有网络编排',
-      subtitle: '支持创建私有网络、生成邀请码，以及通过邀请码向服务端发起组网请求。',
+      subtitle: '先完成本地 ZeroTier 初始化，再通过邀请码或创建私有网络发起后台组网。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           TextField(
             controller: nameController,
-            enabled: !isBusy,
+            enabled: !isBusy && !isDisabled,
             decoration: const InputDecoration(
               labelText: '私有网络名称',
               hintText: '例如 My Private Network',
@@ -751,7 +853,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
           const SizedBox(height: 14),
           TextField(
             controller: descriptionController,
-            enabled: !isBusy,
+            enabled: !isBusy && !isDisabled,
             decoration: const InputDecoration(
               labelText: '网络说明',
               hintText: '例如 Private mesh for trusted devices',
@@ -761,7 +863,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
           const SizedBox(height: 14),
           TextField(
             controller: codeController,
-            enabled: !isBusy,
+            enabled: !isBusy && !isDisabled,
             textInputAction: TextInputAction.done,
             decoration: const InputDecoration(
               labelText: '邀请码',
@@ -775,20 +877,26 @@ class _PrivateNetworkingTab extends StatelessWidget {
             runSpacing: 18,
             children: <Widget>[
               _NetworkingActionOrb(
-                label: isBusy ? '处理中' : '加入网络',
-                icon: isBusy ? Icons.hourglass_top_rounded : Icons.login_rounded,
-                subtitle: isRegistered ? '按邀请码发起请求\n等待本机 Agent 执行' : '等待设备注册完成',
+                label: isDisabled ? '本地初始化' : (isBusy ? '处理中' : '加入网络'),
+                icon: isDisabled
+                    ? Icons.power_settings_new_rounded
+                    : (isBusy ? Icons.hourglass_top_rounded : Icons.login_rounded),
+                subtitle: isDisabled ? '等待本地 ZeroTier 初始化' : '按邀请码发起请求\n等待本机 Agent 执行',
                 diameter: 190,
-                onTap: isBusy || !isRegistered ? null : onJoinPressed,
+                tone: isDisabled ? _NetworkingOrbTone.disabled : _NetworkingOrbTone.idle,
+                onTap: isBusy || isDisabled ? null : onJoinPressed,
               ),
               _NetworkingActionOrb(
-                label: isBusy ? '处理中' : '主持网络',
-                icon: isBusy
-                    ? Icons.hourglass_top_rounded
-                    : Icons.wifi_tethering_rounded,
-                subtitle: isRegistered ? '创建私有网络\n返回邀请码' : '等待设备注册完成',
+                label: isDisabled ? '本地初始化' : (isBusy ? '处理中' : '主持网络'),
+                icon: isDisabled
+                    ? Icons.power_settings_new_rounded
+                    : (isBusy
+                        ? Icons.hourglass_top_rounded
+                        : Icons.wifi_tethering_rounded),
+                subtitle: isDisabled ? '等待本地 ZeroTier 初始化' : '创建私有网络\n返回邀请码',
                 diameter: 190,
-                onTap: isBusy || !isRegistered ? null : onHostPressed,
+                tone: isDisabled ? _NetworkingOrbTone.disabled : _NetworkingOrbTone.idle,
+                onTap: isBusy || isDisabled ? null : onHostPressed,
               ),
             ],
           ),
@@ -1374,6 +1482,75 @@ class _AddressWrap extends StatelessWidget {
   }
 }
 
+class _VirtualIpPanel extends StatelessWidget {
+  const _VirtualIpPanel({
+    required this.addresses,
+    required this.onCopy,
+  });
+
+  final List<String> addresses;
+  final ValueChanged<String> onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFFEAF8EF),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFF86EFAC)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            '已分配虚拟 IP',
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  color: const Color(0xFF166534),
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
+          const SizedBox(height: 12),
+          ...addresses.map(
+            (String address) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: SelectableText(
+                        address,
+                        style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                              fontWeight: FontWeight.w700,
+                              color: const Color(0xFF166534),
+                            ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '复制虚拟 IP',
+                      onPressed: () => onCopy(address),
+                      icon: const Icon(Icons.copy_rounded),
+                      color: const Color(0xFF166534),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+enum _NetworkingOrbTone { idle, active, success, disabled }
+
 class _NetworkingActionOrb extends StatelessWidget {
   const _NetworkingActionOrb({
     required this.label,
@@ -1381,6 +1558,8 @@ class _NetworkingActionOrb extends StatelessWidget {
     required this.subtitle,
     required this.onTap,
     this.diameter = 240,
+    this.tone = _NetworkingOrbTone.idle,
+    this.spinning = false,
   });
 
   final String label;
@@ -1388,35 +1567,55 @@ class _NetworkingActionOrb extends StatelessWidget {
   final String subtitle;
   final VoidCallback? onTap;
   final double diameter;
+  final _NetworkingOrbTone tone;
+  final bool spinning;
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
     final bool enabled = onTap != null;
+    final ({List<Color> colors, Color shadow}) palette = switch (tone) {
+      _NetworkingOrbTone.idle => (
+          colors: const <Color>[Color(0xFFFFC36B), Color(0xFFF97316)],
+          shadow: const Color(0x40F97316),
+        ),
+      _NetworkingOrbTone.active => (
+          colors: const <Color>[Color(0xFF6FB6FF), Color(0xFF2563EB)],
+          shadow: const Color(0x402563EB),
+        ),
+      _NetworkingOrbTone.success => (
+          colors: const <Color>[Color(0xFF6EE7B7), Color(0xFF16A34A)],
+          shadow: const Color(0x4016A34A),
+        ),
+      _NetworkingOrbTone.disabled => (
+          colors: const <Color>[Color(0xFFD1D5DB), Color(0xFF9CA3AF)],
+          shadow: const Color(0x309CA3AF),
+        ),
+    };
 
     return Center(
       child: GestureDetector(
         onTap: onTap,
         child: Opacity(
-          opacity: enabled ? 1 : 0.65,
+          opacity: enabled ? 1 : 0.82,
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 180),
             width: diameter,
             height: diameter,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              gradient: const LinearGradient(
-                colors: <Color>[Color(0xFFFFC36B), Color(0xFFF97316)],
+              gradient: LinearGradient(
+                colors: palette.colors,
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),
-              boxShadow: const <BoxShadow>[
+              boxShadow: <BoxShadow>[
                 BoxShadow(
-                  color: Color(0x40F97316),
+                  color: palette.shadow,
                   blurRadius: 28,
-                  offset: Offset(0, 16),
+                  offset: const Offset(0, 16),
                 ),
-                BoxShadow(
+                const BoxShadow(
                   color: Color(0x80FFFFFF),
                   blurRadius: 18,
                   offset: Offset(-8, -8),
@@ -1436,7 +1635,11 @@ class _NetworkingActionOrb extends StatelessWidget {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: <Widget>[
-                  Icon(icon, size: diameter * 0.18, color: Colors.white),
+                  AnimatedRotation(
+                    turns: spinning ? 1 : 0,
+                    duration: const Duration(milliseconds: 1200),
+                    child: Icon(icon, size: diameter * 0.18, color: Colors.white),
+                  ),
                   SizedBox(height: diameter * 0.06),
                   Text(
                     label,

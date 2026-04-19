@@ -51,8 +51,10 @@ abstract class NetworkingService {
     int maxUses,
     int expiresInMinutes,
   });
-  Future<void> joinByInviteCode(
-      {required String code, required String deviceId});
+  Future<void> joinByInviteCode({
+    required String code,
+    required String deviceId,
+  });
 }
 
 class HttpNetworkingService implements NetworkingService {
@@ -276,7 +278,7 @@ class HttpNetworkingService implements NetworkingService {
         return message;
       }
     }
-    return '请求失败：$statusCode';
+    return '请求失败，状态码 $statusCode';
   }
 
   ManagedNetwork _extractManagedNetwork(dynamic decoded) {
