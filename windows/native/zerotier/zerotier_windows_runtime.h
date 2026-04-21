@@ -28,7 +28,7 @@ class ZeroTierWindowsRuntime {
 
   ZeroTierWindowsRuntime();
 
-  flutter::EncodableMap DetectStatus() const;
+  flutter::EncodableMap DetectStatus();
   flutter::EncodableMap PrepareEnvironment();
   flutter::EncodableMap StartNode();
   flutter::EncodableMap StopNode();
@@ -60,6 +60,11 @@ class ZeroTierWindowsRuntime {
       uint64_t network_id, int event_code = 0,
       const std::string& trigger = "") const;
   uint64_t NextNetworkGenerationLocked(uint64_t network_id);
+  void RefreshSnapshot();
+  void LoadKnownNetworkIdsLocked();
+  void PersistKnownNetworkIdsLocked() const;
+  void RememberKnownNetworkLocked(uint64_t network_id);
+  void ForgetKnownNetworkLocked(uint64_t network_id);
   std::string BuildServiceState() const;
   void SetLastErrorLocked(const std::string& message);
   void ClearLastErrorLocked();
@@ -76,12 +81,15 @@ class ZeroTierWindowsRuntime {
   std::string RuntimeRootPath() const;
   std::string NodeStoragePath() const;
   std::string LogsPath() const;
+  std::string KnownNetworksPath() const;
   std::string ToHexNetworkId(uint64_t network_id) const;
 
   mutable std::mutex mutex_;
+  mutable std::recursive_mutex api_mutex_;
   mutable std::condition_variable state_cv_;
   std::map<uint64_t, ZeroTierWindowsNetworkRecord> networks_;
   std::set<uint64_t> leaving_networks_;
+  std::set<uint64_t> known_network_ids_;
   std::map<uint64_t, std::string> leave_request_sources_;
   std::map<uint64_t, uint64_t> network_generations_;
   std::map<uint64_t, uint64_t> pending_leave_generations_;
@@ -92,6 +100,7 @@ class ZeroTierWindowsRuntime {
   uint64_t node_id_ = 0;
   int node_port_ = 0;
   bool environment_prepared_ = false;
+  bool known_network_ids_loaded_ = false;
   bool handler_registered_ = false;
   bool node_started_ = false;
   bool node_online_ = false;

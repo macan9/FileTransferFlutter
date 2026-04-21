@@ -103,6 +103,7 @@ bool ZeroTierWindowsFirewallManager::ApplyRules(
     return false;
   }
 
+  std::vector<std::wstring> added_rule_names;
   for (const auto& port_rule : ports) {
     INetFwRule* rule = nullptr;
     hr = CoCreateInstance(__uuidof(NetFwRule), nullptr, CLSCTX_INPROC_SERVER,
@@ -156,10 +157,14 @@ bool ZeroTierWindowsFirewallManager::ApplyRules(
         *error_message =
             ComposeFirewallError("Failed to add Windows firewall rule.", hr);
       }
+      std::string rollback_error;
+      RemoveRuleNames(added_rule_names, &rollback_error);
       rules->Release();
       policy->Release();
       return false;
     }
+
+    added_rule_names.push_back(display_name);
   }
 
   rules->Release();
@@ -256,6 +261,45 @@ bool ZeroTierWindowsFirewallManager::RemoveRules(
   }
 
   enumerator->Release();
+  rules->Release();
+  policy->Release();
+  return true;
+}
+
+bool ZeroTierWindowsFirewallManager::RemoveRuleNames(
+    const std::vector<std::wstring>& rule_names, std::string* error_message) {
+  if (rule_names.empty()) {
+    return true;
+  }
+
+  INetFwPolicy2* policy = nullptr;
+  HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), nullptr,
+                                CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2),
+                                reinterpret_cast<void**>(&policy));
+  if (FAILED(hr) || policy == nullptr) {
+    if (error_message != nullptr) {
+      *error_message = ComposeFirewallError("Failed to create INetFwPolicy2.", hr);
+    }
+    return false;
+  }
+
+  INetFwRules* rules = nullptr;
+  hr = policy->get_Rules(&rules);
+  if (FAILED(hr) || rules == nullptr) {
+    policy->Release();
+    if (error_message != nullptr) {
+      *error_message =
+          ComposeFirewallError("Failed to access Windows firewall rules.", hr);
+    }
+    return false;
+  }
+
+  for (const auto& rule_name : rule_names) {
+    BSTR name_bstr = ToBstr(rule_name);
+    rules->Remove(name_bstr);
+    SysFreeString(name_bstr);
+  }
+
   rules->Release();
   policy->Release();
   return true;

@@ -43,6 +43,7 @@ class NetworkingAgentRuntimeState extends Equatable {
     this.isActivated = false,
     this.isLocalInitializing = false,
     this.isBootstrapping = false,
+    this.isNetworkActionLocked = false,
     this.isNetworkTransitioning = false,
     this.networkTransitionLabel,
     this.transitioningNetworkId,
@@ -61,6 +62,7 @@ class NetworkingAgentRuntimeState extends Equatable {
         isActivated = false,
         isLocalInitializing = false,
         isBootstrapping = false,
+        isNetworkActionLocked = false,
         isNetworkTransitioning = false,
         networkTransitionLabel = null,
         transitioningNetworkId = null,
@@ -77,6 +79,7 @@ class NetworkingAgentRuntimeState extends Equatable {
   final bool isActivated;
   final bool isLocalInitializing;
   final bool isBootstrapping;
+  final bool isNetworkActionLocked;
   final bool isNetworkTransitioning;
   final String? networkTransitionLabel;
   final String? transitioningNetworkId;
@@ -99,6 +102,7 @@ class NetworkingAgentRuntimeState extends Equatable {
     bool? isActivated,
     bool? isLocalInitializing,
     bool? isBootstrapping,
+    bool? isNetworkActionLocked,
     bool? isNetworkTransitioning,
     String? networkTransitionLabel,
     bool clearNetworkTransitionLabel = false,
@@ -123,6 +127,8 @@ class NetworkingAgentRuntimeState extends Equatable {
       isActivated: isActivated ?? this.isActivated,
       isLocalInitializing: isLocalInitializing ?? this.isLocalInitializing,
       isBootstrapping: isBootstrapping ?? this.isBootstrapping,
+      isNetworkActionLocked:
+          isNetworkActionLocked ?? this.isNetworkActionLocked,
       isNetworkTransitioning:
           isNetworkTransitioning ?? this.isNetworkTransitioning,
       networkTransitionLabel: clearNetworkTransitionLabel
@@ -154,6 +160,7 @@ class NetworkingAgentRuntimeState extends Equatable {
         isActivated,
         isLocalInitializing,
         isBootstrapping,
+        isNetworkActionLocked,
         isNetworkTransitioning,
         networkTransitionLabel,
         transitioningNetworkId,
@@ -177,6 +184,7 @@ class NetworkingAgentRuntimeController
   bool _started = false;
   bool _busyBootstrapping = false;
   bool _busyPolling = false;
+  bool _suppressCommandPollingDuringRuntimeRecovery = false;
 
   NetworkingService get _networkingService =>
       ref.read(networkingServiceProvider);
@@ -260,6 +268,7 @@ class NetworkingAgentRuntimeController
     }
 
     state = state.copyWith(
+      isNetworkActionLocked: true,
       isNetworkTransitioning: true,
       networkTransitionLabel: '正在离开 ZeroTier 网络并收口本地链路',
       transitioningNetworkId: networkId,
@@ -276,6 +285,35 @@ class NetworkingAgentRuntimeController
       if (_shouldWaitInDartForNetworkLeave) {
         await _waitForNetworkLeft(networkId);
       }
+      state = state.copyWith(
+        isNetworkActionLocked: false,
+        isNetworkTransitioning: false,
+        clearNetworkTransitionLabel: true,
+        clearTransitioningNetworkId: true,
+      );
+      unawaited(
+        _finalizeRuntimeRecoveryAfterLeave(
+          networkId,
+          deactivateWhenIdle: deactivateWhenIdle,
+        ),
+      );
+    } catch (error) {
+      state = state.copyWith(
+        isNetworkActionLocked: false,
+        isNetworkTransitioning: false,
+        clearNetworkTransitionLabel: true,
+        clearTransitioningNetworkId: true,
+      );
+      rethrow;
+    }
+  }
+
+  Future<void> _finalizeRuntimeRecoveryAfterLeave(
+    String networkId, {
+    required bool deactivateWhenIdle,
+  }) async {
+    _suppressCommandPollingDuringRuntimeRecovery = true;
+    try {
       await _waitForRuntimeRecoveryAfterLeave(networkId);
       await _refreshRuntimeStatus();
       if (deactivateWhenIdle &&
@@ -285,18 +323,21 @@ class NetworkingAgentRuntimeController
           'ZeroTier runtime deactivating after leave: networkId=$networkId',
         );
         await deactivate(skipNativeStop: Platform.isWindows);
-      } else if (deactivateWhenIdle && Platform.isWindows) {
+        return;
+      }
+      if (deactivateWhenIdle && Platform.isWindows) {
         debugPrint(
           'ZeroTier runtime stays active after leave on Windows: '
           'networkId=$networkId, joinedNetworks=${state.runtimeStatus.joinedNetworks.length}',
         );
       }
-    } finally {
+    } catch (error) {
       state = state.copyWith(
-        isNetworkTransitioning: false,
-        clearNetworkTransitionLabel: true,
-        clearTransitioningNetworkId: true,
+        lastError: error is RealtimeError ? error.message : '$error',
       );
+    } finally {
+      _suppressCommandPollingDuringRuntimeRecovery = false;
+      unawaited(_pollCommands());
     }
   }
 
@@ -323,11 +364,13 @@ class NetworkingAgentRuntimeController
     _started = false;
     _busyBootstrapping = false;
     _busyPolling = false;
+    _suppressCommandPollingDuringRuntimeRecovery = false;
     state = state.copyWith(
       runtimeStatus: status,
       isActivated: false,
       isLocalInitializing: false,
       isBootstrapping: false,
+      isNetworkActionLocked: false,
       isNetworkTransitioning: false,
       clearNetworkTransitionLabel: true,
       clearTransitioningNetworkId: true,
@@ -474,6 +517,12 @@ class NetworkingAgentRuntimeController
 
   Future<void> _pollCommands() async {
     if (_busyPolling) {
+      return;
+    }
+    if (_suppressCommandPollingDuringRuntimeRecovery) {
+      debugPrint(
+        'Skip polling agent commands while ZeroTier runtime recovery is running in background.',
+      );
       return;
     }
     if (state.isNetworkTransitioning) {
@@ -677,8 +726,7 @@ class NetworkingAgentRuntimeController
   Future<void> _refreshRuntimeStatus() async {
     try {
       final ZeroTierRuntimeStatus previous = state.runtimeStatus;
-      ZeroTierRuntimeStatus status =
-          await _zeroTierService.detectStatus();
+      ZeroTierRuntimeStatus status = await _zeroTierService.detectStatus();
       if (_shouldClearRecoveredRuntimeError(status)) {
         status = status.copyWith(clearLastError: true);
       }
@@ -686,6 +734,7 @@ class NetworkingAgentRuntimeController
       state = state.copyWith(
         runtimeStatus: status,
         lastError: status.lastError,
+        clearLastError: status.lastError?.trim().isNotEmpty != true,
       );
     } catch (error) {
       state = state.copyWith(
@@ -700,7 +749,7 @@ class NetworkingAgentRuntimeController
       await Future<void>.delayed(const Duration(milliseconds: 500));
       latest = await _zeroTierService.detectStatus();
       if (latest.serviceState == 'running' ||
-          latest.serviceState == 'offline' ||
+          latest.serviceState == 'error' ||
           latest.lastError?.trim().isNotEmpty == true) {
         return latest;
       }
@@ -710,29 +759,67 @@ class NetworkingAgentRuntimeController
 
   Future<void> _ensureNodeOnlineForJoin() async {
     ZeroTierRuntimeStatus status = await _zeroTierService.detectStatus();
+    debugPrint(
+      'ZeroTier join preflight: initial serviceState=${status.serviceState}, '
+      'isNodeRunning=${status.isNodeRunning}, '
+      'nodeId=${status.nodeId.isEmpty ? '-' : status.nodeId}, '
+      'joinedNetworks=${status.joinedNetworks.length}, '
+      'lastError=${status.lastError ?? '-'}',
+    );
     if (status.serviceState == 'running') {
       return;
     }
 
     if (status.serviceState == 'starting') {
       status = await _waitForNodeReady();
+      debugPrint(
+        'ZeroTier join preflight: after waiting starting -> '
+        'serviceState=${status.serviceState}, '
+        'isNodeRunning=${status.isNodeRunning}, '
+        'joinedNetworks=${status.joinedNetworks.length}, '
+        'lastError=${status.lastError ?? '-'}',
+      );
       if (status.serviceState == 'running') {
         return;
       }
     }
 
     if (status.serviceState == 'offline') {
-      throw const RealtimeError(
-        'ZeroTier node is offline. Please wait for the local runtime to recover before joining again.',
+      status = await _waitForOfflineNodeRecovery();
+      debugPrint(
+        'ZeroTier join preflight: after offline recovery wait -> '
+        'serviceState=${status.serviceState}, '
+        'isNodeRunning=${status.isNodeRunning}, '
+        'joinedNetworks=${status.joinedNetworks.length}, '
+        'lastError=${status.lastError ?? '-'}',
       );
+      if (status.serviceState == 'running') {
+        return;
+      }
     }
 
     status = await _zeroTierService.startNode();
+    debugPrint(
+      'ZeroTier join preflight: after startNode -> '
+      'serviceState=${status.serviceState}, '
+      'isNodeRunning=${status.isNodeRunning}, '
+      'nodeId=${status.nodeId.isEmpty ? '-' : status.nodeId}, '
+      'joinedNetworks=${status.joinedNetworks.length}, '
+      'lastError=${status.lastError ?? '-'}',
+    );
     if (status.serviceState == 'running') {
       return;
     }
 
     status = await _waitForNodeReady();
+    debugPrint(
+      'ZeroTier join preflight: after waitForNodeReady -> '
+      'serviceState=${status.serviceState}, '
+      'isNodeRunning=${status.isNodeRunning}, '
+      'nodeId=${status.nodeId.isEmpty ? '-' : status.nodeId}, '
+      'joinedNetworks=${status.joinedNetworks.length}, '
+      'lastError=${status.lastError ?? '-'}',
+    );
     if (status.serviceState == 'running') {
       return;
     }
@@ -742,6 +829,28 @@ class NetworkingAgentRuntimeController
           ? status.lastError!
           : 'ZeroTier node is not online yet.',
     );
+  }
+
+  Future<ZeroTierRuntimeStatus> _waitForOfflineNodeRecovery() async {
+    ZeroTierRuntimeStatus latest = state.runtimeStatus;
+    for (int attempt = 0; attempt < 12; attempt += 1) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      latest = await _zeroTierService.detectStatus();
+      debugPrint(
+        'ZeroTier offline recovery probe: attempt=$attempt, '
+        'serviceState=${latest.serviceState}, '
+        'isNodeRunning=${latest.isNodeRunning}, '
+        'joinedNetworks=${latest.joinedNetworks.length}, '
+        'lastError=${latest.lastError ?? '-'}',
+      );
+      if (latest.serviceState == 'running' ||
+          latest.serviceState == 'prepared' ||
+          latest.serviceState == 'starting' ||
+          latest.lastError?.trim().isNotEmpty == true) {
+        return latest;
+      }
+    }
+    return latest;
   }
 
   Future<void> _waitForNetworkReady(String networkId) async {
@@ -811,7 +920,8 @@ class NetworkingAgentRuntimeController
     for (int attempt = 0; attempt < 24; attempt += 1) {
       await Future<void>.delayed(const Duration(milliseconds: 500));
       ZeroTierRuntimeStatus status = await _zeroTierService.detectStatus();
-      final bool hasRecoverableError = _isRecoverableRuntimeError(status.lastError);
+      final bool hasRecoverableError =
+          _isRecoverableRuntimeError(status.lastError);
       debugPrint(
         'ZeroTier leave recovery: attempt=$attempt, '
         'serviceState=${status.serviceState}, '
@@ -825,38 +935,36 @@ class NetworkingAgentRuntimeController
       );
       if (networkStillPresent) {
         stableSamples = 0;
-        state = state.copyWith(
-          isNetworkTransitioning: true,
-          networkTransitionLabel: '正在等待 ZeroTier 网络彻底离开本地节点',
-          transitioningNetworkId: networkId,
-        );
         continue;
       }
 
       if ((status.serviceState == 'running' ||
-              status.serviceState == 'prepared' ||
-              status.serviceState == 'offline') &&
+              status.serviceState == 'prepared') &&
           ((status.lastError?.trim().isEmpty ?? true) || hasRecoverableError)) {
         stableSamples += 1;
         if (stableSamples >= 2) {
           return;
         }
-        state = state.copyWith(
-          isNetworkTransitioning: true,
-          networkTransitionLabel: '离网已完成，正在确认本地 ZeroTier 链路稳定',
-          transitioningNetworkId: networkId,
-        );
         continue;
       }
 
       if (status.serviceState == 'offline') {
-        state = state.copyWith(
-          isNetworkTransitioning: true,
-          networkTransitionLabel: '离网已完成，ZeroTier 节点当前离线，可稍后再次尝试恢复连接',
-          transitioningNetworkId: networkId,
-        );
-        stableSamples += 1;
-        if (stableSamples >= 2) {
+        if (attempt == 4) {
+          debugPrint(
+            'ZeroTier leave recovery: runtime still offline after leave; '
+            'requesting in-process node restart on Windows.',
+          );
+          final ZeroTierRuntimeStatus restarted =
+              await _zeroTierService.startNode();
+          debugPrint(
+            'ZeroTier leave recovery: restart request result '
+            'serviceState=${restarted.serviceState}, '
+            'isNodeRunning=${restarted.isNodeRunning}, '
+            'joinedNetworks=${restarted.joinedNetworks.length}, '
+            'lastError=${restarted.lastError ?? '-'}',
+          );
+        }
+        if (attempt >= 10) {
           return;
         }
         continue;
@@ -864,16 +972,11 @@ class NetworkingAgentRuntimeController
 
       stableSamples = 0;
       if (status.serviceState == 'starting' || status.serviceState == 'error') {
-        state = state.copyWith(
-          isNetworkTransitioning: true,
-          networkTransitionLabel: '本地 ZeroTier 正在恢复在线状态',
-          transitioningNetworkId: networkId,
-        );
         if (attempt >= 6) {
           debugPrint(
             'ZeroTier leave recovery: runtime remains ${status.serviceState} '
-            'after network left; skip in-process stop/start because libzt '
-            'documents zts_node_stop() as requiring application restart.',
+            'after network left; continue observing because offline-state '
+            'recovery should already have requested an in-process restart.',
           );
           return;
         }
@@ -926,20 +1029,38 @@ class NetworkingAgentRuntimeController
       lastRuntimeEvent: event,
       recentRuntimeEvents: recentEvents,
       networkTransitionLabel: switch (event.type) {
-        ZeroTierRuntimeEventType.networkLeft
-            when isMatchingTransitionNetwork =>
+        ZeroTierRuntimeEventType.networkLeft when isMatchingTransitionNetwork =>
           '离网事件已完成，正在检查本地 ZeroTier 是否恢复稳定',
         ZeroTierRuntimeEventType.nodeOffline
             when state.isNetworkTransitioning =>
           'ZeroTier 节点暂时离线，正在等待本地 runtime 恢复',
-        ZeroTierRuntimeEventType.nodeOnline
-            when state.isNetworkTransitioning =>
+        ZeroTierRuntimeEventType.nodeOnline when state.isNetworkTransitioning =>
           'ZeroTier 节点已恢复在线，正在确认可以继续操作',
         _ => state.networkTransitionLabel,
       },
-      lastError: event.type == ZeroTierRuntimeEventType.error
-          ? (event.message ?? state.lastError)
-          : state.lastError,
+      lastError: switch (event.type) {
+        ZeroTierRuntimeEventType.error => event.message ?? state.lastError,
+        ZeroTierRuntimeEventType.environmentReady ||
+        ZeroTierRuntimeEventType.nodeStarted ||
+        ZeroTierRuntimeEventType.nodeOnline ||
+        ZeroTierRuntimeEventType.networkWaitingAuthorization ||
+        ZeroTierRuntimeEventType.networkOnline ||
+        ZeroTierRuntimeEventType.networkLeft ||
+        ZeroTierRuntimeEventType.ipAssigned =>
+          null,
+        _ => state.lastError,
+      },
+      clearLastError: switch (event.type) {
+        ZeroTierRuntimeEventType.environmentReady ||
+        ZeroTierRuntimeEventType.nodeStarted ||
+        ZeroTierRuntimeEventType.nodeOnline ||
+        ZeroTierRuntimeEventType.networkWaitingAuthorization ||
+        ZeroTierRuntimeEventType.networkOnline ||
+        ZeroTierRuntimeEventType.networkLeft ||
+        ZeroTierRuntimeEventType.ipAssigned =>
+          true,
+        _ => false,
+      },
     );
     unawaited(_refreshRuntimeStatus());
     if (_shouldRefreshDashboard(event)) {
@@ -997,7 +1118,6 @@ class NetworkingAgentRuntimeController
     }
     return text.contains('timed out waiting for a managed address');
   }
-
 
   void _logRuntimeStatusChange(
     ZeroTierRuntimeStatus previous,

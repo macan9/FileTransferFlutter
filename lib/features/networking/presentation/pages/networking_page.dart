@@ -79,8 +79,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         ref.watch(networkingAgentRuntimeProvider);
     final ZeroTierRuntimeStatus runtimeStatus = agentState.runtimeStatus;
     final bool isLocalReady = agentState.isLocalReady;
-    final bool showNodeOfflineHint =
-        agentState.lastRuntimeEvent?.type == ZeroTierRuntimeEventType.nodeOffline;
+    final bool showNodeOfflineHint = agentState.lastRuntimeEvent?.type ==
+        ZeroTierRuntimeEventType.nodeOffline;
 
     final bool isRegistered = config.agentToken.trim().isNotEmpty &&
         config.zeroTierNodeId.trim().isNotEmpty &&
@@ -117,7 +117,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             ),
             const SizedBox(height: 16),
             if (agentState.isNetworkTransitioning &&
-                agentState.networkTransitionLabel?.trim().isNotEmpty == true) ...<Widget>[
+                agentState.networkTransitionLabel?.trim().isNotEmpty ==
+                    true) ...<Widget>[
               _InlineBanner(
                 icon: Icons.sync_rounded,
                 color: const Color(0xFF1D4ED8),
@@ -778,8 +779,9 @@ class _OneClickNetworkingTab extends StatelessWidget {
         agentState.transitioningNetworkId?.trim().toLowerCase() ?? '';
     final String defaultNetworkId =
         defaultNetwork?.zeroTierNetworkId?.trim().toLowerCase() ?? '';
-    final bool isTransitionLocked = agentState.isNetworkTransitioning &&
-        (transitionNetworkId.isEmpty || transitionNetworkId == defaultNetworkId);
+    final bool isTransitionLocked = agentState.isNetworkActionLocked &&
+        (transitionNetworkId.isEmpty ||
+            transitionNetworkId == defaultNetworkId);
     final bool isGrouped = localState != null &&
         (localState.isConnected ||
             localState.assignedAddresses.isNotEmpty ||
@@ -819,9 +821,10 @@ class _OneClickNetworkingTab extends StatelessWidget {
               accentColor: const Color(0xFFF97316),
             ),
             const SizedBox(height: 18),
+          ] else ...<Widget>[
+            _NetworkStateBanner(state: visualState),
+            const SizedBox(height: 18),
           ],
-          _NetworkStateBanner(state: visualState),
-          const SizedBox(height: 18),
           _NetworkingActionOrb(
             label: isDisabled
                 ? (isTransitionLocked ? '收口中' : '本地初始化')
@@ -835,7 +838,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
                         : Icons.flash_on_rounded)),
             subtitle: isDisabled
                 ? (isTransitionLocked
-                    ? (agentState.networkTransitionLabel ?? '正在等待本地 ZeroTier 链路恢复稳定')
+                    ? (agentState.networkTransitionLabel ??
+                        '正在等待本地 ZeroTier 链路恢复稳定')
                     : '等待本地 ZeroTier 初始化完成')
                 : (isGrouped
                     ? '按钮为绿色\n点击即可取消组网'
@@ -2308,6 +2312,17 @@ _NetworkVisualState _resolveNetworkVisualState({
   required String? lastError,
   required String runtimeServiceState,
 }) {
+  if (_isAuthorizationPendingLocalNetwork(localState)) {
+    return const _NetworkVisualState(
+      label: 'Waiting Authorization',
+      message:
+          'The ZeroTier network is visible locally, but it is still waiting for authorization.',
+      icon: Icons.schedule_rounded,
+      background: Color(0xFFFFF4E8),
+      foreground: Color(0xFFB45309),
+    );
+  }
+
   if (lastError?.trim().isNotEmpty == true) {
     return const _NetworkVisualState(
       label: '运行异常',
@@ -2359,15 +2374,24 @@ _NetworkVisualState _resolveNetworkVisualState({
     );
   }
 
-  if (localState.isConnected ||
-      localState.assignedAddresses.isNotEmpty ||
-      localState.status == 'OK') {
+  if (localState.assignedAddresses.isNotEmpty) {
     return const _NetworkVisualState(
       label: '网络已在线',
       message: '本机已经接入这条网络，当前可以继续查看托管地址与后续可达性。',
       icon: Icons.check_circle_rounded,
       background: Color(0xFFEAF8EF),
       foreground: Color(0xFF15803D),
+    );
+  }
+
+  if (_isHandshakePendingLocalNetwork(localState, managedStatus)) {
+    return const _NetworkVisualState(
+      label: 'Waiting Handshake',
+      message:
+          'The network is already accepted, but the node is still waiting for controller handshake or managed address assignment.',
+      icon: Icons.hourglass_top_rounded,
+      background: Color(0xFFEAF2FF),
+      foreground: Color(0xFF1D4ED8),
     );
   }
 
@@ -2400,6 +2424,39 @@ _NetworkVisualState _resolveNetworkVisualState({
     background: const Color(0xFFEAF2FF),
     foreground: const Color(0xFF1D4ED8),
   );
+}
+
+bool _isAuthorizationPendingLocalNetwork(ZeroTierNetworkState? localState) {
+  if (localState == null) {
+    return false;
+  }
+  return localState.status == 'ACCESS_DENIED' || !localState.isAuthorized;
+}
+
+bool _isHandshakePendingLocalNetwork(
+  ZeroTierNetworkState? localState,
+  String? managedStatus,
+) {
+  if (localState == null) {
+    return false;
+  }
+  if (_isAuthorizationPendingLocalNetwork(localState)) {
+    return false;
+  }
+  if (localState.isConnected || localState.assignedAddresses.isNotEmpty) {
+    return false;
+  }
+
+  final String normalizedManagedStatus =
+      managedStatus?.trim().toLowerCase() ?? '';
+  final bool serverAlreadyAccepted = normalizedManagedStatus == 'authorized' ||
+      normalizedManagedStatus == 'active';
+  final bool localStillNegotiating =
+      localState.status == 'REQUESTING_CONFIGURATION' ||
+          localState.status == 'OK' ||
+          localState.status == 'UNKNOWN';
+
+  return serverAlreadyAccepted || localStillNegotiating;
 }
 
 _RuntimeEventStyle _runtimeEventStyle(ZeroTierRuntimeEventType type) {

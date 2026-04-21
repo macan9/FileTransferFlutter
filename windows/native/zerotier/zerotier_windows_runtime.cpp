@@ -7,9 +7,11 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <optional>
 #include <sstream>
+#include <iostream>
 
 namespace {
 
@@ -100,13 +102,33 @@ std::string ComposeJoinFailureMessage(const ZeroTierWindowsNetworkRecord& networ
   return "ZeroTier network failed with status " + network.status + ".";
 }
 
+bool IsUsableNodeId(uint64_t node_id) {
+  return node_id != 0 && node_id != UINT64_MAX && node_id != (UINT64_MAX - 1);
+}
+
+std::string JoinAddresses(const std::vector<std::string>& addresses) {
+  if (addresses.empty()) {
+    return "-";
+  }
+
+  std::ostringstream stream;
+  for (size_t index = 0; index < addresses.size(); ++index) {
+    if (index > 0) {
+      stream << ",";
+    }
+    stream << addresses[index];
+  }
+  return stream.str();
+}
+
 }  // namespace
 
 ZeroTierWindowsRuntime::ZeroTierWindowsRuntime() {
   g_runtime_instance = this;
 }
 
-flutter::EncodableMap ZeroTierWindowsRuntime::DetectStatus() const {
+flutter::EncodableMap ZeroTierWindowsRuntime::DetectStatus() {
+  RefreshSnapshot();
   std::scoped_lock lock(mutex_);
   return BuildStatus();
 }
@@ -135,11 +157,21 @@ flutter::EncodableMap ZeroTierWindowsRuntime::StartNode() {
   }
 
   bool emit_start_event = false;
+  bool restarted_from_offline = false;
   {
     std::scoped_lock lock(mutex_);
+    std::clog << "[ZT/WIN] StartNode request"
+              << " node_started=" << (node_started_ ? "true" : "false")
+              << " node_online=" << (node_online_ ? "true" : "false")
+              << " node_offline=" << (node_offline_ ? "true" : "false")
+              << " stop_requested=" << (stop_requested_ ? "true" : "false")
+              << " known_networks=" << known_network_ids_.size()
+              << " joined_networks=" << networks_.size()
+              << std::endl;
     if (node_online_) {
       ClearLastErrorLocked();
     } else if (!node_started_) {
+      std::scoped_lock api_lock(api_mutex_);
       const int result = zts_node_start();
       if (result != ZTS_ERR_OK) {
         SetLastErrorLocked("zts_node_start failed: " + std::to_string(result));
@@ -152,7 +184,50 @@ flutter::EncodableMap ZeroTierWindowsRuntime::StartNode() {
         emit_start_event = true;
       }
     } else {
-      ClearLastErrorLocked();
+      std::clog << "[ZT/WIN] StartNode attempting in-process recovery"
+                << " because node_started is already true"
+                << " while node_online=" << (node_online_ ? "true" : "false")
+                << " node_offline=" << (node_offline_ ? "true" : "false")
+                << std::endl;
+      stop_requested_ = true;
+      std::scoped_lock api_lock(api_mutex_);
+      const int stop_result = zts_node_stop();
+      std::clog << "[ZT/WIN] StartNode recovery stop result"
+                << " code=" << stop_result
+                << std::endl;
+      if (stop_result != ZTS_ERR_OK) {
+        SetLastErrorLocked("zts_node_stop failed during recovery: " +
+                           std::to_string(stop_result));
+        stop_requested_ = false;
+        error_message = last_error_;
+      } else {
+        node_started_ = false;
+        node_online_ = false;
+        node_offline_ = false;
+        networks_.clear();
+        leaving_networks_.clear();
+        leave_request_sources_.clear();
+        pending_leave_generations_.clear();
+        network_generations_.clear();
+
+        const int start_result = zts_node_start();
+        std::clog << "[ZT/WIN] StartNode recovery start result"
+                  << " code=" << start_result
+                  << std::endl;
+        if (start_result != ZTS_ERR_OK) {
+          SetLastErrorLocked("zts_node_start failed during recovery: " +
+                             std::to_string(start_result));
+          stop_requested_ = false;
+          error_message = last_error_;
+        } else {
+          node_started_ = true;
+          node_offline_ = false;
+          stop_requested_ = false;
+          restarted_from_offline = true;
+          emit_start_event = true;
+          ClearLastErrorLocked();
+        }
+      }
     }
   }
   if (!error_message.empty()) {
@@ -162,7 +237,10 @@ flutter::EncodableMap ZeroTierWindowsRuntime::StartNode() {
   }
 
   if (emit_start_event) {
-    EmitEvent(BuildEvent("nodeStarted", "Windows libzt node start requested."));
+    EmitEvent(BuildEvent(
+        "nodeStarted",
+        restarted_from_offline ? "Windows libzt node restart requested."
+                               : "Windows libzt node start requested."));
   }
   std::scoped_lock lock(mutex_);
   return BuildStatus();
@@ -179,6 +257,7 @@ flutter::EncodableMap ZeroTierWindowsRuntime::StopNode() {
     network_generations_.clear();
     networks_.clear();
     if (node_started_) {
+      std::scoped_lock api_lock(api_mutex_);
       const int result = zts_node_stop();
       if (result != ZTS_ERR_OK) {
         SetLastErrorLocked("zts_node_stop failed: " + std::to_string(result));
@@ -240,6 +319,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     leaving_networks_.erase(network_id);
     leave_request_sources_.erase(network_id);
     pending_leave_generations_.erase(network_id);
+    RememberKnownNetworkLocked(network_id);
     ClearLastErrorLocked();
     auto existing = networks_.find(network_id);
     if (existing != networks_.end() &&
@@ -269,7 +349,16 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     return true;
   }
 
-  const int result = zts_net_join(network_id);
+  int result = ZTS_ERR_OK;
+  {
+    std::scoped_lock api_lock(api_mutex_);
+    result = zts_net_join(network_id);
+  }
+  std::clog << "[ZT/WIN] JoinNetwork request"
+            << " network_id=" << ToHexNetworkId(network_id)
+            << " result=" << result
+            << " timeout_ms=" << timeout_ms
+            << std::endl;
   if (result != ZTS_ERR_OK) {
     if (error_message != nullptr) {
       *error_message = "zts_net_join failed: " + std::to_string(result);
@@ -299,7 +388,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
       }
 
       const ZeroTierWindowsNetworkRecord& network = network_it->second;
-      if (network.is_connected || !network.assigned_addresses.empty()) {
+      if (!network.assigned_addresses.empty()) {
         return true;
       }
       if (network.status == "ACCESS_DENIED" ||
@@ -312,7 +401,18 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     const auto network_it = networks_.find(network_id);
     if (network_it != networks_.end()) {
       const ZeroTierWindowsNetworkRecord& network = network_it->second;
-      if (network.is_connected || !network.assigned_addresses.empty()) {
+      std::clog << "[ZT/WIN] JoinNetwork wait snapshot"
+                << " network_id=" << ToHexNetworkId(network_id)
+                << " status=" << network.status
+                << " authorized=" << (network.is_authorized ? "true" : "false")
+                << " connected=" << (network.is_connected ? "true" : "false")
+                << " address_count=" << network.assigned_addresses.size()
+                << " addresses=" << JoinAddresses(network.assigned_addresses)
+                << " node_started=" << (node_started_ ? "true" : "false")
+                << " node_online=" << (node_online_ ? "true" : "false")
+                << " last_error=" << (last_error_.empty() ? "-" : last_error_)
+                << std::endl;
+      if (!network.assigned_addresses.empty()) {
         ClearLastErrorLocked();
         if (error_message != nullptr) {
           error_message->clear();
@@ -361,6 +461,27 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
         "ZeroTier node stayed offline while waiting for the network to become ready.";
   }
   SetLastErrorLocked(message);
+  const auto timed_out_network_it = networks_.find(network_id);
+  if (timed_out_network_it != networks_.end()) {
+    const ZeroTierWindowsNetworkRecord& network = timed_out_network_it->second;
+    std::clog << "[ZT/WIN] JoinNetwork timed out"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " status=" << network.status
+              << " authorized=" << (network.is_authorized ? "true" : "false")
+              << " connected=" << (network.is_connected ? "true" : "false")
+              << " address_count=" << network.assigned_addresses.size()
+              << " addresses=" << JoinAddresses(network.assigned_addresses)
+              << " node_started=" << (node_started_ ? "true" : "false")
+              << " node_online=" << (node_online_ ? "true" : "false")
+              << std::endl;
+  } else {
+    std::clog << "[ZT/WIN] JoinNetwork timed out"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " status=missing"
+              << " node_started=" << (node_started_ ? "true" : "false")
+              << " node_online=" << (node_online_ ? "true" : "false")
+              << std::endl;
+  }
   if (error_message != nullptr) {
     *error_message = message;
   }
@@ -375,16 +496,7 @@ bool ZeroTierWindowsRuntime::LeaveNetwork(uint64_t network_id,
   uint64_t leave_generation = 0;
   {
     std::scoped_lock lock(mutex_);
-    auto existing = networks_.find(network_id);
-    if (existing == networks_.end()) {
-      leave_request_sources_.erase(network_id);
-      pending_leave_generations_.erase(network_id);
-      ClearLastErrorLocked();
-      if (error_message != nullptr) {
-        error_message->clear();
-      }
-      return true;
-    }
+    LoadKnownNetworkIdsLocked();
     leaving_networks_.insert(network_id);
     leave_request_sources_[network_id] =
         source.empty() ? "unknown" : source;
@@ -395,7 +507,11 @@ bool ZeroTierWindowsRuntime::LeaveNetwork(uint64_t network_id,
 
   const std::string network_id_hex = ToHexNetworkId(network_id);
 
-  const int result = zts_net_leave(network_id);
+  int result = ZTS_ERR_OK;
+  {
+    std::scoped_lock api_lock(api_mutex_);
+    result = zts_net_leave(network_id);
+  }
   if (result != ZTS_ERR_OK) {
     {
       std::scoped_lock lock(mutex_);
@@ -501,7 +617,7 @@ flutter::EncodableMap ZeroTierWindowsRuntime::BuildStatus() const {
 
   return EncodableMap{
       {EncodableValue("nodeId"),
-       EncodableValue(node_id_ == 0 ? "" : ToHexNetworkId(node_id_))},
+       EncodableValue(IsUsableNodeId(node_id_) ? ToHexNetworkId(node_id_) : "")},
       {EncodableValue("version"), EncodableValue(version_stream.str())},
       {EncodableValue("serviceState"), EncodableValue(BuildServiceState())},
       {EncodableValue("permissionState"), EncodableValue(permission_state)},
@@ -575,7 +691,7 @@ flutter::EncodableMap ZeroTierWindowsRuntime::BuildNodeDiagnosticsPayloadLocked(
       {EncodableValue("nodeOnline"), EncodableValue(node_online_)},
       {EncodableValue("nodeOffline"), EncodableValue(node_offline_)},
       {EncodableValue("nodeId"),
-       EncodableValue(node_id_ == 0 ? "" : ToHexNetworkId(node_id_))},
+       EncodableValue(IsUsableNodeId(node_id_) ? ToHexNetworkId(node_id_) : "")},
       {EncodableValue("nodePort"), EncodableValue(node_port_)},
   };
 }
@@ -626,9 +742,18 @@ ZeroTierWindowsRuntime::BuildNetworkDiagnosticsPayloadLocked(
       {EncodableValue("knownNetworks"), EncodableValue(known_networks)},
       {EncodableValue("networkStatus"),
        EncodableValue(network_it == networks_.end() ? "" : network_it->second.status)},
+      {EncodableValue("networkAuthorized"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.is_authorized)},
       {EncodableValue("networkConnected"),
        EncodableValue(network_it == networks_.end() ? false
                                                     : network_it->second.is_connected)},
+      {EncodableValue("networkAddressCount"),
+       EncodableValue(static_cast<int>(
+           network_it == networks_.end()
+               ? 0
+               : network_it->second.assigned_addresses.size()))},
   };
 }
 
@@ -662,6 +787,7 @@ bool ZeroTierWindowsRuntime::EnsurePrepared(std::string* error_message) {
   storage_path_ = NodeStoragePath();
   logs_path_ = LogsPath();
 
+  std::scoped_lock api_lock(api_mutex_);
   const int storage_result = zts_init_from_storage(storage_path_.c_str());
   if (storage_result != ZTS_ERR_OK) {
     SetLastErrorLocked("zts_init_from_storage failed: " +
@@ -695,17 +821,35 @@ bool ZeroTierWindowsRuntime::EnsureNodeReady(std::string* error_message) {
   bool should_start = false;
   {
     std::scoped_lock lock(mutex_);
-    should_start = !node_started_;
+    should_start = !node_started_ || (node_started_ && node_offline_);
   }
 
   if (should_start) {
+    std::clog << "[ZT/WIN] EnsureNodeReady requesting StartNode"
+              << " because node_started=" << (node_started_ ? "true" : "false")
+              << " node_offline=" << (node_offline_ ? "true" : "false")
+              << std::endl;
     StartNode();
   }
 
   std::unique_lock lock(mutex_);
+  std::clog << "[ZT/WIN] EnsureNodeReady waiting"
+            << " node_started=" << (node_started_ ? "true" : "false")
+            << " node_online=" << (node_online_ ? "true" : "false")
+            << " node_offline=" << (node_offline_ ? "true" : "false")
+            << " last_error=" << (last_error_.empty() ? "-" : last_error_)
+            << std::endl;
   const bool ready = state_cv_.wait_for(lock, std::chrono::seconds(20), [this]() {
     return node_online_ || !last_error_.empty() || !node_started_;
   });
+
+  std::clog << "[ZT/WIN] EnsureNodeReady finished"
+            << " ready=" << (ready ? "true" : "false")
+            << " node_started=" << (node_started_ ? "true" : "false")
+            << " node_online=" << (node_online_ ? "true" : "false")
+            << " node_offline=" << (node_offline_ ? "true" : "false")
+            << " last_error=" << (last_error_.empty() ? "-" : last_error_)
+            << std::endl;
 
   if (!ready || !node_online_) {
     if (error_message != nullptr) {
@@ -731,6 +875,14 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
   }
 
   auto* event = reinterpret_cast<zts_event_msg_t*>(message_ptr);
+  std::clog << "[ZT/WIN] libzt event"
+            << " code=" << event->event_code
+            << " node_started=" << (node_started_ ? "true" : "false")
+            << " node_online=" << (node_online_ ? "true" : "false")
+            << " node_offline=" << (node_offline_ ? "true" : "false")
+            << " network_ptr=" << (event->network != nullptr ? "yes" : "no")
+            << " addr_ptr=" << (event->addr != nullptr ? "yes" : "no")
+            << std::endl;
   {
     std::scoped_lock lock(mutex_);
     if (event->node != nullptr) {
@@ -739,8 +891,12 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
       major_version_ = event->node->ver_major;
       minor_version_ = event->node->ver_minor;
     } else if (node_started_) {
+      std::scoped_lock api_lock(api_mutex_);
       node_id_ = zts_node_get_id();
       node_port_ = zts_node_get_port();
+    }
+    if (!IsUsableNodeId(node_id_)) {
+      node_id_ = 0;
     }
   }
 
@@ -819,7 +975,6 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
       flutter::EncodableMap payload;
       {
         std::scoped_lock lock(mutex_);
-        SetLastErrorLocked("ZeroTier network authorization is still pending.");
         payload = BuildNetworkDiagnosticsPayloadLocked(
             event->network == nullptr ? 0 : event->network->net_id,
             event->event_code, "networkAccessDenied");
@@ -893,11 +1048,21 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
             event->event_code, "networkDown");
         if (ShouldSuppressNetworkDownError(event, leaving_networks_)) {
           leaving_networks_.erase(event->network->net_id);
+          ForgetKnownNetworkLocked(event->network->net_id);
           networks_.erase(event->network->net_id);
           emit_network_left = true;
           left_network_id = ToHexNetworkId(event->network->net_id);
           leave_request_sources_.erase(event->network->net_id);
           ClearLastErrorLocked();
+        }
+        if (event->network != nullptr && !emit_network_left) {
+          auto it = networks_.find(event->network->net_id);
+          if (it != networks_.end()) {
+            it->second.status = "NETWORK_DOWN";
+            it->second.is_connected = false;
+            it->second.is_authorized = false;
+            it->second.assigned_addresses.clear();
+          }
         }
       }
       if (emit_network_left) {
@@ -941,14 +1106,19 @@ void ZeroTierWindowsRuntime::UpdateNetworkFromLibztMessage(
     return;
   }
   auto& record = networks_[network->net_id];
+  RememberKnownNetworkLocked(network->net_id);
   record.network_id = network->net_id;
   record.network_name = network->name == nullptr ? "" : network->name;
   record.status = NetworkStatusToString(network->status);
   record.is_authorized =
       network->status == ZTS_NETWORK_STATUS_OK ||
       network->type == ZTS_NETWORK_TYPE_PUBLIC;
-  record.is_connected = zts_net_transport_is_ready(network->net_id) == ZTS_ERR_OK ||
-                        network->assigned_addr_count > 0;
+  {
+    std::scoped_lock api_lock(api_mutex_);
+    record.is_connected =
+        zts_net_transport_is_ready(network->net_id) > 0 ||
+        network->assigned_addr_count > 0;
+  }
   record.assigned_addresses.clear();
   for (unsigned int i = 0; i < network->assigned_addr_count; ++i) {
     const std::string address = ExtractAddress(network->assigned_addrs[i]);
@@ -956,6 +1126,16 @@ void ZeroTierWindowsRuntime::UpdateNetworkFromLibztMessage(
       record.assigned_addresses.push_back(address);
     }
   }
+  std::clog << "[ZT/WIN] UpdateNetworkFromEvent"
+            << " network_id=" << ToHexNetworkId(network->net_id)
+            << " raw_status=" << network->status
+            << " status=" << record.status
+            << " type=" << network->type
+            << " authorized=" << (record.is_authorized ? "true" : "false")
+            << " connected=" << (record.is_connected ? "true" : "false")
+            << " assigned_addr_count=" << network->assigned_addr_count
+            << " addresses=" << JoinAddresses(record.assigned_addresses)
+            << std::endl;
 }
 
 void ZeroTierWindowsRuntime::UpdateAddressFromLibztMessage(
@@ -970,6 +1150,7 @@ void ZeroTierWindowsRuntime::UpdateAddressFromLibztMessage(
     return;
   }
   auto& record = networks_[event->addr->net_id];
+  RememberKnownNetworkLocked(event->addr->net_id);
   record.network_id = event->addr->net_id;
   const std::string address = ExtractAddress(event->addr->addr);
   if (!address.empty() &&
@@ -978,6 +1159,13 @@ void ZeroTierWindowsRuntime::UpdateAddressFromLibztMessage(
     record.assigned_addresses.push_back(address);
   }
   record.is_connected = !record.assigned_addresses.empty();
+  std::clog << "[ZT/WIN] UpdateAddressFromEvent"
+            << " network_id=" << ToHexNetworkId(event->addr->net_id)
+            << " address=" << (address.empty() ? "-" : address)
+            << " address_count=" << record.assigned_addresses.size()
+            << " connected=" << (record.is_connected ? "true" : "false")
+            << " addresses=" << JoinAddresses(record.assigned_addresses)
+            << std::endl;
 }
 
 void ZeroTierWindowsRuntime::EmitEvent(const flutter::EncodableMap& event) const {
@@ -1033,4 +1221,183 @@ std::string ZeroTierWindowsRuntime::ToHexNetworkId(uint64_t network_id) const {
   std::ostringstream stream;
   stream << std::hex << std::nouppercase << network_id;
   return stream.str();
+}
+
+void ZeroTierWindowsRuntime::RefreshSnapshot() {
+  std::vector<uint64_t> known_network_ids;
+  {
+    std::scoped_lock lock(mutex_);
+    if (!environment_prepared_) {
+      return;
+    }
+    LoadKnownNetworkIdsLocked();
+    known_network_ids.assign(known_network_ids_.begin(), known_network_ids_.end());
+  }
+
+  uint64_t node_id = 0;
+  int node_port = 0;
+  bool node_online = false;
+  {
+    std::scoped_lock api_lock(api_mutex_);
+    node_id = zts_node_get_id();
+    node_port = zts_node_get_port();
+    node_online = zts_node_is_online() == 1;
+  }
+  std::map<uint64_t, ZeroTierWindowsNetworkRecord> refreshed_networks;
+  std::set<uint64_t> missing_network_ids;
+
+  for (const uint64_t network_id : known_network_ids) {
+    int status_code = 0;
+    int transport_ready = 0;
+    zts_sockaddr_storage assigned_addrs[ZTS_MAX_ASSIGNED_ADDRESSES] = {};
+    unsigned int assigned_addr_count = ZTS_MAX_ASSIGNED_ADDRESSES;
+    std::vector<std::string> assigned_addresses;
+    int addr_result = ZTS_ERR_SERVICE;
+    int network_type = 0;
+    int name_result = ZTS_ERR_SERVICE;
+    char network_name_buffer[ZTS_MAX_NETWORK_SHORT_NAME_LENGTH + 1] = {0};
+    {
+      std::scoped_lock api_lock(api_mutex_);
+      status_code = zts_net_get_status(network_id);
+      transport_ready = zts_net_transport_is_ready(network_id);
+      addr_result =
+          zts_addr_get_all(network_id, assigned_addrs, &assigned_addr_count);
+      network_type = zts_net_get_type(network_id);
+      name_result = zts_net_get_name(network_id, network_name_buffer,
+                                     ZTS_MAX_NETWORK_SHORT_NAME_LENGTH);
+    }
+    if (addr_result == ZTS_ERR_OK) {
+      for (unsigned int i = 0; i < assigned_addr_count; ++i) {
+        const std::string address = ExtractAddress(assigned_addrs[i]);
+        if (!address.empty()) {
+          assigned_addresses.push_back(address);
+        }
+      }
+    }
+
+    const bool has_transport = transport_ready > 0;
+    const bool has_assigned_address = !assigned_addresses.empty();
+    std::clog << "[ZT/WIN] RefreshSnapshot network probe"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " status_code=" << status_code
+              << " status=" << NetworkStatusToString(status_code)
+              << " transport_ready=" << transport_ready
+              << " addr_result=" << addr_result
+              << " addr_count=" << assigned_addr_count
+              << " network_type=" << network_type
+              << " name_result=" << name_result
+              << " has_transport=" << (has_transport ? "true" : "false")
+              << " has_assigned_address="
+              << (has_assigned_address ? "true" : "false")
+              << " addresses=" << JoinAddresses(assigned_addresses)
+              << std::endl;
+    if (status_code < 0 && !has_transport && !has_assigned_address) {
+      missing_network_ids.insert(network_id);
+      continue;
+    }
+
+    ZeroTierWindowsNetworkRecord record;
+    record.network_id = network_id;
+    record.network_name =
+        name_result == ZTS_ERR_OK ? network_name_buffer : std::string();
+    record.status = NetworkStatusToString(status_code);
+    record.assigned_addresses = std::move(assigned_addresses);
+    record.is_connected = has_transport || has_assigned_address;
+    record.is_authorized =
+        status_code == ZTS_NETWORK_STATUS_OK ||
+        network_type == ZTS_NETWORK_TYPE_PUBLIC;
+    refreshed_networks[network_id] = std::move(record);
+  }
+
+  std::scoped_lock lock(mutex_);
+  const bool previous_node_online = node_online_;
+  const bool previous_node_offline = node_offline_;
+  node_id_ = IsUsableNodeId(node_id) ? node_id : 0;
+  node_port_ = node_port;
+  if (node_started_ && node_id_ != 0) {
+    node_online_ = node_online;
+    if (node_online) {
+      node_offline_ = false;
+    }
+  }
+  std::clog << "[ZT/WIN] RefreshSnapshot"
+            << " node_id=" << (node_id_ == 0 ? std::string("-") : ToHexNetworkId(node_id_))
+            << " node_port=" << node_port_
+            << " node_started=" << (node_started_ ? "true" : "false")
+            << " node_online=" << (node_online_ ? "true" : "false")
+            << " node_offline=" << (node_offline_ ? "true" : "false")
+            << " prev_node_online=" << (previous_node_online ? "true" : "false")
+            << " prev_node_offline=" << (previous_node_offline ? "true" : "false")
+            << " known_networks=" << known_network_ids_.size()
+            << " joined_networks=" << refreshed_networks.size()
+            << std::endl;
+  for (const uint64_t network_id : missing_network_ids) {
+    ForgetKnownNetworkLocked(network_id);
+    networks_.erase(network_id);
+    leave_request_sources_.erase(network_id);
+    pending_leave_generations_.erase(network_id);
+  }
+  for (auto& [network_id, record] : refreshed_networks) {
+    networks_[network_id] = std::move(record);
+  }
+}
+
+void ZeroTierWindowsRuntime::LoadKnownNetworkIdsLocked() {
+  if (known_network_ids_loaded_) {
+    return;
+  }
+  known_network_ids_loaded_ = true;
+
+  std::ifstream stream(KnownNetworksPath());
+  if (!stream.is_open()) {
+    return;
+  }
+
+  std::string line;
+  while (std::getline(stream, line)) {
+    std::stringstream parser;
+    parser << std::hex << line;
+    uint64_t network_id = 0;
+    parser >> network_id;
+    if (network_id != 0) {
+      known_network_ids_.insert(network_id);
+    }
+  }
+}
+
+void ZeroTierWindowsRuntime::PersistKnownNetworkIdsLocked() const {
+  std::error_code error;
+  std::filesystem::create_directories(RuntimeRootPath(), error);
+
+  std::ofstream stream(KnownNetworksPath(), std::ios::trunc);
+  if (!stream.is_open()) {
+    return;
+  }
+  for (const uint64_t network_id : known_network_ids_) {
+    stream << ToHexNetworkId(network_id) << '\n';
+  }
+}
+
+void ZeroTierWindowsRuntime::RememberKnownNetworkLocked(uint64_t network_id) {
+  if (network_id == 0) {
+    return;
+  }
+  LoadKnownNetworkIdsLocked();
+  if (known_network_ids_.insert(network_id).second) {
+    PersistKnownNetworkIdsLocked();
+  }
+}
+
+void ZeroTierWindowsRuntime::ForgetKnownNetworkLocked(uint64_t network_id) {
+  if (network_id == 0) {
+    return;
+  }
+  LoadKnownNetworkIdsLocked();
+  if (known_network_ids_.erase(network_id) > 0) {
+    PersistKnownNetworkIdsLocked();
+  }
+}
+
+std::string ZeroTierWindowsRuntime::KnownNetworksPath() const {
+  return RuntimeRootPath() + "\\known_networks.txt";
 }

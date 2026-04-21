@@ -2,6 +2,7 @@
 
 #include <flutter/encodable_value.h>
 
+#include <thread>
 #include <utility>
 
 namespace {
@@ -128,26 +129,11 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
     return;
   }
   if (method_name == "joinNetworkAndWaitForIp") {
-    const std::string network_id = ReadStringArgument(args, "networkId");
-    const int timeout_ms = ReadIntArgument(args, "timeoutMs");
-    std::string error_message;
-    if (network_manager_.JoinNetworkAndWaitForIp(network_id, timeout_ms,
-                                                 &error_message)) {
-      result->Success();
-    } else {
-      result->Error("join_failed", error_message);
-    }
+    HandleJoinNetworkCall(args, std::move(result));
     return;
   }
   if (method_name == "leaveNetwork") {
-    const std::string network_id = ReadStringArgument(args, "networkId");
-    const std::string source = ReadStringArgument(args, "source");
-    std::string error_message;
-    if (network_manager_.LeaveNetwork(network_id, source, &error_message)) {
-      result->Success();
-    } else {
-      result->Error("leave_failed", error_message);
-    }
+    HandleLeaveNetworkCall(args, std::move(result));
     return;
   }
   if (method_name == "listNetworks") {
@@ -209,6 +195,45 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
   result->NotImplemented();
 }
 
+void ZeroTierWindowsPlugin::HandleJoinNetworkCall(
+    const flutter::EncodableMap& args,
+    std::unique_ptr<MethodResult> result) {
+  const std::string network_id = ReadStringArgument(args, "networkId");
+  const int timeout_ms = ReadIntArgument(args, "timeoutMs");
+  auto* plugin = this;
+  std::thread([plugin, network_id, timeout_ms,
+               result = std::move(result)]() mutable {
+    std::string error_message;
+    const bool success = plugin->network_manager_.JoinNetworkAndWaitForIp(
+        network_id, timeout_ms, &error_message);
+    plugin->QueueMethodResult(PendingMethodResult{
+        std::move(result),
+        success,
+        "join_failed",
+        error_message,
+    });
+  }).detach();
+}
+
+void ZeroTierWindowsPlugin::HandleLeaveNetworkCall(
+    const flutter::EncodableMap& args,
+    std::unique_ptr<MethodResult> result) {
+  const std::string network_id = ReadStringArgument(args, "networkId");
+  const std::string source = ReadStringArgument(args, "source");
+  auto* plugin = this;
+  std::thread([plugin, network_id, source, result = std::move(result)]() mutable {
+    std::string error_message;
+    const bool success =
+        plugin->network_manager_.LeaveNetwork(network_id, source, &error_message);
+    plugin->QueueMethodResult(PendingMethodResult{
+        std::move(result),
+        success,
+        "leave_failed",
+        error_message,
+    });
+  }).detach();
+}
+
 std::unique_ptr<flutter::StreamHandlerError<flutter::EncodableValue>>
 ZeroTierWindowsPlugin::OnListen(const flutter::EncodableValue* /*arguments*/,
                                 std::unique_ptr<EventSink>&& events) {
@@ -234,6 +259,17 @@ void ZeroTierWindowsPlugin::QueueEvent(const flutter::EncodableMap& event) {
   }
 }
 
+void ZeroTierWindowsPlugin::QueueMethodResult(PendingMethodResult pending_result) {
+  {
+    std::scoped_lock lock(method_result_mutex_);
+    pending_method_results_.push_back(std::move(pending_result));
+  }
+
+  if (window_handle_ != nullptr) {
+    PostMessage(window_handle_, kFlushMethodResultsMessage, 0, 0);
+  }
+}
+
 void ZeroTierWindowsPlugin::FlushQueuedEvents() {
   if (!event_sink_) {
     return;
@@ -250,10 +286,33 @@ void ZeroTierWindowsPlugin::FlushQueuedEvents() {
   }
 }
 
+void ZeroTierWindowsPlugin::FlushQueuedMethodResults() {
+  std::deque<PendingMethodResult> pending_method_results;
+  {
+    std::scoped_lock lock(method_result_mutex_);
+    pending_method_results.swap(pending_method_results_);
+  }
+
+  for (auto& pending_result : pending_method_results) {
+    if (pending_result.result == nullptr) {
+      continue;
+    }
+    if (pending_result.success) {
+      pending_result.result->Success();
+    } else {
+      pending_result.result->Error(pending_result.error_code,
+                                   pending_result.error_message);
+    }
+  }
+}
+
 std::optional<LRESULT> ZeroTierWindowsPlugin::HandleWindowProc(
     HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
   if (hwnd == window_handle_ && message == kFlushEventsMessage) {
     FlushQueuedEvents();
+  }
+  if (hwnd == window_handle_ && message == kFlushMethodResultsMessage) {
+    FlushQueuedMethodResults();
   }
   return std::nullopt;
 }

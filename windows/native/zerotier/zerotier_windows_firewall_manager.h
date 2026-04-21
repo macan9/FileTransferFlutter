@@ -18,6 +18,10 @@ class ZeroTierWindowsFirewallManager {
                   const std::vector<ZeroTierWindowsFirewallPortRule>& ports,
                   std::string* error_message);
   bool RemoveRules(const std::string& rule_scope_id, std::string* error_message);
+
+ private:
+  bool RemoveRuleNames(const std::vector<std::wstring>& rule_names,
+                       std::string* error_message);
 };
 
 #endif  // FLUTTER_RUNNER_ZEROTIER_WINDOWS_FIREWALL_MANAGER_H_
