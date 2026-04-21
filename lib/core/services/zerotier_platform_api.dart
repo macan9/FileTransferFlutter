@@ -13,7 +13,10 @@ abstract class ZeroTierPlatformApi {
     String networkId, {
     Duration timeout,
   });
-  Future<void> leaveNetwork(String networkId);
+  Future<void> leaveNetwork(
+    String networkId, {
+    String source,
+  });
   Future<List<ZeroTierNetworkState>> listNetworks();
   Future<ZeroTierNetworkState?> getNetworkDetail(String networkId);
   Future<void> applyFirewallRules({

@@ -141,8 +141,9 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
   }
   if (method_name == "leaveNetwork") {
     const std::string network_id = ReadStringArgument(args, "networkId");
+    const std::string source = ReadStringArgument(args, "source");
     std::string error_message;
-    if (network_manager_.LeaveNetwork(network_id, &error_message)) {
+    if (network_manager_.LeaveNetwork(network_id, source, &error_message)) {
       result->Success();
     } else {
       result->Error("leave_failed", error_message);

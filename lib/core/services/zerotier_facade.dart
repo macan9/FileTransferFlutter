@@ -37,8 +37,13 @@ class ZeroTierFacade implements ZeroTierPlatformApi {
   }
 
   @override
-  Future<void> leaveNetwork(String networkId) => _platformApi.leaveNetwork(
+  Future<void> leaveNetwork(
+    String networkId, {
+    String source = 'unknown',
+  }) =>
+      _platformApi.leaveNetwork(
         networkId,
+        source: source,
       );
 
   @override

@@ -39,6 +39,7 @@ bool ZeroTierWindowsNetworkManager::JoinNetworkAndWaitForIp(
 }
 
 bool ZeroTierWindowsNetworkManager::LeaveNetwork(const std::string& network_id,
+                                                 const std::string& source,
                                                  std::string* error_message) {
   if (runtime_ == nullptr) {
     if (error_message != nullptr) {
@@ -53,7 +54,7 @@ bool ZeroTierWindowsNetworkManager::LeaveNetwork(const std::string& network_id,
     }
     return false;
   }
-  return runtime_->LeaveNetwork(parsed_network_id, error_message);
+  return runtime_->LeaveNetwork(parsed_network_id, source, error_message);
 }
 
 uint64_t ZeroTierWindowsNetworkManager::ParseNetworkId(

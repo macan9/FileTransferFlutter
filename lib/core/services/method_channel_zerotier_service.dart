@@ -64,11 +64,15 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
   }
 
   @override
-  Future<void> leaveNetwork(String networkId) async {
+  Future<void> leaveNetwork(
+    String networkId, {
+    String source = 'unknown',
+  }) async {
     await _invoke(
       'leaveNetwork',
       <String, Object?>{
         'networkId': networkId,
+        'source': source,
       },
     );
   }

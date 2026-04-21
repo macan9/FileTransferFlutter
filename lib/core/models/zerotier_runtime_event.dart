@@ -4,6 +4,8 @@ enum ZeroTierRuntimeEventType {
   environmentReady,
   permissionRequired,
   nodeStarted,
+  nodeOnline,
+  nodeOffline,
   nodeStopped,
   networkJoining,
   networkWaitingAuthorization,

@@ -195,7 +195,10 @@ class ProcessZeroTierLocalService implements ZeroTierLocalService {
   }
 
   @override
-  Future<void> leaveNetwork(String networkId) async {
+  Future<void> leaveNetwork(
+    String networkId, {
+    String source = 'unknown',
+  }) async {
     final String executable = await _requireCliExecutable();
     final _CommandResult leaveResult =
         await _run(executable, <String>['leave', networkId]);
@@ -214,6 +217,9 @@ class ProcessZeroTierLocalService implements ZeroTierLocalService {
     _emit(
       ZeroTierRuntimeEventType.networkLeft,
       networkId: networkId,
+      payload: <String, Object?>{
+        'leaveSource': source,
+      },
     );
   }
 

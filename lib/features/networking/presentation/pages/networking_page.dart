@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
@@ -77,6 +79,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         ref.watch(networkingAgentRuntimeProvider);
     final ZeroTierRuntimeStatus runtimeStatus = agentState.runtimeStatus;
     final bool isLocalReady = agentState.isLocalReady;
+    final bool showNodeOfflineHint =
+        agentState.lastRuntimeEvent?.type == ZeroTierRuntimeEventType.nodeOffline;
 
     final bool isRegistered = config.agentToken.trim().isNotEmpty &&
         config.zeroTierNodeId.trim().isNotEmpty &&
@@ -94,6 +98,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
               agentState: agentState,
               config: config,
               isRegistered: isRegistered,
+              recentEvents: agentState.recentRuntimeEvents,
+              lastError: agentState.lastError,
               onRefresh: _refreshAll,
               onCopyToken: config.agentToken.trim().isEmpty
                   ? null
@@ -106,9 +112,32 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             _RuntimeInsightCard(
               runtimeStatus: runtimeStatus,
               recentEvents: agentState.recentRuntimeEvents,
+              lastError: agentState.lastError,
               onRefresh: _refreshAll,
             ),
             const SizedBox(height: 16),
+            if (agentState.isNetworkTransitioning &&
+                agentState.networkTransitionLabel?.trim().isNotEmpty == true) ...<Widget>[
+              _InlineBanner(
+                icon: Icons.sync_rounded,
+                color: const Color(0xFF1D4ED8),
+                background: const Color(0xFFEAF2FF),
+                title: '本地链路收口中',
+                message: agentState.networkTransitionLabel!,
+              ),
+              const SizedBox(height: 16),
+            ],
+            if (showNodeOfflineHint) ...<Widget>[
+              const _InlineBanner(
+                icon: Icons.wifi_off_rounded,
+                color: Color(0xFFB45309),
+                background: Color(0xFFFFF4E8),
+                title: 'ZeroTier 节点离线',
+                message:
+                    '当前检测到 ZeroTier node offline。这更像是本地节点暂时失去在线连通性，不等同于节点重新启动。',
+              ),
+              const SizedBox(height: 16),
+            ],
             if (agentState.lastError != null &&
                 agentState.lastError!.trim().isNotEmpty) ...<Widget>[
               _InlineBanner(
@@ -235,8 +264,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       await ref
           .read(networkingProvider.notifier)
           .joinDefaultNetwork(deviceId: readyConfig.deviceId);
-      await ref.read(networkingAgentRuntimeProvider.notifier).refreshNow();
-      await ref.read(networkingProvider.notifier).refresh();
+      unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
+      unawaited(ref.read(networkingProvider.notifier).refresh());
       _showPageMessage('默认网络入网请求已提交，等待本机 Agent 执行 join。');
     } on RealtimeError catch (error) {
       _showPageMessage(error.message);
@@ -254,6 +283,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       await ref.read(networkingAgentRuntimeProvider.notifier).leaveNetwork(
             networkId,
             deactivateWhenIdle: true,
+            source: 'ui.defaultNetworkCard',
           );
       await ref.read(networkingProvider.notifier).refresh();
       _showPageMessage('已取消默认网络组网。');
@@ -282,7 +312,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             code: code,
             deviceId: readyConfig.deviceId,
           );
-      await ref.read(networkingAgentRuntimeProvider.notifier).refreshNow();
+      unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
       _showPageMessage('邀请码组网请求已提交，等待本机 Agent 执行 join。');
     } on RealtimeError catch (error) {
       _showPageMessage(error.message);
@@ -347,6 +377,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       ZeroTierRuntimeEventType.environmentReady => 'Windows ZeroTier 环境已准备完成。',
       ZeroTierRuntimeEventType.permissionRequired => 'ZeroTier 需要额外权限或手动设置。',
       ZeroTierRuntimeEventType.nodeStarted => 'ZeroTier 节点已启动。',
+      ZeroTierRuntimeEventType.nodeOnline => 'ZeroTier 节点已恢复在线。',
+      ZeroTierRuntimeEventType.nodeOffline => 'ZeroTier 节点当前离线。',
       ZeroTierRuntimeEventType.nodeStopped => 'ZeroTier 节点已停止。',
       ZeroTierRuntimeEventType.networkJoining =>
         '正在加入 ZeroTier 网络$networkSuffix。',
@@ -388,6 +420,8 @@ class _HeroStatusCard extends StatelessWidget {
     required this.agentState,
     required this.config,
     required this.isRegistered,
+    required this.recentEvents,
+    required this.lastError,
     required this.onRefresh,
     required this.onCopyToken,
   });
@@ -396,18 +430,27 @@ class _HeroStatusCard extends StatelessWidget {
   final NetworkingAgentRuntimeState agentState;
   final AppConfig config;
   final bool isRegistered;
+  final List<ZeroTierRuntimeEvent> recentEvents;
+  final String? lastError;
   final Future<void> Function() onRefresh;
   final VoidCallback? onCopyToken;
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
+    final _RuntimeSignal signal = _resolveRuntimeSignal(
+      runtimeStatus: runtimeStatus,
+      recentEvents: recentEvents,
+      lastError: lastError,
+    );
     return SectionCard(
       title: 'ZeroTier Agent 实况',
       subtitle: '页面直接消费统一 ZeroTierFacade 与 provider 状态流，展示本机节点、网络与事件回流。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
+          _RuntimeSignalBanner(signal: signal),
+          const SizedBox(height: 16),
           Wrap(
             spacing: 10,
             runSpacing: 10,
@@ -525,15 +568,22 @@ class _RuntimeInsightCard extends StatelessWidget {
   const _RuntimeInsightCard({
     required this.runtimeStatus,
     required this.recentEvents,
+    required this.lastError,
     required this.onRefresh,
   });
 
   final ZeroTierRuntimeStatus runtimeStatus;
   final List<ZeroTierRuntimeEvent> recentEvents;
+  final String? lastError;
   final Future<void> Function() onRefresh;
 
   @override
   Widget build(BuildContext context) {
+    final _RuntimeSignal signal = _resolveRuntimeSignal(
+      runtimeStatus: runtimeStatus,
+      recentEvents: recentEvents,
+      lastError: lastError,
+    );
     return SectionCard(
       title: '运行时事件回流',
       subtitle: '以下事件来自 Windows 原生 EventChannel，反映 libzt 节点生命周期与网络状态变化。',
@@ -554,6 +604,7 @@ class _RuntimeInsightCard extends StatelessWidget {
                 label: 'Last Error',
                 value: runtimeStatus.lastError ?? '无',
               ),
+              _InfoPill(label: 'Current Signal', value: signal.label),
             ],
           ),
           const SizedBox(height: 16),
@@ -723,6 +774,12 @@ class _OneClickNetworkingTab extends StatelessWidget {
     final ZeroTierNetworkState? localState = defaultNetwork == null
         ? null
         : _findLocal(runtimeStatus, defaultNetwork!);
+    final String transitionNetworkId =
+        agentState.transitioningNetworkId?.trim().toLowerCase() ?? '';
+    final String defaultNetworkId =
+        defaultNetwork?.zeroTierNetworkId?.trim().toLowerCase() ?? '';
+    final bool isTransitionLocked = agentState.isNetworkTransitioning &&
+        (transitionNetworkId.isEmpty || transitionNetworkId == defaultNetworkId);
     final bool isGrouped = localState != null &&
         (localState.isConnected ||
             localState.assignedAddresses.isNotEmpty ||
@@ -731,7 +788,15 @@ class _OneClickNetworkingTab extends StatelessWidget {
         (isBusy ||
             agentState.isBootstrapping ||
             localState?.status == 'REQUESTING_CONFIGURATION');
-    final bool isDisabled = agentState.isLocalInitializing || !isLocalReady;
+    final bool isDisabled =
+        agentState.isLocalInitializing || !isLocalReady || isTransitionLocked;
+    final _NetworkVisualState visualState = _resolveNetworkVisualState(
+      localState: localState,
+      managedStatus: defaultNetwork?.status,
+      isBusy: isTransitionLocked || isConnecting,
+      lastError: agentState.lastError,
+      runtimeServiceState: runtimeStatus.serviceState,
+    );
     final _NetworkingOrbTone orbTone = isDisabled
         ? _NetworkingOrbTone.disabled
         : (isGrouped
@@ -742,9 +807,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
 
     return SectionCard(
       title: '默认网络编排',
-      subtitle: isGrouped
-          ? '当前设备已接入默认网络，点击绿色按钮即可取消组网。'
-          : '应用启动时只完成本地 ZeroTier 初始化；点击开始组网后才会接入后台编排。',
+      subtitle: visualState.message,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: <Widget>[
@@ -752,13 +815,16 @@ class _OneClickNetworkingTab extends StatelessWidget {
             _ManagedNetworkCard(
               network: defaultNetwork!,
               localState: localState,
+              visualState: visualState,
               accentColor: const Color(0xFFF97316),
             ),
             const SizedBox(height: 18),
           ],
+          _NetworkStateBanner(state: visualState),
+          const SizedBox(height: 18),
           _NetworkingActionOrb(
             label: isDisabled
-                ? '本地初始化'
+                ? (isTransitionLocked ? '收口中' : '本地初始化')
                 : (isGrouped ? '已组网' : (isConnecting ? '组网中' : '开始组网')),
             icon: isDisabled
                 ? Icons.power_settings_new_rounded
@@ -768,7 +834,9 @@ class _OneClickNetworkingTab extends StatelessWidget {
                         ? Icons.sync_rounded
                         : Icons.flash_on_rounded)),
             subtitle: isDisabled
-                ? '等待本地 ZeroTier 初始化完成'
+                ? (isTransitionLocked
+                    ? (agentState.networkTransitionLabel ?? '正在等待本地 ZeroTier 链路恢复稳定')
+                    : '等待本地 ZeroTier 初始化完成')
                 : (isGrouped
                     ? '按钮为绿色\n点击即可取消组网'
                     : (isConnecting
@@ -791,7 +859,9 @@ class _OneClickNetworkingTab extends StatelessWidget {
           const SizedBox(height: 20),
           _InlineHint(
             message: isDisabled
-                ? '未完成本地初始化前，圆形开始组网按钮会保持灰色。'
+                ? (isTransitionLocked
+                    ? '离网收口完成前，按钮会暂时灰掉，避免旧事件和新 join 链路互相打架。'
+                    : '未完成本地初始化前，圆形开始组网按钮会保持灰色。')
                 : (isGrouped
                     ? '绿色表示已经组网成功。'
                     : (isConnecting
@@ -981,6 +1051,13 @@ class _PrivateNetworkingTab extends StatelessWidget {
                       child: _ManagedNetworkCard(
                         network: network,
                         localState: _findLocal(runtimeStatus, network),
+                        visualState: _resolveNetworkVisualState(
+                          localState: _findLocal(runtimeStatus, network),
+                          managedStatus: network.status,
+                          isBusy: isBusy,
+                          lastError: agentState.lastError,
+                          runtimeServiceState: runtimeStatus.serviceState,
+                        ),
                         accentColor: network.isDefault
                             ? const Color(0xFF2563EB)
                             : const Color(0xFFEA580C),
@@ -1016,11 +1093,13 @@ class _ManagedNetworkCard extends StatelessWidget {
   const _ManagedNetworkCard({
     required this.network,
     required this.localState,
+    required this.visualState,
     required this.accentColor,
   });
 
   final ManagedNetwork network;
   final ZeroTierNetworkState? localState;
+  final _NetworkVisualState visualState;
   final Color accentColor;
 
   @override
@@ -1054,8 +1133,8 @@ class _ManagedNetworkCard extends StatelessWidget {
                 ),
               ),
               _StatusChip(
-                label: network.status.isEmpty ? 'unknown' : network.status,
-                color: accentColor,
+                label: visualState.label,
+                color: visualState.foreground,
               ),
             ],
           ),
@@ -1069,6 +1148,7 @@ class _ManagedNetworkCard extends StatelessWidget {
             runSpacing: 10,
             children: <Widget>[
               _InfoPill(label: '类型', value: network.type),
+              _InfoPill(label: '编排状态', value: network.status),
               if (network.zeroTierNetworkName?.trim().isNotEmpty == true)
                 _InfoPill(
                     label: 'ZeroTier 名称', value: network.zeroTierNetworkName!),
@@ -1081,6 +1161,8 @@ class _ManagedNetworkCard extends StatelessWidget {
               ),
             ],
           ),
+          const SizedBox(height: 12),
+          _NetworkStateBanner(state: visualState),
           if (localState != null &&
               localState!.assignedAddresses.isNotEmpty) ...<Widget>[
             const SizedBox(height: 12),
@@ -1107,6 +1189,13 @@ class _LocalNetworkCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final Color accentColor =
         network.isConnected ? const Color(0xFF15803D) : const Color(0xFFB45309);
+    final _NetworkVisualState visualState = _resolveNetworkVisualState(
+      localState: network,
+      managedStatus: managedNetwork?.status,
+      isBusy: false,
+      lastError: null,
+      runtimeServiceState: 'running',
+    );
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
@@ -1137,7 +1226,10 @@ class _LocalNetworkCard extends StatelessWidget {
                       ),
                 ),
               ),
-              _StatusChip(label: network.status, color: accentColor),
+              _StatusChip(
+                label: visualState.label,
+                color: visualState.foreground,
+              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -1156,6 +1248,8 @@ class _LocalNetworkCard extends StatelessWidget {
                 _InfoPill(label: '服务端网络', value: managedNetwork!.name),
             ],
           ),
+          const SizedBox(height: 12),
+          _NetworkStateBanner(state: visualState),
           const SizedBox(height: 12),
           if (network.assignedAddresses.isEmpty)
             const Text('暂未分配托管地址。')
@@ -1179,27 +1273,7 @@ class _RuntimeEventTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final ({Color background, Color foreground, IconData icon}) style =
-        switch (event.type) {
-      ZeroTierRuntimeEventType.error => (
-          background: const Color(0xFFFFE9E9),
-          foreground: const Color(0xFFB91C1C),
-          icon: Icons.error_outline_rounded,
-        ),
-      ZeroTierRuntimeEventType.networkOnline ||
-      ZeroTierRuntimeEventType.ipAssigned ||
-      ZeroTierRuntimeEventType.nodeStarted =>
-        (
-          background: const Color(0xFFEAF8EF),
-          foreground: const Color(0xFF15803D),
-          icon: Icons.check_circle_rounded,
-        ),
-      _ => (
-          background: const Color(0xFFEAF2FF),
-          foreground: const Color(0xFF1D4ED8),
-          icon: Icons.timeline_rounded,
-        ),
-    };
+    final _RuntimeEventStyle style = _runtimeEventStyle(event.type);
 
     return Container(
       width: double.infinity,
@@ -1218,7 +1292,7 @@ class _RuntimeEventTile extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
                 Text(
-                  event.type.name,
+                  _runtimeEventTitle(event.type),
                   style: Theme.of(context).textTheme.labelLarge?.copyWith(
                         color: style.foreground,
                         fontWeight: FontWeight.w700,
@@ -1228,7 +1302,7 @@ class _RuntimeEventTile extends StatelessWidget {
                 Text(
                   event.message?.trim().isNotEmpty == true
                       ? event.message!
-                      : '事件已回流到 Flutter 编排层。',
+                      : _runtimeEventFallbackMessage(event.type),
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: style.foreground,
                       ),
@@ -1238,6 +1312,102 @@ class _RuntimeEventTile extends StatelessWidget {
                   '${_timeOrDash(event.occurredAt)}${event.networkId == null ? '' : ' · ${event.networkId}'}',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
                         color: style.foreground.withValues(alpha: 0.82),
+                      ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RuntimeSignalBanner extends StatelessWidget {
+  const _RuntimeSignalBanner({
+    required this.signal,
+  });
+
+  final _RuntimeSignal signal;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: signal.background,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(signal.icon, color: signal.foreground),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  signal.label,
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        color: signal.foreground,
+                        fontWeight: FontWeight.w800,
+                      ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  signal.message,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: signal.foreground,
+                      ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _NetworkStateBanner extends StatelessWidget {
+  const _NetworkStateBanner({
+    required this.state,
+  });
+
+  final _NetworkVisualState state;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: state.background,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(state.icon, color: state.foreground),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  state.label,
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        color: state.foreground,
+                        fontWeight: FontWeight.w800,
+                      ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  state.message,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: state.foreground,
                       ),
                 ),
               ],
@@ -1836,6 +2006,50 @@ class _InfoPill extends StatelessWidget {
   }
 }
 
+class _RuntimeSignal {
+  const _RuntimeSignal({
+    required this.label,
+    required this.message,
+    required this.icon,
+    required this.background,
+    required this.foreground,
+  });
+
+  final String label;
+  final String message;
+  final IconData icon;
+  final Color background;
+  final Color foreground;
+}
+
+class _NetworkVisualState {
+  const _NetworkVisualState({
+    required this.label,
+    required this.message,
+    required this.icon,
+    required this.background,
+    required this.foreground,
+  });
+
+  final String label;
+  final String message;
+  final IconData icon;
+  final Color background;
+  final Color foreground;
+}
+
+class _RuntimeEventStyle {
+  const _RuntimeEventStyle({
+    required this.background,
+    required this.foreground,
+    required this.icon,
+  });
+
+  final Color background;
+  final Color foreground;
+  final IconData icon;
+}
+
 String _timeOrDash(DateTime? time) {
   if (time == null) {
     return '-';
@@ -1905,13 +2119,400 @@ String _serviceStateLabel(ZeroTierRuntimeStatus status) {
   switch (status.serviceState) {
     case 'running':
       return '运行中';
+    case 'offline':
+      return '离线';
     case 'starting':
       return '启动中';
     case 'prepared':
-      return '已准备';
+      return '已就绪';
+    case 'error':
+      return '异常';
     case 'unavailable':
       return '不可用';
     default:
       return status.serviceState;
+  }
+}
+
+_RuntimeSignal _resolveRuntimeSignal({
+  required ZeroTierRuntimeStatus runtimeStatus,
+  required List<ZeroTierRuntimeEvent> recentEvents,
+  required String? lastError,
+}) {
+  final bool hasActiveJoinedNetwork = runtimeStatus.joinedNetworks.any(
+    (ZeroTierNetworkState network) =>
+        network.isConnected ||
+        network.assignedAddresses.isNotEmpty ||
+        network.status == 'OK',
+  );
+  final ZeroTierRuntimeEvent? highlightedEvent =
+      recentEvents.cast<ZeroTierRuntimeEvent?>().firstWhere(
+            (ZeroTierRuntimeEvent? event) =>
+                event != null &&
+                (event.type == ZeroTierRuntimeEventType.error ||
+                    event.type == ZeroTierRuntimeEventType.nodeOffline ||
+                    event.type ==
+                        ZeroTierRuntimeEventType.networkWaitingAuthorization ||
+                    event.type == ZeroTierRuntimeEventType.networkOnline ||
+                    event.type == ZeroTierRuntimeEventType.networkLeft),
+            orElse: () => null,
+          );
+
+  if (lastError?.trim().isNotEmpty == true) {
+    return _RuntimeSignal(
+      label: '运行异常',
+      message: lastError!,
+      icon: Icons.error_outline_rounded,
+      background: const Color(0xFFFFE9E9),
+      foreground: const Color(0xFFB91C1C),
+    );
+  }
+
+  if (hasActiveJoinedNetwork) {
+    return const _RuntimeSignal(
+      label: '网络已在线',
+      message: '当前本机仍检测到可用的 ZeroTier 本地网络映射，运行时状态以实际 joined network 为准。',
+      icon: Icons.check_circle_rounded,
+      background: Color(0xFFEAF8EF),
+      foreground: Color(0xFF15803D),
+    );
+  }
+
+  if (highlightedEvent != null) {
+    switch (highlightedEvent.type) {
+      case ZeroTierRuntimeEventType.networkWaitingAuthorization:
+        return _RuntimeSignal(
+          label: '等待网络授权',
+          message: highlightedEvent.message?.trim().isNotEmpty == true
+              ? highlightedEvent.message!
+              : 'ZeroTier 已发起入网请求，当前仍在等待控制面或网络侧授权。',
+          icon: Icons.schedule_rounded,
+          background: const Color(0xFFFFF4E8),
+          foreground: const Color(0xFFB45309),
+        );
+      case ZeroTierRuntimeEventType.nodeOffline:
+        return _RuntimeSignal(
+          label: '节点当前离线',
+          message: highlightedEvent.message?.trim().isNotEmpty == true
+              ? highlightedEvent.message!
+              : 'ZeroTier 节点当前失去在线连接，这更像是连通性抖动，不等同于进程重启。',
+          icon: Icons.wifi_off_rounded,
+          background: const Color(0xFFFFF4E8),
+          foreground: const Color(0xFFB45309),
+        );
+      case ZeroTierRuntimeEventType.networkOnline:
+        return _RuntimeSignal(
+          label: '网络已在线',
+          message: highlightedEvent.message?.trim().isNotEmpty == true
+              ? highlightedEvent.message!
+              : 'ZeroTier 网络已经进入在线状态，可以继续观察地址分配与互通性。',
+          icon: Icons.check_circle_rounded,
+          background: const Color(0xFFEAF8EF),
+          foreground: const Color(0xFF15803D),
+        );
+      case ZeroTierRuntimeEventType.networkLeft:
+        return _RuntimeSignal(
+          label: '已离开网络',
+          message: highlightedEvent.message?.trim().isNotEmpty == true
+              ? highlightedEvent.message!
+              : '本机已经完成离网，当前可以继续观察本地链路是否稳定。',
+          icon: Icons.logout_rounded,
+          background: const Color(0xFFEAF2FF),
+          foreground: const Color(0xFF1D4ED8),
+        );
+      case ZeroTierRuntimeEventType.error:
+        return _RuntimeSignal(
+          label: '运行异常',
+          message: highlightedEvent.message?.trim().isNotEmpty == true
+              ? highlightedEvent.message!
+              : 'ZeroTier 运行时返回了错误，请结合最近事件与本地状态排查。',
+          icon: Icons.error_outline_rounded,
+          background: const Color(0xFFFFE9E9),
+          foreground: const Color(0xFFB91C1C),
+        );
+      case ZeroTierRuntimeEventType.environmentReady:
+      case ZeroTierRuntimeEventType.permissionRequired:
+      case ZeroTierRuntimeEventType.nodeStarted:
+      case ZeroTierRuntimeEventType.nodeOnline:
+      case ZeroTierRuntimeEventType.nodeStopped:
+      case ZeroTierRuntimeEventType.networkJoining:
+      case ZeroTierRuntimeEventType.ipAssigned:
+        break;
+    }
+  }
+
+  switch (runtimeStatus.serviceState) {
+    case 'running':
+      return const _RuntimeSignal(
+        label: '运行稳定',
+        message: 'ZeroTier runtime 正在运行，等待新的组网事件或网络状态变化。',
+        icon: Icons.verified_rounded,
+        background: Color(0xFFEAF8EF),
+        foreground: Color(0xFF15803D),
+      );
+    case 'offline':
+      return const _RuntimeSignal(
+        label: '节点离线',
+        message: 'ZeroTier 节点当前未在线，但本地 runtime 仍然存活；这更像是离线状态，不等同于重新启动中。',
+        icon: Icons.wifi_off_rounded,
+        background: Color(0xFFFFF4E8),
+        foreground: Color(0xFFB45309),
+      );
+    case 'starting':
+      return const _RuntimeSignal(
+        label: '正在启动',
+        message: '本机 ZeroTier runtime 已开始启动，Node ID 与网络状态会在后续事件中回流。',
+        icon: Icons.autorenew_rounded,
+        background: Color(0xFFEAF2FF),
+        foreground: Color(0xFF1D4ED8),
+      );
+    case 'prepared':
+      return const _RuntimeSignal(
+        label: '本地已就绪',
+        message: '运行时环境已经准备完成，下一步可以发起节点启动和入网动作。',
+        icon: Icons.construction_rounded,
+        background: Color(0xFFFFF4E8),
+        foreground: Color(0xFFB45309),
+      );
+    case 'unavailable':
+      return const _RuntimeSignal(
+        label: '运行时不可用',
+        message: '本机尚未完成 ZeroTier runtime 初始化，当前无法执行真实组网动作。',
+        icon: Icons.portable_wifi_off_rounded,
+        background: Color(0xFFFFF4E8),
+        foreground: Color(0xFFB45309),
+      );
+    case 'error':
+      return const _RuntimeSignal(
+        label: '运行异常',
+        message: 'ZeroTier runtime 当前处于异常状态，请查看最近事件与错误详情。',
+        icon: Icons.error_outline_rounded,
+        background: Color(0xFFFFE9E9),
+        foreground: Color(0xFFB91C1C),
+      );
+    default:
+      return _RuntimeSignal(
+        label: '状态 ${runtimeStatus.serviceState}',
+        message: '运行时已经回传状态信息，当前展示的是底层 serviceState 原始值。',
+        icon: Icons.info_outline_rounded,
+        background: const Color(0xFFEAF2FF),
+        foreground: const Color(0xFF1D4ED8),
+      );
+  }
+}
+
+_NetworkVisualState _resolveNetworkVisualState({
+  required ZeroTierNetworkState? localState,
+  required String? managedStatus,
+  required bool isBusy,
+  required String? lastError,
+  required String runtimeServiceState,
+}) {
+  if (lastError?.trim().isNotEmpty == true) {
+    return const _NetworkVisualState(
+      label: '运行异常',
+      message: '这条组网链路最近出现了错误，请优先查看上方运行时状态和最近事件。',
+      icon: Icons.error_outline_rounded,
+      background: Color(0xFFFFE9E9),
+      foreground: Color(0xFFB91C1C),
+    );
+  }
+
+  if (runtimeServiceState == 'offline') {
+    return const _NetworkVisualState(
+      label: '节点离线',
+      message: '本地 ZeroTier 节点当前离线，网络条目暂不视为可继续操作完成。',
+      icon: Icons.wifi_off_rounded,
+      background: Color(0xFFFFF4E8),
+      foreground: Color(0xFFB45309),
+    );
+  }
+
+  if (localState == null) {
+    if (isBusy) {
+      return const _NetworkVisualState(
+        label: '正在编排',
+        message: '当前正在等待本机 Agent 和 ZeroTier runtime 完成入网或离网收口动作。',
+        icon: Icons.sync_rounded,
+        background: Color(0xFFEAF2FF),
+        foreground: Color(0xFF1D4ED8),
+      );
+    }
+    return _NetworkVisualState(
+      label: '尚未接入',
+      message: managedStatus?.trim().isNotEmpty == true
+          ? '服务端已记录这条网络，但本机当前还没有检测到对应的 ZeroTier 本地映射。'
+          : '本机当前还未接入这条网络。',
+      icon: Icons.link_off_rounded,
+      background: const Color(0xFFF3F4F6),
+      foreground: const Color(0xFF4B5563),
+    );
+  }
+
+  if (localState.status == 'ACCESS_DENIED' || !localState.isAuthorized) {
+    return const _NetworkVisualState(
+      label: '等待网络授权',
+      message: 'ZeroTier 已看到这条网络，但当前仍处于等待授权阶段，还不能视为组网完成。',
+      icon: Icons.schedule_rounded,
+      background: Color(0xFFFFF4E8),
+      foreground: Color(0xFFB45309),
+    );
+  }
+
+  if (localState.isConnected ||
+      localState.assignedAddresses.isNotEmpty ||
+      localState.status == 'OK') {
+    return const _NetworkVisualState(
+      label: '网络已在线',
+      message: '本机已经接入这条网络，当前可以继续查看托管地址与后续可达性。',
+      icon: Icons.check_circle_rounded,
+      background: Color(0xFFEAF8EF),
+      foreground: Color(0xFF15803D),
+    );
+  }
+
+  if (localState.status == 'REQUESTING_CONFIGURATION' || isBusy) {
+    return const _NetworkVisualState(
+      label: '正在入网',
+      message: '本机已经发起 ZeroTier 入网，正在等待配置下发与网络状态收敛。',
+      icon: Icons.sync_rounded,
+      background: Color(0xFFEAF2FF),
+      foreground: Color(0xFF1D4ED8),
+    );
+  }
+
+  if (localState.status == 'NOT_FOUND' ||
+      localState.status == 'PORT_ERROR' ||
+      localState.status == 'CLIENT_TOO_OLD') {
+    return _NetworkVisualState(
+      label: '网络异常',
+      message: 'ZeroTier 返回状态 ${localState.status}，当前这条网络链路没有正常完成。',
+      icon: Icons.error_outline_rounded,
+      background: const Color(0xFFFFE9E9),
+      foreground: const Color(0xFFB91C1C),
+    );
+  }
+
+  return _NetworkVisualState(
+    label: '状态 ${localState.status}',
+    message: '当前本地网络已经回传状态，但仍需要继续等待或观察后续事件。',
+    icon: Icons.info_outline_rounded,
+    background: const Color(0xFFEAF2FF),
+    foreground: const Color(0xFF1D4ED8),
+  );
+}
+
+_RuntimeEventStyle _runtimeEventStyle(ZeroTierRuntimeEventType type) {
+  switch (type) {
+    case ZeroTierRuntimeEventType.error:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFFFE9E9),
+        foreground: Color(0xFFB91C1C),
+        icon: Icons.error_outline_rounded,
+      );
+    case ZeroTierRuntimeEventType.networkWaitingAuthorization:
+    case ZeroTierRuntimeEventType.nodeOffline:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFFFF4E8),
+        foreground: Color(0xFFB45309),
+        icon: Icons.schedule_rounded,
+      );
+    case ZeroTierRuntimeEventType.networkLeft:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFEAF2FF),
+        foreground: Color(0xFF1D4ED8),
+        icon: Icons.logout_rounded,
+      );
+    case ZeroTierRuntimeEventType.networkOnline:
+    case ZeroTierRuntimeEventType.ipAssigned:
+    case ZeroTierRuntimeEventType.nodeStarted:
+    case ZeroTierRuntimeEventType.nodeOnline:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFEAF8EF),
+        foreground: Color(0xFF15803D),
+        icon: Icons.check_circle_rounded,
+      );
+    case ZeroTierRuntimeEventType.environmentReady:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFEAF8EF),
+        foreground: Color(0xFF15803D),
+        icon: Icons.inventory_2_rounded,
+      );
+    case ZeroTierRuntimeEventType.networkJoining:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFEAF2FF),
+        foreground: Color(0xFF1D4ED8),
+        icon: Icons.sync_rounded,
+      );
+    case ZeroTierRuntimeEventType.permissionRequired:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFFFF4E8),
+        foreground: Color(0xFFB45309),
+        icon: Icons.lock_outline_rounded,
+      );
+    case ZeroTierRuntimeEventType.nodeStopped:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFF3F4F6),
+        foreground: Color(0xFF4B5563),
+        icon: Icons.pause_circle_outline_rounded,
+      );
+  }
+}
+
+String _runtimeEventTitle(ZeroTierRuntimeEventType type) {
+  switch (type) {
+    case ZeroTierRuntimeEventType.environmentReady:
+      return '环境已就绪';
+    case ZeroTierRuntimeEventType.permissionRequired:
+      return '需要额外权限';
+    case ZeroTierRuntimeEventType.nodeStarted:
+      return '节点已启动';
+    case ZeroTierRuntimeEventType.nodeOnline:
+      return '节点已在线';
+    case ZeroTierRuntimeEventType.nodeOffline:
+      return '节点离线';
+    case ZeroTierRuntimeEventType.nodeStopped:
+      return '节点已停止';
+    case ZeroTierRuntimeEventType.networkJoining:
+      return '正在入网';
+    case ZeroTierRuntimeEventType.networkWaitingAuthorization:
+      return '等待网络授权';
+    case ZeroTierRuntimeEventType.networkOnline:
+      return '网络已在线';
+    case ZeroTierRuntimeEventType.networkLeft:
+      return '已离开网络';
+    case ZeroTierRuntimeEventType.ipAssigned:
+      return '地址已分配';
+    case ZeroTierRuntimeEventType.error:
+      return '运行异常';
+  }
+}
+
+String _runtimeEventFallbackMessage(ZeroTierRuntimeEventType type) {
+  switch (type) {
+    case ZeroTierRuntimeEventType.environmentReady:
+      return 'ZeroTier 运行时环境已经准备完成。';
+    case ZeroTierRuntimeEventType.permissionRequired:
+      return '当前动作仍需要额外权限或手动设置。';
+    case ZeroTierRuntimeEventType.nodeStarted:
+      return '本机 ZeroTier 节点已经收到启动动作。';
+    case ZeroTierRuntimeEventType.nodeOnline:
+      return '本机 ZeroTier 节点当前已经在线。';
+    case ZeroTierRuntimeEventType.nodeOffline:
+      return '本机 ZeroTier 节点当前离线，这更像是连通性问题，不等同于进程重启。';
+    case ZeroTierRuntimeEventType.nodeStopped:
+      return '本机 ZeroTier 节点当前已停止。';
+    case ZeroTierRuntimeEventType.networkJoining:
+      return '已发起入网，正在等待网络侧返回更明确状态。';
+    case ZeroTierRuntimeEventType.networkWaitingAuthorization:
+      return '当前网络仍在等待授权，暂时还不能视为入网成功。';
+    case ZeroTierRuntimeEventType.networkOnline:
+      return '网络已进入在线状态，可以继续观察地址和可达性。';
+    case ZeroTierRuntimeEventType.networkLeft:
+      return '本机已完成离网。';
+    case ZeroTierRuntimeEventType.ipAssigned:
+      return '网络已经为本机分配托管地址。';
+    case ZeroTierRuntimeEventType.error:
+      return '运行时返回了错误，请结合上方状态和最近事件排查。';
   }
 }
