@@ -11,6 +11,7 @@ add_executable(${BINARY_NAME} WIN32
   "main.cpp"
   "utils.cpp"
   "win32_window.cpp"
+  "../native/zerotier/zerotier_windows_adapter_bridge.cpp"
   "../native/zerotier/zerotier_windows_firewall_manager.cpp"
   "../native/zerotier/zerotier_windows_network_manager.cpp"
   "../native/zerotier/zerotier_windows_plugin.cpp"

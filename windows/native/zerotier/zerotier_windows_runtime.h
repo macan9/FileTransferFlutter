@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include "native/zerotier/zerotier_windows_adapter_bridge.h"
+
 struct ZeroTierWindowsNetworkRecord {
   uint64_t network_id = 0;
   std::string network_name;
@@ -59,6 +61,7 @@ class ZeroTierWindowsRuntime {
   flutter::EncodableMap BuildNetworkDiagnosticsPayloadLocked(
       uint64_t network_id, int event_code = 0,
       const std::string& trigger = "") const;
+  flutter::EncodableMap BuildAdapterDiagnosticsPayloadLocked() const;
   uint64_t NextNetworkGenerationLocked(uint64_t network_id);
   void RefreshSnapshot();
   void LoadKnownNetworkIdsLocked();
@@ -88,6 +91,7 @@ class ZeroTierWindowsRuntime {
   mutable std::recursive_mutex api_mutex_;
   mutable std::condition_variable state_cv_;
   std::map<uint64_t, ZeroTierWindowsNetworkRecord> networks_;
+  std::set<uint64_t> pending_join_networks_;
   std::set<uint64_t> leaving_networks_;
   std::set<uint64_t> known_network_ids_;
   std::map<uint64_t, std::string> leave_request_sources_;
@@ -109,6 +113,8 @@ class ZeroTierWindowsRuntime {
   uint64_t next_network_generation_ = 0;
   int major_version_ = 0;
   int minor_version_ = 0;
+  ZeroTierWindowsAdapterBridge adapter_bridge_;
+  ZeroTierWindowsAdapterBridge::ProbeResult adapter_probe_;
 };
 
 #endif  // FLUTTER_RUNNER_ZEROTIER_WINDOWS_RUNTIME_H_

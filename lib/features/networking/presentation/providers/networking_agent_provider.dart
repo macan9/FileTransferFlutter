@@ -185,6 +185,7 @@ class NetworkingAgentRuntimeController
   bool _busyBootstrapping = false;
   bool _busyPolling = false;
   bool _suppressCommandPollingDuringRuntimeRecovery = false;
+  int _runtimeRefreshRevision = 0;
 
   NetworkingService get _networkingService =>
       ref.read(networkingServiceProvider);
@@ -525,14 +526,6 @@ class NetworkingAgentRuntimeController
       );
       return;
     }
-    if (state.isNetworkTransitioning) {
-      debugPrint(
-        'Skip polling agent commands while ZeroTier network transition is in progress: '
-        'networkId=${state.transitioningNetworkId ?? '-'}, '
-        'label=${state.networkTransitionLabel ?? '-'}',
-      );
-      return;
-    }
     final AppConfig config = ref.read(appConfigProvider);
     if (config.agentToken.trim().isEmpty ||
         config.deviceId.trim().isEmpty ||
@@ -618,11 +611,9 @@ class NetworkingAgentRuntimeController
               'Executing agent command: id=${command.id}, type=${command.type}, '
               'networkId=$networkId, sessionId=${command.sessionId ?? '-'}',
             );
-            await _ensureNodeOnlineForJoin();
-            await _zeroTierService.joinNetworkAndWaitForIp(networkId);
-            if (_shouldWaitInDartForNetworkJoin) {
-              await _waitForNetworkReady(networkId);
-            }
+            await _joinNetworkWithRecovery(networkId);
+            await _refreshRuntimeStatus();
+            await ref.read(networkingProvider.notifier).refresh();
             break;
           }
         case 'leave_zerotier_network':
@@ -640,6 +631,17 @@ class NetworkingAgentRuntimeController
               'networkId=$networkId, sessionId=${command.sessionId ?? '-'}, '
               'source=$leaveSource',
             );
+            if (await _shouldSuppressLeaveCommand(
+              config,
+              command: command,
+              networkId: networkId,
+            )) {
+              debugPrint(
+                'Skipping stale leave command: id=${command.id}, '
+                'networkId=$networkId because a newer join command is pending.',
+              );
+              break;
+            }
             await _zeroTierService.leaveNetwork(
               networkId,
               source: leaveSource,
@@ -647,6 +649,8 @@ class NetworkingAgentRuntimeController
             if (_shouldWaitInDartForNetworkLeave) {
               await _waitForNetworkLeft(networkId);
             }
+            await _refreshRuntimeStatus();
+            await ref.read(networkingProvider.notifier).refresh();
             break;
           }
         case 'apply_firewall_rules':
@@ -724,9 +728,14 @@ class NetworkingAgentRuntimeController
   }
 
   Future<void> _refreshRuntimeStatus() async {
+    final int revision = ++_runtimeRefreshRevision;
     try {
       final ZeroTierRuntimeStatus previous = state.runtimeStatus;
       ZeroTierRuntimeStatus status = await _zeroTierService.detectStatus();
+      if (revision != _runtimeRefreshRevision) {
+        return;
+      }
+      status = _stabilizeTransientWindowsStatus(previous, status);
       if (_shouldClearRecoveredRuntimeError(status)) {
         status = status.copyWith(clearLastError: true);
       }
@@ -737,10 +746,211 @@ class NetworkingAgentRuntimeController
         clearLastError: status.lastError?.trim().isNotEmpty != true,
       );
     } catch (error) {
+      if (revision != _runtimeRefreshRevision) {
+        return;
+      }
       state = state.copyWith(
         lastError: error is RealtimeError ? error.message : '$error',
       );
     }
+  }
+
+  Future<void> _joinNetworkWithRecovery(String networkId) async {
+    await _ensureNodeOnlineForJoin();
+    try {
+      await _zeroTierService.joinNetworkAndWaitForIp(
+        networkId,
+        timeout: _joinWaitTimeout,
+      );
+    } catch (error) {
+      if (!_shouldAttemptWindowsJoinRecovery(error)) {
+        rethrow;
+      }
+      debugPrint(
+        'ZeroTier join recovery: networkId=$networkId, '
+        'reason=${error is RealtimeError ? error.message : error}',
+      );
+      await _recoverWindowsJoinMapping(networkId);
+    }
+
+    if (_shouldWaitInDartForNetworkJoin) {
+      await _waitForNetworkReady(networkId);
+    }
+  }
+
+  bool _shouldAttemptWindowsJoinRecovery(Object error) {
+    if (!Platform.isWindows) {
+      return false;
+    }
+    final String message =
+        error is RealtimeError ? error.message.toLowerCase() : '$error'.toLowerCase();
+    return message.contains('timed out waiting for a managed address') ||
+        message.contains('requesting_configuration') ||
+        message.contains('node stayed offline');
+  }
+
+  Future<void> _recoverWindowsJoinMapping(String networkId) async {
+    try {
+      await _zeroTierService.leaveNetwork(
+        networkId,
+        source: 'agent.windows-recovery',
+      );
+      debugPrint(
+        'ZeroTier join recovery: local leave requested for networkId=$networkId',
+      );
+    } catch (error) {
+      debugPrint(
+        'ZeroTier join recovery: leave skipped for networkId=$networkId, '
+        'reason=${error is RealtimeError ? error.message : error}',
+      );
+    }
+
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    final ZeroTierRuntimeStatus restarted = await _zeroTierService.startNode();
+    debugPrint(
+      'ZeroTier join recovery: startNode result '
+      'serviceState=${restarted.serviceState}, '
+      'isNodeRunning=${restarted.isNodeRunning}, '
+      'joinedNetworks=${restarted.joinedNetworks.length}, '
+      'lastError=${restarted.lastError ?? '-'}',
+    );
+    await _ensureNodeOnlineForJoin();
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    await _zeroTierService.joinNetworkAndWaitForIp(
+      networkId,
+      timeout: _joinWaitTimeout,
+    );
+  }
+
+  Future<bool> _shouldSuppressLeaveCommand(
+    AppConfig config, {
+    required NetworkAgentCommand command,
+    required String networkId,
+  }) async {
+    final List<NetworkAgentCommand> latestCommands =
+        await _networkingService.fetchAgentCommands(
+      deviceId: config.deviceId,
+      agentToken: config.agentToken,
+    );
+    final DateTime commandCreatedAt =
+        command.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+    for (final NetworkAgentCommand candidate in latestCommands) {
+      if (candidate.type != 'join_zerotier_network' ||
+          candidate.isCancelled ||
+          candidate.isFinal) {
+        continue;
+      }
+      final String candidateNetworkId =
+          candidate.payload['networkId']?.toString() ?? '';
+      if (candidateNetworkId.trim() != networkId.trim()) {
+        continue;
+      }
+      final DateTime candidateCreatedAt =
+          candidate.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+      if (!candidateCreatedAt.isBefore(commandCreatedAt)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  ZeroTierRuntimeStatus _stabilizeTransientWindowsStatus(
+    ZeroTierRuntimeStatus previous,
+    ZeroTierRuntimeStatus next,
+  ) {
+    if (!Platform.isWindows) {
+      return next;
+    }
+    final ZeroTierRuntimeStatus merged = _mergeTransientRegressedNetworks(
+      previous,
+      next,
+    );
+    if (merged != next) {
+      return merged;
+    }
+    if (next.joinedNetworks.isNotEmpty || previous.joinedNetworks.isEmpty) {
+      return next;
+    }
+    if (state.isNetworkTransitioning &&
+        state.transitioningNetworkId?.trim().isNotEmpty == true) {
+      return next;
+    }
+
+    final ZeroTierRuntimeEventType? lastEventType = state.lastRuntimeEvent?.type;
+    final bool sawSuccessfulNetworkEvent =
+        lastEventType == ZeroTierRuntimeEventType.networkOnline ||
+            lastEventType == ZeroTierRuntimeEventType.ipAssigned;
+    final bool previousHadUsableNetwork = previous.joinedNetworks.any(
+      (ZeroTierNetworkState item) =>
+          item.isConnected ||
+          item.assignedAddresses.isNotEmpty ||
+          item.status == 'OK',
+    );
+    final bool nextLooksTransient = next.serviceState == 'offline' ||
+        next.serviceState == 'starting' ||
+        next.serviceState == 'error';
+
+    if (!sawSuccessfulNetworkEvent ||
+        !previousHadUsableNetwork ||
+        !nextLooksTransient) {
+      return next;
+    }
+
+    debugPrint(
+      'ZeroTier runtime status: retaining previous joined networks during '
+      'transient Windows runtime wobble. '
+      'previous=${_summarizeNetworks(previous.joinedNetworks)}, '
+      'nextServiceState=${next.serviceState}, '
+      'lastEvent=${lastEventType?.name ?? '-'}',
+    );
+    return next.copyWith(joinedNetworks: previous.joinedNetworks);
+  }
+
+  ZeroTierRuntimeStatus _mergeTransientRegressedNetworks(
+    ZeroTierRuntimeStatus previous,
+    ZeroTierRuntimeStatus next,
+  ) {
+    if (previous.joinedNetworks.isEmpty || next.joinedNetworks.isEmpty) {
+      return next;
+    }
+
+    final Map<String, ZeroTierNetworkState> previousById =
+        <String, ZeroTierNetworkState>{
+      for (final ZeroTierNetworkState item in previous.joinedNetworks)
+        item.networkId.trim().toLowerCase(): item,
+    };
+
+    bool changed = false;
+    final List<ZeroTierNetworkState> merged = next.joinedNetworks
+        .map((ZeroTierNetworkState current) {
+      final String key = current.networkId.trim().toLowerCase();
+      final ZeroTierNetworkState? prev = previousById[key];
+      if (prev == null) {
+        return current;
+      }
+      final bool prevReady = prev.status == 'OK' &&
+          (prev.isConnected || prev.assignedAddresses.isNotEmpty);
+      final bool currentRegressed = current.status == 'REQUESTING_CONFIGURATION' &&
+          !current.isConnected &&
+          current.assignedAddresses.isEmpty;
+      if (!prevReady || !currentRegressed) {
+        return current;
+      }
+      changed = true;
+      return prev;
+    }).toList(growable: false);
+
+    if (!changed) {
+      return next;
+    }
+
+    debugPrint(
+      'ZeroTier runtime status: retained previous ready network state to '
+      'avoid transient REQUESTING_CONFIGURATION regression. '
+      'previous=${_summarizeNetworks(previous.joinedNetworks)}, '
+      'next=${_summarizeNetworks(next.joinedNetworks)}',
+    );
+    return next.copyWith(joinedNetworks: merged);
   }
 
   Future<ZeroTierRuntimeStatus> _waitForNodeReady() async {
@@ -991,6 +1201,10 @@ class NetworkingAgentRuntimeController
 
   bool get _shouldWaitInDartForNetworkLeave => !Platform.isWindows;
 
+  Duration get _joinWaitTimeout => Platform.isWindows
+      ? const Duration(minutes: 2)
+      : const Duration(seconds: 30);
+
   bool _isTerminalNetworkFailure(String status) {
     switch (status) {
       case 'NOT_FOUND':
@@ -1062,10 +1276,89 @@ class NetworkingAgentRuntimeController
         _ => false,
       },
     );
+    _applyRuntimeEventNetworkSnapshot(event);
     unawaited(_refreshRuntimeStatus());
     if (_shouldRefreshDashboard(event)) {
       unawaited(ref.read(networkingProvider.notifier).refresh());
     }
+  }
+
+  void _applyRuntimeEventNetworkSnapshot(ZeroTierRuntimeEvent event) {
+    if (!Platform.isWindows) {
+      return;
+    }
+    final String networkId = event.networkId?.trim() ?? '';
+    if (networkId.isEmpty) {
+      return;
+    }
+    switch (event.type) {
+      case ZeroTierRuntimeEventType.networkOnline:
+      case ZeroTierRuntimeEventType.ipAssigned:
+        break;
+      default:
+        return;
+    }
+
+    final List<String> payloadAddresses = _readEventNetworkAddresses(event);
+    final String payloadStatus =
+        (event.payload['networkStatus']?.toString().trim().toUpperCase() ?? '');
+    final bool connectedFromPayload =
+        (event.payload['networkConnected'] as bool?) == true;
+
+    final List<ZeroTierNetworkState> networks =
+        List<ZeroTierNetworkState>.from(state.runtimeStatus.joinedNetworks);
+    final int existingIndex = networks.indexWhere(
+      (ZeroTierNetworkState item) =>
+          item.networkId.trim().toLowerCase() == networkId.toLowerCase(),
+    );
+    final ZeroTierNetworkState previous = existingIndex >= 0
+        ? networks[existingIndex]
+        : ZeroTierNetworkState(
+            networkId: networkId,
+            networkName: '',
+            status: 'OK',
+            assignedAddresses: const <String>[],
+            isAuthorized: true,
+            isConnected: false,
+          );
+
+    final List<String> mergedAddresses = payloadAddresses.isNotEmpty
+        ? payloadAddresses
+        : previous.assignedAddresses;
+    final bool mergedConnected =
+        mergedAddresses.isNotEmpty || connectedFromPayload || previous.isConnected;
+    final String mergedStatus =
+        payloadStatus.isNotEmpty ? payloadStatus : 'OK';
+
+    final ZeroTierNetworkState patched = ZeroTierNetworkState(
+      networkId: previous.networkId,
+      networkName: previous.networkName,
+      status: mergedStatus,
+      assignedAddresses: mergedAddresses,
+      isAuthorized: true,
+      isConnected: mergedConnected,
+    );
+
+    if (existingIndex >= 0) {
+      networks[existingIndex] = patched;
+    } else {
+      networks.add(patched);
+    }
+    state = state.copyWith(
+      runtimeStatus: state.runtimeStatus.copyWith(joinedNetworks: networks),
+    );
+  }
+
+  List<String> _readEventNetworkAddresses(ZeroTierRuntimeEvent event) {
+    final Object? raw =
+        event.payload['networkAddresses'] ?? event.payload['assignedAddresses'];
+    if (raw is! List) {
+      return const <String>[];
+    }
+    return raw
+        .map((Object? item) => item?.toString() ?? '')
+        .where((String item) => item.trim().isNotEmpty)
+        .toList(growable: false);
   }
 
   bool _shouldIgnoreRuntimeEvent(ZeroTierRuntimeEvent event) {
@@ -1139,8 +1432,23 @@ class NetworkingAgentRuntimeController
       'isNodeRunning=${next.isNodeRunning}, '
       'nodeId=${next.nodeId.isEmpty ? '-' : next.nodeId}, '
       'joinedNetworks=${next.joinedNetworks.length}, '
+      'networks=${_summarizeNetworks(next.joinedNetworks)}, '
       'lastError=${next.lastError ?? '-'}',
     );
+  }
+
+  String _summarizeNetworks(List<ZeroTierNetworkState> networks) {
+    if (networks.isEmpty) {
+      return '-';
+    }
+    return networks
+        .map(
+          (ZeroTierNetworkState item) =>
+              '${item.networkId}:${item.status}:'
+              '${item.assignedAddresses.isEmpty ? "-" : item.assignedAddresses.join("|")}:'
+              'connected=${item.isConnected}',
+        )
+        .join(',');
   }
 
   bool _shouldRefreshDashboard(ZeroTierRuntimeEvent event) {
