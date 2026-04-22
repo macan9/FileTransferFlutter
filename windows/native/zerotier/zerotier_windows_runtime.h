@@ -22,6 +22,37 @@ struct ZeroTierWindowsNetworkRecord {
   std::vector<std::string> assigned_addresses;
   bool is_authorized = false;
   bool is_connected = false;
+  bool local_interface_ready = false;
+  std::string matched_interface_name;
+  bool matched_interface_up = false;
+  std::string local_mount_state = "unknown";
+  int last_event_code = 0;
+  std::string last_event_name;
+  std::string last_event_at_utc;
+  int last_event_status_code = 0;
+  int last_event_network_type = 0;
+  int last_event_netconf_rev = 0;
+  int last_event_assigned_addr_count = 0;
+  int last_event_transport_ready = 0;
+  int last_probe_status_code = 0;
+  std::string last_probe_at_utc;
+  int last_probe_transport_ready = 0;
+  int last_probe_addr_result = 0;
+  std::string last_probe_addr_result_name;
+  int last_probe_assigned_addr_count = 0;
+  int last_probe_network_type = 0;
+  bool last_probe_pending_join = false;
+  std::string join_trace_started_at_utc;
+  std::string join_event_sequence;
+  bool join_saw_req_config = false;
+  bool join_saw_ready_ip4 = false;
+  bool join_saw_ready_ip6 = false;
+  bool join_saw_ready_ip4_ip6 = false;
+  bool join_saw_network_ok = false;
+  bool join_saw_network_down = false;
+  bool join_saw_addr_added_ip4 = false;
+  bool join_saw_addr_added_ip6 = false;
+  bool join_trace_active = false;
 };
 
 class ZeroTierWindowsRuntime {
@@ -45,6 +76,7 @@ class ZeroTierWindowsRuntime {
 
   flutter::EncodableList ListNetworks() const;
   std::optional<flutter::EncodableMap> GetNetworkDetail(uint64_t network_id) const;
+  flutter::EncodableMap ProbeNetworkStateNow(uint64_t network_id);
 
  private:
   static void HandleLibztEvent(void* message_ptr);

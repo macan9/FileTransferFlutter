@@ -782,8 +782,9 @@ class NetworkingAgentRuntimeController
     if (!Platform.isWindows) {
       return false;
     }
-    final String message =
-        error is RealtimeError ? error.message.toLowerCase() : '$error'.toLowerCase();
+    final String message = error is RealtimeError
+        ? error.message.toLowerCase()
+        : '$error'.toLowerCase();
     return message.contains('timed out waiting for a managed address') ||
         message.contains('requesting_configuration') ||
         message.contains('node stayed offline');
@@ -876,15 +877,16 @@ class NetworkingAgentRuntimeController
       return next;
     }
 
-    final ZeroTierRuntimeEventType? lastEventType = state.lastRuntimeEvent?.type;
+    final ZeroTierRuntimeEventType? lastEventType =
+        state.lastRuntimeEvent?.type;
     final bool sawSuccessfulNetworkEvent =
         lastEventType == ZeroTierRuntimeEventType.networkOnline ||
             lastEventType == ZeroTierRuntimeEventType.ipAssigned;
     final bool previousHadUsableNetwork = previous.joinedNetworks.any(
       (ZeroTierNetworkState item) =>
+          item.localInterfaceReady ||
           item.isConnected ||
-          item.assignedAddresses.isNotEmpty ||
-          item.status == 'OK',
+          item.assignedAddresses.isNotEmpty,
     );
     final bool nextLooksTransient = next.serviceState == 'offline' ||
         next.serviceState == 'starting' ||
@@ -921,18 +923,21 @@ class NetworkingAgentRuntimeController
     };
 
     bool changed = false;
-    final List<ZeroTierNetworkState> merged = next.joinedNetworks
-        .map((ZeroTierNetworkState current) {
+    final List<ZeroTierNetworkState> merged =
+        next.joinedNetworks.map((ZeroTierNetworkState current) {
       final String key = current.networkId.trim().toLowerCase();
       final ZeroTierNetworkState? prev = previousById[key];
       if (prev == null) {
         return current;
       }
       final bool prevReady = prev.status == 'OK' &&
-          (prev.isConnected || prev.assignedAddresses.isNotEmpty);
-      final bool currentRegressed = current.status == 'REQUESTING_CONFIGURATION' &&
-          !current.isConnected &&
-          current.assignedAddresses.isEmpty;
+          (prev.localInterfaceReady ||
+              prev.isConnected ||
+              prev.assignedAddresses.isNotEmpty);
+      final bool currentRegressed =
+          current.status == 'REQUESTING_CONFIGURATION' &&
+              !current.isConnected &&
+              current.assignedAddresses.isEmpty;
       if (!prevReady || !currentRegressed) {
         return current;
       }
@@ -1095,7 +1100,9 @@ class NetworkingAgentRuntimeController
               : 'ZeroTier network failed with status ${network.status}.',
         );
       }
-      if (network.assignedAddresses.isNotEmpty || network.isConnected) {
+      if (network.localInterfaceReady ||
+          network.assignedAddresses.isNotEmpty ||
+          network.isConnected) {
         return;
       }
     }
@@ -1320,15 +1327,31 @@ class NetworkingAgentRuntimeController
             assignedAddresses: const <String>[],
             isAuthorized: true,
             isConnected: false,
+            localInterfaceReady: false,
+            matchedInterfaceName: '',
+            matchedInterfaceUp: false,
+            localMountState: 'unknown',
           );
 
     final List<String> mergedAddresses = payloadAddresses.isNotEmpty
         ? payloadAddresses
         : previous.assignedAddresses;
-    final bool mergedConnected =
-        mergedAddresses.isNotEmpty || connectedFromPayload || previous.isConnected;
-    final String mergedStatus =
-        payloadStatus.isNotEmpty ? payloadStatus : 'OK';
+    final bool mergedConnected = mergedAddresses.isNotEmpty ||
+        connectedFromPayload ||
+        previous.isConnected;
+    final bool mergedLocalInterfaceReady =
+        (event.payload['localInterfaceReady'] as bool?) == true ||
+            previous.localInterfaceReady;
+    final String mergedMatchedInterfaceName =
+        event.payload['matchedInterfaceName']?.toString() ??
+            previous.matchedInterfaceName;
+    final bool mergedMatchedInterfaceUp =
+        (event.payload['matchedInterfaceUp'] as bool?) == true ||
+            previous.matchedInterfaceUp;
+    final String mergedLocalMountState =
+        event.payload['localMountState']?.toString() ??
+            previous.localMountState;
+    final String mergedStatus = payloadStatus.isNotEmpty ? payloadStatus : 'OK';
 
     final ZeroTierNetworkState patched = ZeroTierNetworkState(
       networkId: previous.networkId,
@@ -1337,6 +1360,10 @@ class NetworkingAgentRuntimeController
       assignedAddresses: mergedAddresses,
       isAuthorized: true,
       isConnected: mergedConnected,
+      localInterfaceReady: mergedLocalInterfaceReady,
+      matchedInterfaceName: mergedMatchedInterfaceName,
+      matchedInterfaceUp: mergedMatchedInterfaceUp,
+      localMountState: mergedLocalMountState,
     );
 
     if (existingIndex >= 0) {
@@ -1397,9 +1424,9 @@ class NetworkingAgentRuntimeController
     }
     final bool hasActiveJoinedNetwork = status.joinedNetworks.any(
       (ZeroTierNetworkState item) =>
+          item.localInterfaceReady ||
           item.isConnected ||
-          item.assignedAddresses.isNotEmpty ||
-          item.status == 'OK',
+          item.assignedAddresses.isNotEmpty,
     );
     return status.serviceState == 'running' && hasActiveJoinedNetwork;
   }
@@ -1409,7 +1436,9 @@ class NetworkingAgentRuntimeController
     if (text.isEmpty) {
       return false;
     }
-    return text.contains('timed out waiting for a managed address');
+    return text.contains('timed out waiting for a managed address') ||
+        text.contains(
+            'timed out waiting for zerotier to mount the managed address');
   }
 
   void _logRuntimeStatusChange(
@@ -1443,10 +1472,11 @@ class NetworkingAgentRuntimeController
     }
     return networks
         .map(
-          (ZeroTierNetworkState item) =>
-              '${item.networkId}:${item.status}:'
+          (ZeroTierNetworkState item) => '${item.networkId}:${item.status}:'
               '${item.assignedAddresses.isEmpty ? "-" : item.assignedAddresses.join("|")}:'
-              'connected=${item.isConnected}',
+              'connected=${item.isConnected}:'
+              'localReady=${item.localInterfaceReady}:'
+              'mount=${item.localMountState}',
         )
         .join(',');
   }

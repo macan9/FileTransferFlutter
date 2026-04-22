@@ -64,6 +64,82 @@ namespace ZeroTier {
 
 namespace {
 
+static bool _isAssignModeEnabled(const json &assignMode, const char *key)
+{
+	return (assignMode.is_object() && key && OSUtils::jsonBool(assignMode[key],false));
+}
+
+static bool _networkHasManagedIpConfig(const json &network)
+{
+	const json &routes = network["routes"];
+	const json &pools = network["ipAssignmentPools"];
+	return (
+		((routes.is_array()) && (!routes.empty())) ||
+		((pools.is_array()) && (!pools.empty())) ||
+		_isAssignModeEnabled(network["v4AssignMode"],"zt") ||
+		_isAssignModeEnabled(network["v6AssignMode"],"zt") ||
+		_isAssignModeEnabled(network["v6AssignMode"],"rfc4193") ||
+		_isAssignModeEnabled(network["v6AssignMode"],"6plane")
+	);
+}
+
+static json _makeDefaultIpv4ManagedRoute(const uint64_t networkId)
+{
+	const unsigned int secondOctet = 64U + (unsigned int)((networkId >> 16) & 0x3fULL);
+	const unsigned int thirdOctet = (unsigned int)((networkId >> 8) & 0xffULL);
+
+	char cidr[32];
+	OSUtils::ztsnprintf(
+		cidr,
+		sizeof(cidr),
+		"10.%u.%u.0/24",
+		secondOctet,
+		thirdOctet);
+
+	json route = json::object();
+	route["target"] = cidr;
+	route["via"] = json();
+	return route;
+}
+
+static json _makeDefaultIpv4ManagedPool(const uint64_t networkId)
+{
+	const unsigned int secondOctet = 64U + (unsigned int)((networkId >> 16) & 0x3fULL);
+	const unsigned int thirdOctet = (unsigned int)((networkId >> 8) & 0xffULL);
+
+	char start[32];
+	char end[32];
+	OSUtils::ztsnprintf(start,sizeof(start),"10.%u.%u.1",secondOctet,thirdOctet);
+	OSUtils::ztsnprintf(end,sizeof(end),"10.%u.%u.254",secondOctet,thirdOctet);
+
+	json pool = json::object();
+	pool["ipRangeStart"] = start;
+	pool["ipRangeEnd"] = end;
+	return pool;
+}
+
+static bool _shouldInjectDefaultManagedIpConfig(const json &body,const json &network)
+{
+	if (!OSUtils::jsonBool(network["private"],true)) {
+		return false;
+	}
+	if (body.count("routes") || body.count("ipAssignmentPools") || body.count("v4AssignMode") || body.count("v6AssignMode")) {
+		return false;
+	}
+	return !_networkHasManagedIpConfig(network);
+}
+
+static void _injectDefaultManagedIpConfig(const uint64_t networkId,json &network)
+{
+	network["routes"] = json::array({ _makeDefaultIpv4ManagedRoute(networkId) });
+	network["ipAssignmentPools"] = json::array({ _makeDefaultIpv4ManagedPool(networkId) });
+	network["v4AssignMode"] = {{"zt",true}};
+	if (!network["v6AssignMode"].is_object()) {
+		network["v6AssignMode"] = {{"rfc4193",false},{"zt",false},{"6plane",false}};
+	}
+	network["v6AssignMode"]["rfc4193"] = true;
+}
+
 static json _renderRule(ZT_VirtualNetworkRule &rule)
 {
 	char tmp[128];
@@ -854,6 +930,29 @@ std::string EmbeddedNetworkController::networkUpdateFromPostData(uint64_t networ
 
 	network["id"] = nwids;
 	network["nwid"] = nwids;
+	if (_shouldInjectDefaultManagedIpConfig(b,network)) {
+		_injectDefaultManagedIpConfig(networkID,network);
+		fprintf(
+			stderr,
+			"[libzt-ctl] injected default managed ip config nwid=%s route=%s pool=%s-%s\n",
+			nwids,
+			OSUtils::jsonString(network["routes"][0]["target"],"-").c_str(),
+			OSUtils::jsonString(network["ipAssignmentPools"][0]["ipRangeStart"],"-").c_str(),
+			OSUtils::jsonString(network["ipAssignmentPools"][0]["ipRangeEnd"],"-").c_str());
+	}
+	fprintf(
+		stderr,
+		"[libzt-ctl] networkUpdateFromPostData nwid=%s name=%s private=%d routes=%u pools=%u v4zt=%d v6zt=%d v6rfc4193=%d v66plane=%d mtu=%u\n",
+		nwids,
+		OSUtils::jsonString(network["name"],"").c_str(),
+		OSUtils::jsonBool(network["private"],true) ? 1 : 0,
+		(unsigned int)(network["routes"].is_array() ? network["routes"].size() : 0),
+		(unsigned int)(network["ipAssignmentPools"].is_array() ? network["ipAssignmentPools"].size() : 0),
+		OSUtils::jsonBool(network["v4AssignMode"]["zt"],false) ? 1 : 0,
+		OSUtils::jsonBool(network["v6AssignMode"]["zt"],false) ? 1 : 0,
+		OSUtils::jsonBool(network["v6AssignMode"]["rfc4193"],false) ? 1 : 0,
+		OSUtils::jsonBool(network["v6AssignMode"]["6plane"],false) ? 1 : 0,
+		(unsigned int)OSUtils::jsonInt(network["mtu"],ZT_DEFAULT_MTU));
 
 	DB::cleanNetwork(network);
 	_db.save(network, true);
@@ -890,6 +989,19 @@ void EmbeddedNetworkController::configureHTTPControlPlane(
 
 		setContent(req, res, network.dump());
 	});
+
+	auto updateNetwork = [&, setContent](const httplib::Request &req, httplib::Response &res) {
+		auto networkID = req.matches[1];
+		uint64_t nwid = Utils::hexStrToU64(networkID.str().c_str());
+		json network;
+		if (!_db.get(nwid, network)) {
+			res.status = 404;
+			return;
+		}
+		setContent(req, res, networkUpdateFromPostData(nwid, req.body));
+	};
+	s.Put("/controller/network/([0-9a-fA-F]{16})", updateNetwork);
+	s.Post("/controller/network/([0-9a-fA-F]{16})", updateNetwork);
 
 	auto createNewNetwork = [&, setContent](const httplib::Request &req, httplib::Response &res) {
 		fprintf(stderr, "creating new network (new style)\n");
@@ -1891,6 +2003,23 @@ void EmbeddedNetworkController::_request(
 		b9.stop();
 		#endif
 		return;
+	}
+	if (nc->staticIpCount == 0) {
+		fprintf(
+			stderr,
+			"[libzt-ctl] empty netconf nwid=%s member=%llx routes=%u pools=%u memberIpAssignments=%u noAutoAssignIps=%d v4zt=%d v6zt=%d v6rfc4193=%d v66plane=%d private=%d revision=%llu\n",
+			nwids,
+			(unsigned long long)identity.address().toInt(),
+			nc->routeCount,
+			(unsigned int)(ipAssignmentPools.is_array() ? ipAssignmentPools.size() : 0),
+			(unsigned int)(ipAssignments.is_array() ? ipAssignments.size() : 0),
+			noAutoAssignIps ? 1 : 0,
+			(v4AssignMode.is_object() && OSUtils::jsonBool(v4AssignMode["zt"],false)) ? 1 : 0,
+			(v6AssignMode.is_object() && OSUtils::jsonBool(v6AssignMode["zt"],false)) ? 1 : 0,
+			(v6AssignMode.is_object() && OSUtils::jsonBool(v6AssignMode["rfc4193"],false)) ? 1 : 0,
+			(v6AssignMode.is_object() && OSUtils::jsonBool(v6AssignMode["6plane"],false)) ? 1 : 0,
+			OSUtils::jsonBool(network["private"],true) ? 1 : 0,
+			(unsigned long long)OSUtils::jsonInt(network["revision"],0ULL));
 	}
 #ifdef CENTRAL_CONTROLLER_REQUEST_BENCHMARK
 	b9.stop();

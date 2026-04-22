@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:file_transfer_flutter/core/models/zerotier_adapter_bridge_status.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_network_state.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_permission_state.dart';
@@ -12,10 +13,9 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
   MethodChannelZeroTierService({
     MethodChannel? methodChannel,
     EventChannel? eventChannel,
-  })  : _methodChannel = methodChannel ??
-            const MethodChannel(_methodChannelName),
-        _eventChannel =
-            eventChannel ?? const EventChannel(_eventChannelName);
+  })  : _methodChannel =
+            methodChannel ?? const MethodChannel(_methodChannelName),
+        _eventChannel = eventChannel ?? const EventChannel(_eventChannelName);
 
   static const String _methodChannelName =
       'file_transfer_flutter/zerotier/methods';
@@ -163,8 +163,56 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
       joinedNetworks: _readList(map, 'joinedNetworks')
           .map(_parseNetworkState)
           .toList(growable: false),
+      adapterBridge: _parseAdapterBridgeStatus(map['adapterBridge']),
       lastError: _readNullableString(map, 'lastError'),
       updatedAt: _parseDateTime(map['updatedAt']),
+    );
+  }
+
+  ZeroTierAdapterBridgeStatus _parseAdapterBridgeStatus(Object? raw) {
+    final Map<Object?, Object?> map = _asMap(raw);
+    if (map.isEmpty) {
+      return const ZeroTierAdapterBridgeStatus.unknown();
+    }
+    return ZeroTierAdapterBridgeStatus(
+      initialized: _readBool(map, 'initialized'),
+      hasVirtualAdapter: _readBool(map, 'hasVirtualAdapter'),
+      hasExpectedNetworkIp: _readBool(map, 'hasExpectedNetworkIp'),
+      virtualAdapterNames: _readList(map, 'virtualAdapterNames')
+          .map((Object? item) => item?.toString() ?? '')
+          .where((String item) => item.trim().isNotEmpty)
+          .toList(growable: false),
+      detectedIpv4Addresses: _readList(map, 'detectedIpv4Addresses')
+          .map((Object? item) => item?.toString() ?? '')
+          .where((String item) => item.trim().isNotEmpty)
+          .toList(growable: false),
+      expectedIpv4Addresses: _readList(map, 'expectedIpv4Addresses')
+          .map((Object? item) => item?.toString() ?? '')
+          .where((String item) => item.trim().isNotEmpty)
+          .toList(growable: false),
+      adapters: _readList(map, 'adapters')
+          .map(_parseAdapterRecord)
+          .toList(growable: false),
+      summary: _readNullableString(map, 'summary'),
+    );
+  }
+
+  ZeroTierAdapterRecord _parseAdapterRecord(Object? raw) {
+    final Map<Object?, Object?> map = _asMap(raw);
+    return ZeroTierAdapterRecord(
+      adapterName: _readString(map, 'adapterName'),
+      friendlyName: _readString(map, 'friendlyName'),
+      description: _readString(map, 'description'),
+      ifIndex: _readInt(map, 'ifIndex'),
+      luid: _readInt(map, 'luid'),
+      operStatus: _readString(map, 'operStatus', fallback: 'unknown'),
+      isUp: _readBool(map, 'isUp'),
+      isVirtual: _readBool(map, 'isVirtual'),
+      matchesExpectedIp: _readBool(map, 'matchesExpectedIp'),
+      ipv4Addresses: _readList(map, 'ipv4Addresses')
+          .map((Object? item) => item?.toString() ?? '')
+          .where((String item) => item.trim().isNotEmpty)
+          .toList(growable: false),
     );
   }
 
@@ -195,6 +243,10 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
           .toList(growable: false),
       isAuthorized: _readBool(map, 'isAuthorized'),
       isConnected: _readBool(map, 'isConnected'),
+      localInterfaceReady: _readBool(map, 'localInterfaceReady'),
+      matchedInterfaceName: _readString(map, 'matchedInterfaceName'),
+      matchedInterfaceUp: _readBool(map, 'matchedInterfaceUp'),
+      localMountState: _readString(map, 'localMountState', fallback: 'unknown'),
     );
   }
 
@@ -275,6 +327,17 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
       return false;
     }
     return fallback;
+  }
+
+  int _readInt(Map<Object?, Object?> map, String key, {int fallback = 0}) {
+    final Object? value = map[key];
+    if (value is int) {
+      return value;
+    }
+    if (value is num) {
+      return value.toInt();
+    }
+    return int.tryParse(value?.toString() ?? '') ?? fallback;
   }
 
   DateTime? _parseDateTime(Object? value) {

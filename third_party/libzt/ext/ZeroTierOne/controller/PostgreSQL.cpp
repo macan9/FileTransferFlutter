@@ -710,7 +710,7 @@ void PostgreSQL::initializeNetworks()
 					std::vector<std::string> r = split(*it, '|');
 					json route;
 					route["target"] = r[0];
-					route["via"] = ((route["via"] == "NULL")? nullptr : r[1]);
+					route["via"] = ((r.size() > 1) && (r[1] != "NULL")) ? json(r[1]) : json();
 					config["routes"].push_back(route);
 				}
 			}

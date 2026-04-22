@@ -15,6 +15,7 @@ class ZeroTierWindowsNetworkManager {
   flutter::EncodableList ListNetworks() const;
   std::optional<flutter::EncodableMap> GetNetworkDetail(
       const std::string& network_id) const;
+  flutter::EncodableMap ProbeNetworkStateNow(const std::string& network_id) const;
   bool JoinNetworkAndWaitForIp(const std::string& network_id, int timeout_ms,
                                std::string* error_message);
   bool LeaveNetwork(const std::string& network_id, const std::string& source,

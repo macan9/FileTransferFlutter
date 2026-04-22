@@ -19,6 +19,26 @@ ZeroTierWindowsNetworkManager::GetNetworkDetail(
   return runtime_->GetNetworkDetail(ParseNetworkId(network_id));
 }
 
+flutter::EncodableMap ZeroTierWindowsNetworkManager::ProbeNetworkStateNow(
+    const std::string& network_id) const {
+  if (runtime_ == nullptr) {
+    return flutter::EncodableMap{
+        {flutter::EncodableValue("networkId"), flutter::EncodableValue(network_id)},
+        {flutter::EncodableValue("error"),
+         flutter::EncodableValue("ZeroTier runtime is unavailable.")},
+    };
+  }
+  const uint64_t parsed_network_id = ParseNetworkId(network_id);
+  if (parsed_network_id == 0) {
+    return flutter::EncodableMap{
+        {flutter::EncodableValue("networkId"), flutter::EncodableValue(network_id)},
+        {flutter::EncodableValue("error"),
+         flutter::EncodableValue("ZeroTier network id is invalid.")},
+    };
+  }
+  return runtime_->ProbeNetworkStateNow(parsed_network_id);
+}
+
 bool ZeroTierWindowsNetworkManager::JoinNetworkAndWaitForIp(
     const std::string& network_id, int timeout_ms, std::string* error_message) {
   if (runtime_ == nullptr) {

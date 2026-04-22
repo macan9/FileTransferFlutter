@@ -578,6 +578,16 @@ void NodeService::syncManagedStuff(NetworkState& n)
     }
     std::sort(newManagedIps.begin(), newManagedIps.end());
     newManagedIps.erase(std::unique(newManagedIps.begin(), newManagedIps.end()), newManagedIps.end());
+    fprintf(
+        stderr,
+        "[libzt] syncManagedStuff net=%llx assignedAddressCount=%u managedIpsBefore=%u tapHasIpv4=%d tapHasIpv6=%d netif4=%p netif6=%p\n",
+        (unsigned long long)n.config.nwid,
+        n.config.assignedAddressCount,
+        (unsigned int)n.managedIps.size(),
+        n.tap ? (n.tap->hasIpv4Addr() ? 1 : 0) : 0,
+        n.tap ? (n.tap->hasIpv6Addr() ? 1 : 0) : 0,
+        n.tap ? n.tap->netif4 : NULL,
+        n.tap ? n.tap->netif6 : NULL);
     for (std::vector<InetAddress>::iterator ip(n.managedIps.begin()); ip != n.managedIps.end(); ++ip) {
         if (std::find(newManagedIps.begin(), newManagedIps.end(), *ip) == newManagedIps.end()) {
             if (! n.tap->removeIp(*ip)) {
@@ -603,6 +613,12 @@ void NodeService::syncManagedStuff(NetworkState& n)
     }
     for (std::vector<InetAddress>::iterator ip(newManagedIps.begin()); ip != newManagedIps.end(); ++ip) {
         if (std::find(n.managedIps.begin(), n.managedIps.end(), *ip) == n.managedIps.end()) {
+            fprintf(
+                stderr,
+                "[libzt] syncManagedStuff add attempt net=%llx ip=%s family=%s\n",
+                (unsigned long long)n.config.nwid,
+                ip->toString(ipbuf),
+                (*ip).isV4() ? "ipv4" : ((*ip).isV6() ? "ipv6" : "other"));
             if (! n.tap->addIp(*ip)) {
                 fprintf(stderr, "ERROR: unable to add ip address %s" ZT_EOL_S, ip->toString(ipbuf));
             }
@@ -625,6 +641,15 @@ void NodeService::syncManagedStuff(NetworkState& n)
         }
     }
     n.managedIps.swap(newManagedIps);
+    fprintf(
+        stderr,
+        "[libzt] syncManagedStuff complete net=%llx managedIpsAfter=%u tapHasIpv4=%d tapHasIpv6=%d netif4=%p netif6=%p\n",
+        (unsigned long long)n.config.nwid,
+        (unsigned int)n.managedIps.size(),
+        n.tap ? (n.tap->hasIpv4Addr() ? 1 : 0) : 0,
+        n.tap ? (n.tap->hasIpv6Addr() ? 1 : 0) : 0,
+        n.tap ? n.tap->netif4 : NULL,
+        n.tap ? n.tap->netif6 : NULL);
 }
 
 void NodeService::phyOnDatagram(
@@ -867,9 +892,31 @@ int NodeService::nodeVirtualNetworkConfigFunction(
                 *nuptr = (void*)&n;
                 n.tap->setUserEventSystem(_events);
             }
+            fprintf(
+                stderr,
+                "[libzt] networkConfig op=UP net=%llx status=%d rev=%lu assigned=%u routes=%u mtu=%u tap=%p\n",
+                (unsigned long long)net_id,
+                (int)nwc->status,
+                (unsigned long)nwc->netconfRevision,
+                nwc->assignedAddressCount,
+                nwc->routeCount,
+                nwc->mtu,
+                n.tap);
             // After setting up tap, fall through to CONFIG_UPDATE since we
             // also want to do this...
         case ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE:
+            if (op == ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE) {
+                fprintf(
+                    stderr,
+                    "[libzt] networkConfig op=CONFIG_UPDATE net=%llx status=%d rev=%lu assigned=%u routes=%u mtu=%u tap=%p\n",
+                    (unsigned long long)net_id,
+                    (int)nwc->status,
+                    (unsigned long)nwc->netconfRevision,
+                    nwc->assignedAddressCount,
+                    nwc->routeCount,
+                    nwc->mtu,
+                    n.tap);
+            }
             memcpy(&(n.config), nwc, sizeof(ZT_VirtualNetworkConfig));
             if (n.tap) {   // sanity check
                 syncManagedStuff(n);
@@ -1159,6 +1206,16 @@ void NodeService::generateSyntheticEvents()
                 sendEventToUser(ZTS_EVENT_NETWORK_REQ_CONFIG, (void*)&netState);
                 break;
             case ZT_NETWORK_STATUS_OK:
+                fprintf(
+                    stderr,
+                    "[libzt] syntheticEvent net=%llx status=OK assigned=%u routeCount=%u tapHasIpv4=%d tapHasIpv6=%d netif4Up=%d netif6Up=%d\n",
+                    (unsigned long long)netState.config.nwid,
+                    netState.config.assignedAddressCount,
+                    netState.config.routeCount,
+                    tap ? (tap->hasIpv4Addr() ? 1 : 0) : 0,
+                    tap ? (tap->hasIpv6Addr() ? 1 : 0) : 0,
+                    (tap && tap->netif4) ? (zts_lwip_is_netif_up(tap->netif4) ? 1 : 0) : 0,
+                    (tap && tap->netif6) ? (zts_lwip_is_netif_up(tap->netif6) ? 1 : 0) : 0);
                 if (tap->hasIpv4Addr() && zts_lwip_is_netif_up(tap->netif4)) {
                     sendEventToUser(ZTS_EVENT_NETWORK_READY_IP4, (void*)&netState);
                 }
@@ -1610,6 +1667,14 @@ void NodeService::nodeStatePutFunction(
     }
 
     if (len >= 0 && data != nullptr) {
+        if (type == ZT_STATE_OBJECT_NETWORK_CONFIG) {
+            fprintf(
+                stderr,
+                "[libzt] statePut networkConfig net=%llx bytes=%d path=%s\n",
+                (unsigned long long)id[0],
+                len,
+                p);
+        }
         // Check to see if we've already written this first. This reduces
         // redundant writes and I/O overhead on most platforms and has
         // little effect on others.
@@ -1713,6 +1778,14 @@ int NodeService::nodeStateGetFunction(
         int n = (int)fread(data, 1, maxlen, f);
         fclose(f);
         if (n >= 0) {
+            if (type == ZT_STATE_OBJECT_NETWORK_CONFIG) {
+                fprintf(
+                    stderr,
+                    "[libzt] stateGet networkConfig net=%llx bytes=%d path=%s\n",
+                    (unsigned long long)id[0],
+                    n,
+                    p);
+            }
             return n;
         }
     }

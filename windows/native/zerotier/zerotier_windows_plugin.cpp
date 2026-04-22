@@ -150,6 +150,12 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
     }
     return;
   }
+  if (method_name == "probeNetworkStateNow") {
+    const std::string network_id = ReadStringArgument(args, "networkId");
+    result->Success(
+        flutter::EncodableValue(network_manager_.ProbeNetworkStateNow(network_id)));
+    return;
+  }
   if (method_name == "applyFirewallRules") {
     std::vector<ZeroTierWindowsFirewallPortRule> ports;
     const auto ports_it = args.find(flutter::EncodableValue("allowedInboundPorts"));

@@ -1,3 +1,4 @@
+import 'package:file_transfer_flutter/core/models/zerotier_adapter_bridge_status.dart';
 import 'package:equatable/equatable.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_network_state.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_permission_state.dart';
@@ -10,6 +11,7 @@ class ZeroTierRuntimeStatus extends Equatable {
     required this.permissionState,
     required this.isNodeRunning,
     required this.joinedNetworks,
+    required this.adapterBridge,
     required this.updatedAt,
     this.lastError,
   });
@@ -21,6 +23,7 @@ class ZeroTierRuntimeStatus extends Equatable {
         permissionState = const ZeroTierPermissionState.unknown(),
         isNodeRunning = false,
         joinedNetworks = const <ZeroTierNetworkState>[],
+        adapterBridge = const ZeroTierAdapterBridgeStatus.unknown(),
         updatedAt = null,
         lastError = null;
 
@@ -30,6 +33,7 @@ class ZeroTierRuntimeStatus extends Equatable {
   final ZeroTierPermissionState permissionState;
   final bool isNodeRunning;
   final List<ZeroTierNetworkState> joinedNetworks;
+  final ZeroTierAdapterBridgeStatus adapterBridge;
   final String? lastError;
   final DateTime? updatedAt;
 
@@ -44,6 +48,7 @@ class ZeroTierRuntimeStatus extends Equatable {
     ZeroTierPermissionState? permissionState,
     bool? isNodeRunning,
     List<ZeroTierNetworkState>? joinedNetworks,
+    ZeroTierAdapterBridgeStatus? adapterBridge,
     String? lastError,
     bool clearLastError = false,
     DateTime? updatedAt,
@@ -55,6 +60,7 @@ class ZeroTierRuntimeStatus extends Equatable {
       permissionState: permissionState ?? this.permissionState,
       isNodeRunning: isNodeRunning ?? this.isNodeRunning,
       joinedNetworks: joinedNetworks ?? this.joinedNetworks,
+      adapterBridge: adapterBridge ?? this.adapterBridge,
       lastError: clearLastError ? null : lastError ?? this.lastError,
       updatedAt: updatedAt ?? this.updatedAt,
     );
@@ -68,6 +74,7 @@ class ZeroTierRuntimeStatus extends Equatable {
         permissionState,
         isNodeRunning,
         joinedNetworks,
+        adapterBridge,
         lastError,
         updatedAt,
       ];

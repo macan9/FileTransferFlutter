@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
+import 'package:file_transfer_flutter/core/models/zerotier_adapter_bridge_status.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_network_state.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_permission_state.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_runtime_event.dart';
@@ -54,6 +55,7 @@ class ProcessZeroTierLocalService implements ZeroTierLocalService {
         permissionState: _detectPermissionState(),
         isNodeRunning: nodeId.isNotEmpty,
         joinedNetworks: joinedNetworks,
+        adapterBridge: const ZeroTierAdapterBridgeStatus.unknown(),
         lastError: fallbackInfo.succeeded ? null : fallbackInfo.output.trim(),
         updatedAt: DateTime.now(),
       );
@@ -67,6 +69,7 @@ class ProcessZeroTierLocalService implements ZeroTierLocalService {
       permissionState: _detectPermissionState(),
       isNodeRunning: nodeId.isNotEmpty,
       joinedNetworks: joinedNetworks,
+      adapterBridge: const ZeroTierAdapterBridgeStatus.unknown(),
       updatedAt: DateTime.now(),
     );
   }
@@ -383,6 +386,11 @@ Get-NetFirewallRule -DisplayName "FileTransferFlutter-$ruleScopeId-*" -ErrorActi
       assignedAddresses: assignedAddresses,
       isAuthorized: isAuthorized,
       isConnected: assignedAddresses.isNotEmpty || status.toUpperCase() == 'OK',
+      localInterfaceReady:
+          assignedAddresses.isNotEmpty || status.toUpperCase() == 'OK',
+      matchedInterfaceName: '',
+      matchedInterfaceUp: assignedAddresses.isNotEmpty,
+      localMountState: assignedAddresses.isNotEmpty ? 'ready' : 'unknown',
     );
   }
 
@@ -444,7 +452,8 @@ Get-NetFirewallRule -DisplayName "FileTransferFlutter-$ruleScopeId-*" -ErrorActi
       isGranted: true,
       requiresManualSetup: false,
       isFirewallSupported: false,
-      summary: 'Additional platform-specific permission integration is pending.',
+      summary:
+          'Additional platform-specific permission integration is pending.',
     );
   }
 

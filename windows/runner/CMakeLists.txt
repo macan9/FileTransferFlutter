@@ -21,9 +21,17 @@ add_executable(${BINARY_NAME} WIN32
   "runner.exe.manifest"
 )
 
+add_executable(zt_runtime_smoke
+  "../native/zerotier/zerotier_windows_adapter_bridge.cpp"
+  "../native/zerotier/zerotier_windows_network_manager.cpp"
+  "../native/zerotier/zerotier_windows_runtime.cpp"
+  "../native/zerotier/zt_runtime_smoke.cpp"
+)
+
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
+apply_standard_settings(zt_runtime_smoke)
 
 # Add preprocessor definitions for the build version.
 target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION=\"${FLUTTER_VERSION}\"")
@@ -34,13 +42,31 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION_BUILD=${FLUTT
 
 # Disable Windows macros that collide with C++ standard library functions.
 target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
+target_compile_definitions(zt_runtime_smoke PRIVATE "NOMINMAX")
 
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app flutter_wrapper_plugin)
-target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "ole32.lib" "oleaut32.lib" zt-shared)
+target_link_libraries(${BINARY_NAME} PRIVATE
+  "dwmapi.lib"
+  "iphlpapi.lib"
+  "ole32.lib"
+  "oleaut32.lib"
+  "ws2_32.lib"
+  zt-shared
+)
+target_link_libraries(zt_runtime_smoke PRIVATE
+  "iphlpapi.lib"
+  "ws2_32.lib"
+  zt-shared
+)
 target_include_directories(${BINARY_NAME} PRIVATE
   "${CMAKE_SOURCE_DIR}"
+  "${CMAKE_SOURCE_DIR}/../third_party/libzt/include"
+)
+target_include_directories(zt_runtime_smoke PRIVATE
+  "${CMAKE_SOURCE_DIR}"
+  "${FLUTTER_MANAGED_DIR}/ephemeral/cpp_client_wrapper/include"
   "${CMAKE_SOURCE_DIR}/../third_party/libzt/include"
 )
 

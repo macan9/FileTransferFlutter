@@ -136,6 +136,32 @@ bool IsEmptyShellNetwork(const ZeroTierWindowsNetworkRecord& network) {
          network.status == "UNKNOWN" || network.status == "NETWORK_DOWN";
 }
 
+std::string ResolveLocalMountState(
+    const ZeroTierWindowsNetworkRecord& network,
+    bool has_virtual_adapter) {
+  if (network.local_interface_ready) {
+    return "ready";
+  }
+  if (network.status == "ACCESS_DENIED" ||
+      IsTerminalNetworkFailureStatus(network.status)) {
+    return "not_ready";
+  }
+  if (network.assigned_addresses.empty()) {
+    if (network.status == "REQUESTING_CONFIGURATION" || network.status == "OK" ||
+        network.status == "UNKNOWN") {
+      return "awaiting_address";
+    }
+    return "not_ready";
+  }
+  if (network.matched_interface_name.empty()) {
+    return has_virtual_adapter ? "ip_not_bound" : "missing_adapter";
+  }
+  if (!network.matched_interface_up) {
+    return "adapter_down";
+  }
+  return "ip_not_bound";
+}
+
 bool ShouldExposeNetworkRecord(
     uint64_t network_id, const ZeroTierWindowsNetworkRecord& network,
     const std::set<uint64_t>& pending_join_networks,
@@ -153,6 +179,11 @@ bool ShouldExposeNetworkRecord(
     return true;
   }
   if (network.status == "ACCESS_DENIED") {
+    return true;
+  }
+  if (network.local_mount_state == "ip_not_bound" ||
+      network.local_mount_state == "adapter_down" ||
+      network.local_mount_state == "missing_adapter") {
     return true;
   }
   return false;
@@ -191,6 +222,68 @@ std::string JoinAddresses(const std::vector<std::string>& addresses) {
     stream << addresses[index];
   }
   return stream.str();
+}
+
+void ResetJoinTrace(ZeroTierWindowsNetworkRecord* network) {
+  if (network == nullptr) {
+    return;
+  }
+  network->join_trace_active = true;
+  network->join_trace_started_at_utc = Iso8601NowUtc();
+  network->join_event_sequence.clear();
+  network->join_saw_req_config = false;
+  network->join_saw_ready_ip4 = false;
+  network->join_saw_ready_ip6 = false;
+  network->join_saw_ready_ip4_ip6 = false;
+  network->join_saw_network_ok = false;
+  network->join_saw_network_down = false;
+  network->join_saw_addr_added_ip4 = false;
+  network->join_saw_addr_added_ip6 = false;
+}
+
+void AppendJoinTraceEvent(ZeroTierWindowsNetworkRecord* network,
+                          int event_code,
+                          const char* event_name) {
+  if (network == nullptr) {
+    return;
+  }
+  const std::string label =
+      event_name == nullptr ? ("EVENT_" + std::to_string(event_code))
+                            : std::string(event_name);
+  if (!network->join_event_sequence.empty()) {
+    network->join_event_sequence.append(" -> ");
+  }
+  network->join_event_sequence.append(label);
+  switch (event_code) {
+    case ZTS_EVENT_NETWORK_REQ_CONFIG:
+      network->join_saw_req_config = true;
+      break;
+    case ZTS_EVENT_NETWORK_READY_IP4:
+      network->join_saw_ready_ip4 = true;
+      break;
+    case ZTS_EVENT_NETWORK_READY_IP6:
+      network->join_saw_ready_ip6 = true;
+      break;
+    case ZTS_EVENT_NETWORK_READY_IP4_IP6:
+      network->join_saw_ready_ip4_ip6 = true;
+      network->join_saw_ready_ip4 = true;
+      network->join_saw_ready_ip6 = true;
+      break;
+    case ZTS_EVENT_NETWORK_OK:
+      network->join_saw_network_ok = true;
+      break;
+    case ZTS_EVENT_NETWORK_DOWN:
+      network->join_saw_network_down = true;
+      break;
+    case ZTS_EVENT_ADDR_ADDED_IP4:
+      network->join_saw_addr_added_ip4 = true;
+      break;
+    case ZTS_EVENT_ADDR_ADDED_IP6:
+      network->join_saw_addr_added_ip6 = true;
+      break;
+    default:
+      break;
+  }
 }
 
 }  // namespace
@@ -399,8 +492,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     ClearLastErrorLocked();
     auto existing = networks_.find(network_id);
     if (existing != networks_.end() &&
-        (existing->second.is_connected ||
-         !existing->second.assigned_addresses.empty())) {
+        existing->second.local_interface_ready) {
       join_generation = NextNetworkGenerationLocked(network_id);
       emit_existing_network_online = true;
       existing_network_payload = BuildNetworkDiagnosticsPayloadLocked(
@@ -412,6 +504,11 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
       networks_[network_id].is_connected = false;
       networks_[network_id].is_authorized = false;
       networks_[network_id].assigned_addresses.clear();
+      networks_[network_id].local_interface_ready = false;
+      networks_[network_id].matched_interface_name.clear();
+      networks_[network_id].matched_interface_up = false;
+      networks_[network_id].local_mount_state = "awaiting_address";
+      ResetJoinTrace(&networks_[network_id]);
     }
   }
 
@@ -479,10 +576,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
           IsTerminalNetworkFailureStatus(network.status)) {
         return true;
       }
-      if (!network.assigned_addresses.empty()) {
-        return true;
-      }
-      if (network.status == "OK" && network.is_authorized && node_online_) {
+      if (network.local_interface_ready) {
         return true;
       }
       return !last_error_.empty() || !node_started_;
@@ -498,28 +592,57 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
                 << " connected=" << (network.is_connected ? "true" : "false")
                 << " address_count=" << network.assigned_addresses.size()
                 << " addresses=" << JoinAddresses(network.assigned_addresses)
+                << " local_mount_state=" << network.local_mount_state
+                << " local_interface_ready="
+                << (network.local_interface_ready ? "true" : "false")
+                << " matched_interface="
+                << (network.matched_interface_name.empty()
+                        ? "-"
+                        : network.matched_interface_name)
+                << " last_event=" << (network.last_event_name.empty()
+                                           ? "-"
+                                           : network.last_event_name)
+                << " last_event_status_code=" << network.last_event_status_code
+                << " last_event_netconf_rev=" << network.last_event_netconf_rev
+                << " last_event_addr_count="
+                << network.last_event_assigned_addr_count
+                << " last_event_transport_ready="
+                << network.last_event_transport_ready
+                << " last_probe_status_code=" << network.last_probe_status_code
+                << " last_probe_transport_ready="
+                << network.last_probe_transport_ready
+                << " last_probe_addr_result="
+                << (network.last_probe_addr_result_name.empty()
+                        ? "-"
+                        : network.last_probe_addr_result_name)
+                << " last_probe_addr_count="
+                << network.last_probe_assigned_addr_count
+                << " join_sequence="
+                << (network.join_event_sequence.empty() ? "-" : network.join_event_sequence)
+                << " join_ready_flags="
+                << (network.join_saw_req_config ? "req" : "-")
+                << ","
+                << (network.join_saw_ready_ip4 ? "ready4" : "-")
+                << ","
+                << (network.join_saw_ready_ip6 ? "ready6" : "-")
+                << ","
+                << (network.join_saw_network_ok ? "ok" : "-")
+                << ","
+                << (network.join_saw_network_down ? "down" : "-")
+                << ","
+                << (network.join_saw_addr_added_ip4 ? "addr4" : "-")
+                << ","
+                << (network.join_saw_addr_added_ip6 ? "addr6" : "-")
                 << " node_started=" << (node_started_ ? "true" : "false")
                 << " node_online=" << (node_online_ ? "true" : "false")
                 << " last_error=" << (last_error_.empty() ? "-" : last_error_)
                 << std::endl;
-      if (!network.assigned_addresses.empty()) {
+      if (network.local_interface_ready) {
         ClearLastErrorLocked();
         pending_join_networks_.erase(network_id);
         if (error_message != nullptr) {
           error_message->clear();
         }
-        return true;
-      }
-      if (network.status == "OK" && network.is_authorized && node_online_) {
-        ClearLastErrorLocked();
-        pending_join_networks_.erase(network_id);
-        if (error_message != nullptr) {
-          error_message->clear();
-        }
-        std::clog << "[ZT/WIN] JoinNetwork accepting local-mounted pending state"
-                  << " network_id=" << ToHexNetworkId(network_id)
-                  << " because network is authorized and OK"
-                  << std::endl;
         return true;
       }
       if (network.status == "ACCESS_DENIED" ||
@@ -559,12 +682,25 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     }
   }
 
-  std::string message = "Timed out waiting for a managed address from ZeroTier.";
+  std::string message =
+      "Timed out waiting for ZeroTier to mount the managed address on a Windows adapter.";
   if (!node_started_) {
     message = "ZeroTier node stopped before the network became ready.";
   } else if (!node_online_) {
     message =
         "ZeroTier node stayed offline while waiting for the network to become ready.";
+  } else if (const auto timed_out_network_it = networks_.find(network_id);
+             timed_out_network_it != networks_.end()) {
+    const ZeroTierWindowsNetworkRecord& network = timed_out_network_it->second;
+    if (network.join_saw_network_ok &&
+        !network.join_saw_ready_ip4 &&
+        !network.join_saw_ready_ip6 &&
+        !network.join_saw_ready_ip4_ip6 &&
+        !network.join_saw_addr_added_ip4 &&
+        !network.join_saw_addr_added_ip6) {
+      message =
+          "ZeroTier reported NETWORK_OK, but no READY_IP4/IP6 or ADDR_ADDED event was observed.";
+    }
   }
   SetLastErrorLocked(message);
   const auto timed_out_network_it = networks_.find(network_id);
@@ -577,6 +713,29 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
               << " connected=" << (network.is_connected ? "true" : "false")
               << " address_count=" << network.assigned_addresses.size()
               << " addresses=" << JoinAddresses(network.assigned_addresses)
+              << " local_mount_state=" << network.local_mount_state
+              << " local_interface_ready="
+              << (network.local_interface_ready ? "true" : "false")
+              << " matched_interface="
+              << (network.matched_interface_name.empty()
+                      ? "-"
+                      : network.matched_interface_name)
+              << " join_sequence="
+              << (network.join_event_sequence.empty() ? "-" : network.join_event_sequence)
+              << " join_ready_flags="
+              << (network.join_saw_req_config ? "req" : "-")
+              << ","
+              << (network.join_saw_ready_ip4 ? "ready4" : "-")
+              << ","
+              << (network.join_saw_ready_ip6 ? "ready6" : "-")
+              << ","
+              << (network.join_saw_network_ok ? "ok" : "-")
+              << ","
+              << (network.join_saw_network_down ? "down" : "-")
+              << ","
+              << (network.join_saw_addr_added_ip4 ? "addr4" : "-")
+              << ","
+              << (network.join_saw_addr_added_ip6 ? "addr6" : "-")
               << " node_started=" << (node_started_ ? "true" : "false")
               << " node_online=" << (node_online_ ? "true" : "false")
               << std::endl;
@@ -743,6 +902,72 @@ std::string ErrorCodeToString(int code) {
   }
 }
 
+flutter::EncodableMap ZeroTierWindowsRuntime::ProbeNetworkStateNow(
+    uint64_t network_id) {
+  RefreshSnapshot();
+
+  int status_code = 0;
+  int transport_ready = 0;
+  zts_sockaddr_storage assigned_addrs[ZTS_MAX_ASSIGNED_ADDRESSES] = {};
+  unsigned int assigned_addr_count = ZTS_MAX_ASSIGNED_ADDRESSES;
+  int addr_result = ZTS_ERR_SERVICE;
+  int network_type = 0;
+  int name_result = ZTS_ERR_SERVICE;
+  char network_name_buffer[ZTS_MAX_NETWORK_SHORT_NAME_LENGTH + 1] = {0};
+  {
+    std::scoped_lock api_lock(api_mutex_);
+    status_code = zts_net_get_status(network_id);
+    transport_ready = zts_net_transport_is_ready(network_id);
+    addr_result =
+        zts_addr_get_all(network_id, assigned_addrs, &assigned_addr_count);
+    network_type = zts_net_get_type(network_id);
+    name_result = zts_net_get_name(network_id, network_name_buffer,
+                                   ZTS_MAX_NETWORK_SHORT_NAME_LENGTH);
+  }
+
+  EncodableList live_addresses;
+  if (addr_result == ZTS_ERR_OK) {
+    for (unsigned int i = 0; i < assigned_addr_count; ++i) {
+      const std::string address = ExtractAddress(assigned_addrs[i]);
+      if (!address.empty()) {
+        live_addresses.emplace_back(address);
+      }
+    }
+  }
+
+  EncodableMap result{
+      {EncodableValue("networkId"), EncodableValue(ToHexNetworkId(network_id))},
+      {EncodableValue("statusCode"), EncodableValue(status_code)},
+      {EncodableValue("status"),
+       EncodableValue(NetworkStatusToString(status_code))},
+      {EncodableValue("transportReady"), EncodableValue(transport_ready)},
+      {EncodableValue("addrResult"), EncodableValue(addr_result)},
+      {EncodableValue("addrResultName"),
+       EncodableValue(ErrorCodeToString(addr_result))},
+      {EncodableValue("assignedAddrCount"),
+       EncodableValue(static_cast<int64_t>(assigned_addr_count))},
+      {EncodableValue("networkType"), EncodableValue(network_type)},
+      {EncodableValue("nameResult"), EncodableValue(name_result)},
+      {EncodableValue("liveAssignedAddresses"),
+       EncodableValue(live_addresses)},
+  };
+
+  std::scoped_lock lock(mutex_);
+  const auto it = networks_.find(network_id);
+  if (it != networks_.end()) {
+    result[EncodableValue("runtimeRecord")] =
+        EncodableValue(BuildNetworkMap(it->second));
+  }
+  result[EncodableValue("serviceState")] = EncodableValue(BuildServiceState());
+  result[EncodableValue("nodeOnline")] = EncodableValue(node_online_);
+  result[EncodableValue("nodeStarted")] = EncodableValue(node_started_);
+  result[EncodableValue("lastError")] = EncodableValue(last_error_);
+  result[EncodableValue("networkNameFromProbe")] =
+      EncodableValue(name_result == ZTS_ERR_OK ? std::string(network_name_buffer)
+                                               : std::string());
+  return result;
+}
+
 const char* EventCodeToString(int code) {
   switch (code) {
     case ZTS_EVENT_NODE_UP:
@@ -759,8 +984,16 @@ const char* EventCodeToString(int code) {
       return "ZTS_EVENT_NETWORK_REQ_CONFIG";
     case ZTS_EVENT_NETWORK_OK:
       return "ZTS_EVENT_NETWORK_OK";
+    case ZTS_EVENT_NETWORK_UPDATE:
+      return "ZTS_EVENT_NETWORK_UPDATE";
     case ZTS_EVENT_NETWORK_ACCESS_DENIED:
       return "ZTS_EVENT_NETWORK_ACCESS_DENIED";
+    case ZTS_EVENT_NETWORK_READY_IP4:
+      return "ZTS_EVENT_NETWORK_READY_IP4";
+    case ZTS_EVENT_NETWORK_READY_IP6:
+      return "ZTS_EVENT_NETWORK_READY_IP6";
+    case ZTS_EVENT_NETWORK_READY_IP4_IP6:
+      return "ZTS_EVENT_NETWORK_READY_IP4_IP6";
     case ZTS_EVENT_NETWORK_DOWN:
       return "ZTS_EVENT_NETWORK_DOWN";
     case ZTS_EVENT_ADDR_ADDED_IP4:
@@ -868,6 +1101,68 @@ flutter::EncodableMap ZeroTierWindowsRuntime::BuildNetworkMap(
       {EncodableValue("assignedAddresses"), EncodableValue(assigned_addresses)},
       {EncodableValue("isAuthorized"), EncodableValue(network.is_authorized)},
       {EncodableValue("isConnected"), EncodableValue(network.is_connected)},
+      {EncodableValue("localInterfaceReady"),
+       EncodableValue(network.local_interface_ready)},
+      {EncodableValue("matchedInterfaceName"),
+       EncodableValue(network.matched_interface_name)},
+      {EncodableValue("matchedInterfaceUp"),
+       EncodableValue(network.matched_interface_up)},
+      {EncodableValue("localMountState"),
+       EncodableValue(network.local_mount_state)},
+      {EncodableValue("lastEventCode"),
+       EncodableValue(network.last_event_code)},
+      {EncodableValue("lastEventName"),
+       EncodableValue(network.last_event_name)},
+      {EncodableValue("lastEventAtUtc"),
+       EncodableValue(network.last_event_at_utc)},
+      {EncodableValue("lastEventStatusCode"),
+       EncodableValue(network.last_event_status_code)},
+      {EncodableValue("lastEventNetworkType"),
+       EncodableValue(network.last_event_network_type)},
+      {EncodableValue("lastEventNetconfRev"),
+       EncodableValue(network.last_event_netconf_rev)},
+      {EncodableValue("lastEventAssignedAddrCount"),
+       EncodableValue(network.last_event_assigned_addr_count)},
+      {EncodableValue("lastEventTransportReady"),
+       EncodableValue(network.last_event_transport_ready)},
+      {EncodableValue("lastProbeStatusCode"),
+       EncodableValue(network.last_probe_status_code)},
+      {EncodableValue("lastProbeAtUtc"),
+       EncodableValue(network.last_probe_at_utc)},
+      {EncodableValue("lastProbeTransportReady"),
+       EncodableValue(network.last_probe_transport_ready)},
+      {EncodableValue("lastProbeAddrResult"),
+       EncodableValue(network.last_probe_addr_result)},
+      {EncodableValue("lastProbeAddrResultName"),
+       EncodableValue(network.last_probe_addr_result_name)},
+      {EncodableValue("lastProbeAssignedAddrCount"),
+       EncodableValue(network.last_probe_assigned_addr_count)},
+      {EncodableValue("lastProbeNetworkType"),
+       EncodableValue(network.last_probe_network_type)},
+      {EncodableValue("lastProbePendingJoin"),
+       EncodableValue(network.last_probe_pending_join)},
+      {EncodableValue("joinTraceStartedAtUtc"),
+       EncodableValue(network.join_trace_started_at_utc)},
+      {EncodableValue("joinEventSequence"),
+       EncodableValue(network.join_event_sequence)},
+      {EncodableValue("joinSawReqConfig"),
+       EncodableValue(network.join_saw_req_config)},
+      {EncodableValue("joinSawReadyIp4"),
+       EncodableValue(network.join_saw_ready_ip4)},
+      {EncodableValue("joinSawReadyIp6"),
+       EncodableValue(network.join_saw_ready_ip6)},
+      {EncodableValue("joinSawReadyIp4Ip6"),
+       EncodableValue(network.join_saw_ready_ip4_ip6)},
+      {EncodableValue("joinSawNetworkOk"),
+       EncodableValue(network.join_saw_network_ok)},
+      {EncodableValue("joinSawNetworkDown"),
+       EncodableValue(network.join_saw_network_down)},
+      {EncodableValue("joinSawAddrAddedIp4"),
+       EncodableValue(network.join_saw_addr_added_ip4)},
+      {EncodableValue("joinSawAddrAddedIp6"),
+       EncodableValue(network.join_saw_addr_added_ip6)},
+      {EncodableValue("joinTraceActive"),
+       EncodableValue(network.join_trace_active)},
   };
 }
 
@@ -896,6 +1191,10 @@ ZeroTierWindowsRuntime::BuildNetworkDiagnosticsPayloadLocked(
         {EncodableValue("isConnected"), EncodableValue(network.is_connected)},
         {EncodableValue("addressCount"),
          EncodableValue(static_cast<int>(network.assigned_addresses.size()))},
+        {EncodableValue("lastEventName"),
+         EncodableValue(network.last_event_name)},
+        {EncodableValue("lastProbeAddrResultName"),
+         EncodableValue(network.last_probe_addr_result_name)},
     });
   }
 
@@ -944,12 +1243,136 @@ ZeroTierWindowsRuntime::BuildNetworkDiagnosticsPayloadLocked(
       {EncodableValue("networkConnected"),
        EncodableValue(network_it == networks_.end() ? false
                                                     : network_it->second.is_connected)},
+      {EncodableValue("localInterfaceReady"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.local_interface_ready)},
+      {EncodableValue("matchedInterfaceName"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.matched_interface_name)},
+      {EncodableValue("matchedInterfaceUp"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.matched_interface_up)},
+      {EncodableValue("localMountState"),
+       EncodableValue(network_it == networks_.end()
+                          ? "unknown"
+                          : network_it->second.local_mount_state)},
       {EncodableValue("networkAddressCount"),
        EncodableValue(static_cast<int>(
            network_it == networks_.end()
                ? 0
                : network_it->second.assigned_addresses.size()))},
       {EncodableValue("networkAddresses"), EncodableValue(network_addresses)},
+      {EncodableValue("lastEventCode"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_event_code)},
+      {EncodableValue("lastEventName"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.last_event_name)},
+      {EncodableValue("lastEventAtUtc"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.last_event_at_utc)},
+      {EncodableValue("lastEventStatusCode"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_event_status_code)},
+      {EncodableValue("lastEventNetworkType"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_event_network_type)},
+      {EncodableValue("lastEventNetconfRev"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_event_netconf_rev)},
+      {EncodableValue("lastEventAssignedAddrCount"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_event_assigned_addr_count)},
+      {EncodableValue("lastEventTransportReady"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_event_transport_ready)},
+      {EncodableValue("lastProbeStatusCode"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_probe_status_code)},
+      {EncodableValue("lastProbeAtUtc"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.last_probe_at_utc)},
+      {EncodableValue("lastProbeTransportReady"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_probe_transport_ready)},
+      {EncodableValue("lastProbeAddrResult"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_probe_addr_result)},
+      {EncodableValue("lastProbeAddrResultName"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.last_probe_addr_result_name)},
+      {EncodableValue("lastProbeAssignedAddrCount"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_probe_assigned_addr_count)},
+      {EncodableValue("lastProbeNetworkType"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.last_probe_network_type)},
+      {EncodableValue("lastProbePendingJoin"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.last_probe_pending_join)},
+      {EncodableValue("joinTraceStartedAtUtc"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.join_trace_started_at_utc)},
+      {EncodableValue("joinEventSequence"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.join_event_sequence)},
+      {EncodableValue("joinSawReqConfig"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_saw_req_config)},
+      {EncodableValue("joinSawReadyIp4"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_saw_ready_ip4)},
+      {EncodableValue("joinSawReadyIp6"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_saw_ready_ip6)},
+      {EncodableValue("joinSawReadyIp4Ip6"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_saw_ready_ip4_ip6)},
+      {EncodableValue("joinSawNetworkOk"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_saw_network_ok)},
+      {EncodableValue("joinSawNetworkDown"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_saw_network_down)},
+      {EncodableValue("joinSawAddrAddedIp4"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_saw_addr_added_ip4)},
+      {EncodableValue("joinSawAddrAddedIp6"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_saw_addr_added_ip6)},
+      {EncodableValue("joinTraceActive"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.join_trace_active)},
       {EncodableValue("adapterBridge"),
        EncodableValue(BuildAdapterDiagnosticsPayloadLocked())},
   };
@@ -957,9 +1380,37 @@ ZeroTierWindowsRuntime::BuildNetworkDiagnosticsPayloadLocked(
 
 flutter::EncodableMap
 ZeroTierWindowsRuntime::BuildAdapterDiagnosticsPayloadLocked() const {
+  EncodableList adapters;
+  for (const auto& adapter : adapter_probe_.adapters) {
+    EncodableList ipv4_addresses;
+    for (const auto& address : adapter.ipv4_addresses) {
+      ipv4_addresses.emplace_back(address);
+    }
+    adapters.emplace_back(EncodableMap{
+        {EncodableValue("adapterName"), EncodableValue(adapter.adapter_name)},
+        {EncodableValue("friendlyName"), EncodableValue(adapter.friendly_name)},
+        {EncodableValue("description"), EncodableValue(adapter.description)},
+        {EncodableValue("ifIndex"),
+         EncodableValue(static_cast<int64_t>(adapter.if_index))},
+        {EncodableValue("luid"),
+         EncodableValue(static_cast<int64_t>(adapter.luid))},
+        {EncodableValue("operStatus"), EncodableValue(adapter.oper_status)},
+        {EncodableValue("isUp"), EncodableValue(adapter.is_up)},
+        {EncodableValue("isVirtual"), EncodableValue(adapter.is_virtual)},
+        {EncodableValue("isMountCandidate"),
+         EncodableValue(adapter.is_mount_candidate)},
+        {EncodableValue("matchesExpectedIp"),
+         EncodableValue(adapter.matches_expected_ip)},
+        {EncodableValue("ipv4Addresses"), EncodableValue(ipv4_addresses)},
+    });
+  }
   EncodableList adapter_names;
   for (const auto& item : adapter_probe_.virtual_adapter_names) {
     adapter_names.emplace_back(item);
+  }
+  EncodableList mount_candidate_names;
+  for (const auto& item : adapter_probe_.mount_candidate_names) {
+    mount_candidate_names.emplace_back(item);
   }
   EncodableList detected_ips;
   for (const auto& item : adapter_probe_.detected_ipv4_addresses) {
@@ -973,11 +1424,16 @@ ZeroTierWindowsRuntime::BuildAdapterDiagnosticsPayloadLocked() const {
       {EncodableValue("initialized"), EncodableValue(adapter_probe_.initialized)},
       {EncodableValue("hasVirtualAdapter"),
        EncodableValue(adapter_probe_.has_virtual_adapter)},
+      {EncodableValue("hasMountCandidate"),
+       EncodableValue(adapter_probe_.has_mount_candidate)},
       {EncodableValue("hasExpectedNetworkIp"),
        EncodableValue(adapter_probe_.has_expected_network_ip)},
       {EncodableValue("virtualAdapterNames"), EncodableValue(adapter_names)},
+      {EncodableValue("mountCandidateNames"),
+       EncodableValue(mount_candidate_names)},
       {EncodableValue("detectedIpv4Addresses"), EncodableValue(detected_ips)},
       {EncodableValue("expectedIpv4Addresses"), EncodableValue(expected_ips)},
+      {EncodableValue("adapters"), EncodableValue(adapters)},
       {EncodableValue("summary"), EncodableValue(adapter_probe_.summary)},
   };
 }
@@ -1112,8 +1568,8 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
   }
 
   auto* event = reinterpret_cast<zts_event_msg_t*>(message_ptr);
-  if (const char* event_name = EventCodeToString(event->event_code);
-      event_name != nullptr) {
+  const char* event_name = EventCodeToString(event->event_code);
+  if (event_name != nullptr) {
     std::clog << "[ZT/WIN] libzt event"
               << " code=" << event->event_code
               << " name=" << event_name
@@ -1142,6 +1598,18 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
   }
 
   if (event->network != nullptr) {
+    bool is_pending_join_network = false;
+    {
+      std::scoped_lock lock(mutex_);
+      is_pending_join_network =
+          pending_join_networks_.find(event->network->net_id) !=
+          pending_join_networks_.end();
+    }
+    int event_transport_ready = 0;
+    {
+      std::scoped_lock api_lock(api_mutex_);
+      event_transport_ready = zts_net_transport_is_ready(event->network->net_id);
+    }
     std::clog << "[ZT/WIN] Event network snapshot"
               << " network_id=" << ToHexNetworkId(event->network->net_id)
               << " status=" << NetworkStatusToString(event->network->status)
@@ -1153,14 +1621,24 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
               << " port_error=" << event->network->port_error
               << " netconf_rev=" << event->network->netconf_rev
               << " assigned_addr_count=" << event->network->assigned_addr_count
+              << " transport_ready=" << event_transport_ready
+              << " pending_join=" << (is_pending_join_network ? "true" : "false")
               << std::endl;
     UpdateNetworkFromLibztMessage(message_ptr);
   }
   if (event->addr != nullptr) {
+    bool is_pending_join_network = false;
+    {
+      std::scoped_lock lock(mutex_);
+      is_pending_join_network =
+          pending_join_networks_.find(event->addr->net_id) !=
+          pending_join_networks_.end();
+    }
     std::clog << "[ZT/WIN] Event address snapshot"
               << " network_id=" << ToHexNetworkId(event->addr->net_id)
               << " family=" << event->addr->addr.ss_family
               << " address=" << ExtractAddress(event->addr->addr)
+              << " pending_join=" << (is_pending_join_network ? "true" : "false")
               << std::endl;
     UpdateAddressFromLibztMessage(message_ptr);
   }
@@ -1188,6 +1666,42 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
         node_offline_ = true;
         ClearLastErrorLocked();
         payload = BuildNodeDiagnosticsPayloadLocked(event->event_code);
+        if (!pending_join_networks_.empty()) {
+          std::clog << "[ZT/WIN] NodeOffline during pending join"
+                    << " pending_join_count=" << pending_join_networks_.size()
+                    << std::endl;
+          for (const uint64_t network_id : pending_join_networks_) {
+            const auto network_it = networks_.find(network_id);
+            if (network_it == networks_.end()) {
+              std::clog << "[ZT/WIN] NodeOffline pending join network"
+                        << " network_id=" << ToHexNetworkId(network_id)
+                        << " record=missing"
+                        << std::endl;
+              continue;
+            }
+            const ZeroTierWindowsNetworkRecord& network = network_it->second;
+            std::clog << "[ZT/WIN] NodeOffline pending join network"
+                      << " network_id=" << ToHexNetworkId(network_id)
+                      << " status=" << network.status
+                      << " authorized=" << (network.is_authorized ? "true" : "false")
+                      << " connected=" << (network.is_connected ? "true" : "false")
+                      << " local_mount_state=" << network.local_mount_state
+                      << " last_event=" << network.last_event_name
+                      << " last_event_status_code=" << network.last_event_status_code
+                      << " last_event_netconf_rev=" << network.last_event_netconf_rev
+                      << " last_event_addr_count=" << network.last_event_assigned_addr_count
+                      << " last_event_transport_ready="
+                      << network.last_event_transport_ready
+                      << " last_probe_status_code=" << network.last_probe_status_code
+                      << " last_probe_transport_ready="
+                      << network.last_probe_transport_ready
+                      << " last_probe_addr_result="
+                      << network.last_probe_addr_result_name
+                      << " last_probe_addr_count="
+                      << network.last_probe_assigned_addr_count
+                      << std::endl;
+          }
+        }
       }
       EmitEvent(BuildEvent("nodeOffline", message, "", payload));
       break;
@@ -1259,6 +1773,32 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
         payload = BuildNetworkDiagnosticsPayloadLocked(
             event->network == nullptr ? 0 : event->network->net_id,
             event->event_code, "networkReady");
+        if (event->event_code == ZTS_EVENT_NETWORK_OK &&
+            event->network != nullptr) {
+          const auto network_it = networks_.find(event->network->net_id);
+          if (network_it != networks_.end() &&
+              pending_join_networks_.find(event->network->net_id) !=
+                  pending_join_networks_.end() &&
+              !network_it->second.join_saw_ready_ip4 &&
+              !network_it->second.join_saw_ready_ip6 &&
+              !network_it->second.join_saw_ready_ip4_ip6 &&
+              !network_it->second.join_saw_addr_added_ip4 &&
+              !network_it->second.join_saw_addr_added_ip6) {
+            std::clog << "[ZT/WIN] Join recovery anomaly"
+                      << " network_id=" << ToHexNetworkId(event->network->net_id)
+                      << " observed=NETWORK_OK_without_READY_or_ADDR_ADDED"
+                      << " event_sequence="
+                      << (network_it->second.join_event_sequence.empty()
+                              ? "-"
+                              : network_it->second.join_event_sequence)
+                      << " netconf_rev=" << network_it->second.last_event_netconf_rev
+                      << " event_addr_count="
+                      << network_it->second.last_event_assigned_addr_count
+                      << " probe_addr_result="
+                      << network_it->second.last_probe_addr_result_name
+                      << std::endl;
+          }
+        }
       }
       if (suppress_event) {
         break;
@@ -1320,6 +1860,27 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
             it->second.is_connected = false;
             it->second.is_authorized = false;
             it->second.assigned_addresses.clear();
+            std::clog << "[ZT/WIN] NetworkDown diagnostics"
+                      << " network_id=" << ToHexNetworkId(event->network->net_id)
+                      << " local_mount_state=" << it->second.local_mount_state
+                      << " last_event=" << it->second.last_event_name
+                      << " last_event_status_code="
+                      << it->second.last_event_status_code
+                      << " last_event_netconf_rev="
+                      << it->second.last_event_netconf_rev
+                      << " last_event_addr_count="
+                      << it->second.last_event_assigned_addr_count
+                      << " last_event_transport_ready="
+                      << it->second.last_event_transport_ready
+                      << " last_probe_status_code="
+                      << it->second.last_probe_status_code
+                      << " last_probe_transport_ready="
+                      << it->second.last_probe_transport_ready
+                      << " last_probe_addr_result="
+                      << it->second.last_probe_addr_result_name
+                      << " last_probe_addr_count="
+                      << it->second.last_probe_assigned_addr_count
+                      << std::endl;
           }
         }
       }
@@ -1362,6 +1923,11 @@ void ZeroTierWindowsRuntime::UpdateNetworkFromLibztMessage(
     return;
   }
 
+  int transport_ready = 0;
+  {
+    std::scoped_lock api_lock(api_mutex_);
+    transport_ready = zts_net_transport_is_ready(event->network->net_id);
+  }
   std::scoped_lock lock(mutex_);
   const zts_net_info_t* network = event->network;
   if (leaving_networks_.find(network->net_id) != leaving_networks_.end()) {
@@ -1369,22 +1935,51 @@ void ZeroTierWindowsRuntime::UpdateNetworkFromLibztMessage(
   }
   auto& record = networks_[network->net_id];
   const ZeroTierWindowsNetworkRecord previous_record = record;
+  const bool join_trace_active =
+      previous_record.join_trace_active ||
+      pending_join_networks_.find(network->net_id) != pending_join_networks_.end();
   RememberKnownNetworkLocked(network->net_id);
   ZeroTierWindowsNetworkRecord next_record;
   next_record.network_id = network->net_id;
   next_record.network_name = network->name == nullptr ? "" : network->name;
   next_record.status = NetworkStatusToString(network->status);
   const bool stale_addresses = ShouldTreatAddressesAsStale(next_record.status);
+  next_record.last_event_code = event->event_code;
+  next_record.last_event_name =
+      EventCodeToString(event->event_code) == nullptr
+          ? "UNKNOWN_EVENT"
+          : EventCodeToString(event->event_code);
+  next_record.last_event_at_utc = Iso8601NowUtc();
+  next_record.last_event_status_code = network->status;
+  next_record.last_event_network_type = network->type;
+  next_record.last_event_netconf_rev = network->netconf_rev;
+  next_record.last_event_assigned_addr_count =
+      static_cast<int>(network->assigned_addr_count);
+  next_record.last_event_transport_ready = transport_ready;
+  next_record.join_trace_started_at_utc = previous_record.join_trace_started_at_utc;
+  next_record.join_event_sequence = previous_record.join_event_sequence;
+  next_record.join_saw_req_config = previous_record.join_saw_req_config;
+  next_record.join_saw_ready_ip4 = previous_record.join_saw_ready_ip4;
+  next_record.join_saw_ready_ip6 = previous_record.join_saw_ready_ip6;
+  next_record.join_saw_ready_ip4_ip6 = previous_record.join_saw_ready_ip4_ip6;
+  next_record.join_saw_network_ok = previous_record.join_saw_network_ok;
+  next_record.join_saw_network_down = previous_record.join_saw_network_down;
+  next_record.join_saw_addr_added_ip4 = previous_record.join_saw_addr_added_ip4;
+  next_record.join_saw_addr_added_ip6 = previous_record.join_saw_addr_added_ip6;
+  next_record.join_trace_active = join_trace_active;
+  if (join_trace_active && next_record.join_trace_started_at_utc.empty()) {
+    next_record.join_trace_started_at_utc = Iso8601NowUtc();
+  }
+  if (join_trace_active) {
+    AppendJoinTraceEvent(&next_record, event->event_code,
+                         EventCodeToString(event->event_code));
+  }
   next_record.is_authorized =
       network->status == ZTS_NETWORK_STATUS_OK ||
       network->type == ZTS_NETWORK_TYPE_PUBLIC;
-  {
-    std::scoped_lock api_lock(api_mutex_);
-    next_record.is_connected =
-        !stale_addresses &&
-        (zts_net_transport_is_ready(network->net_id) > 0 ||
-         network->assigned_addr_count > 0);
-  }
+  next_record.is_connected =
+      !stale_addresses &&
+      (transport_ready > 0 || network->assigned_addr_count > 0);
   next_record.assigned_addresses.clear();
   if (!stale_addresses) {
     for (unsigned int i = 0; i < network->assigned_addr_count; ++i) {
@@ -1395,9 +1990,7 @@ void ZeroTierWindowsRuntime::UpdateNetworkFromLibztMessage(
     }
   }
   const bool should_keep_previous_ready_state =
-      previous_record.status == "OK" &&
-      (previous_record.is_connected ||
-       !previous_record.assigned_addresses.empty()) &&
+      previous_record.local_interface_ready &&
       next_record.status == "REQUESTING_CONFIGURATION" &&
       !next_record.is_connected && next_record.assigned_addresses.empty();
   if (should_keep_previous_ready_state) {
@@ -1408,6 +2001,19 @@ void ZeroTierWindowsRuntime::UpdateNetworkFromLibztMessage(
               << " reason=transientRegression"
               << std::endl;
   } else {
+    next_record.last_probe_status_code = previous_record.last_probe_status_code;
+    next_record.last_probe_at_utc = previous_record.last_probe_at_utc;
+    next_record.last_probe_transport_ready =
+        previous_record.last_probe_transport_ready;
+    next_record.last_probe_addr_result = previous_record.last_probe_addr_result;
+    next_record.last_probe_addr_result_name =
+        previous_record.last_probe_addr_result_name;
+    next_record.last_probe_assigned_addr_count =
+        previous_record.last_probe_assigned_addr_count;
+    next_record.last_probe_network_type =
+        previous_record.last_probe_network_type;
+    next_record.last_probe_pending_join =
+        previous_record.last_probe_pending_join;
     record = std::move(next_record);
   }
   std::clog << "[ZT/WIN] UpdateNetworkFromEvent"
@@ -1417,11 +2023,13 @@ void ZeroTierWindowsRuntime::UpdateNetworkFromLibztMessage(
             << " type=" << network->type
             << " authorized=" << (record.is_authorized ? "true" : "false")
             << " connected=" << (record.is_connected ? "true" : "false")
+            << " transport_ready=" << record.last_event_transport_ready
+            << " netconf_rev=" << record.last_event_netconf_rev
             << " assigned_addr_count=" << network->assigned_addr_count
             << " addresses=" << JoinAddresses(record.assigned_addresses)
             << std::endl;
-  if (record.is_connected || !record.assigned_addresses.empty() ||
-      (record.status == "OK" && record.is_authorized)) {
+  if (record.local_interface_ready || record.is_connected ||
+      !record.assigned_addresses.empty()) {
     pending_join_networks_.erase(network->net_id);
   }
 }
@@ -1440,6 +2048,15 @@ void ZeroTierWindowsRuntime::UpdateAddressFromLibztMessage(
   auto& record = networks_[event->addr->net_id];
   RememberKnownNetworkLocked(event->addr->net_id);
   record.network_id = event->addr->net_id;
+  if (record.join_trace_active ||
+      pending_join_networks_.find(event->addr->net_id) != pending_join_networks_.end()) {
+    if (record.join_trace_started_at_utc.empty()) {
+      record.join_trace_started_at_utc = Iso8601NowUtc();
+    }
+    record.join_trace_active = true;
+    AppendJoinTraceEvent(&record, event->event_code,
+                         EventCodeToString(event->event_code));
+  }
   if (ShouldTreatAddressesAsStale(record.status)) {
     record.assigned_addresses.clear();
     record.is_connected = false;
@@ -1630,6 +2247,16 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         if (retained.status.empty() || retained.status == "UNKNOWN") {
           retained.status = "UNKNOWN";
         }
+        retained.last_probe_status_code = status_code;
+        retained.last_probe_at_utc = Iso8601NowUtc();
+        retained.last_probe_transport_ready = transport_ready;
+        retained.last_probe_addr_result = addr_result;
+        retained.last_probe_addr_result_name = ErrorCodeToString(addr_result);
+        retained.last_probe_assigned_addr_count =
+            static_cast<int>(assigned_addr_count);
+        retained.last_probe_network_type = network_type;
+        retained.last_probe_pending_join = pending_join_network_ids.find(network_id) !=
+                                           pending_join_network_ids.end();
         refreshed_networks[network_id] = std::move(retained);
         std::clog << "[ZT/WIN] RefreshSnapshot retained pending network"
                   << " network_id=" << ToHexNetworkId(network_id)
@@ -1645,7 +2272,18 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                                                   normalized_status,
                                                   has_transport,
                                                   has_assigned_address)) {
-      refreshed_networks[network_id] = previous_it->second;
+      ZeroTierWindowsNetworkRecord retained = previous_it->second;
+      retained.last_probe_status_code = status_code;
+      retained.last_probe_at_utc = Iso8601NowUtc();
+      retained.last_probe_transport_ready = transport_ready;
+      retained.last_probe_addr_result = addr_result;
+      retained.last_probe_addr_result_name = ErrorCodeToString(addr_result);
+      retained.last_probe_assigned_addr_count =
+          static_cast<int>(assigned_addr_count);
+      retained.last_probe_network_type = network_type;
+      retained.last_probe_pending_join = pending_join_network_ids.find(network_id) !=
+                                         pending_join_network_ids.end();
+      refreshed_networks[network_id] = std::move(retained);
       std::clog << "[ZT/WIN] RefreshSnapshot retained network"
                 << " network_id=" << ToHexNetworkId(network_id)
                 << " previous_status=" << previous_it->second.status
@@ -1678,6 +2316,41 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                 << std::endl;
       continue;
     }
+    record.last_probe_status_code = status_code;
+    record.last_probe_at_utc = Iso8601NowUtc();
+    record.last_probe_transport_ready = transport_ready;
+    record.last_probe_addr_result = addr_result;
+    record.last_probe_addr_result_name = ErrorCodeToString(addr_result);
+    record.last_probe_assigned_addr_count = static_cast<int>(assigned_addr_count);
+    record.last_probe_network_type = network_type;
+    record.last_probe_pending_join = pending_join;
+    if (previous_it != previous_networks.end()) {
+      record.last_event_code = previous_it->second.last_event_code;
+      record.last_event_name = previous_it->second.last_event_name;
+      record.last_event_at_utc = previous_it->second.last_event_at_utc;
+      record.last_event_status_code = previous_it->second.last_event_status_code;
+      record.last_event_network_type = previous_it->second.last_event_network_type;
+      record.last_event_netconf_rev = previous_it->second.last_event_netconf_rev;
+      record.last_event_assigned_addr_count =
+          previous_it->second.last_event_assigned_addr_count;
+      record.last_event_transport_ready =
+          previous_it->second.last_event_transport_ready;
+      record.join_trace_started_at_utc =
+          previous_it->second.join_trace_started_at_utc;
+      record.join_event_sequence = previous_it->second.join_event_sequence;
+      record.join_saw_req_config = previous_it->second.join_saw_req_config;
+      record.join_saw_ready_ip4 = previous_it->second.join_saw_ready_ip4;
+      record.join_saw_ready_ip6 = previous_it->second.join_saw_ready_ip6;
+      record.join_saw_ready_ip4_ip6 =
+          previous_it->second.join_saw_ready_ip4_ip6;
+      record.join_saw_network_ok = previous_it->second.join_saw_network_ok;
+      record.join_saw_network_down = previous_it->second.join_saw_network_down;
+      record.join_saw_addr_added_ip4 =
+          previous_it->second.join_saw_addr_added_ip4;
+      record.join_saw_addr_added_ip6 =
+          previous_it->second.join_saw_addr_added_ip6;
+      record.join_trace_active = previous_it->second.join_trace_active;
+    }
     refreshed_networks[network_id] = std::move(record);
   }
 
@@ -1694,6 +2367,67 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
   std::clog << "[ZT/WIN] AdapterBridge probe"
             << " summary=" << adapter_probe.summary
             << std::endl;
+
+  for (auto& [network_id, record] : refreshed_networks) {
+    record.local_interface_ready = false;
+    record.matched_interface_name.clear();
+    record.matched_interface_up = false;
+
+    if (!record.assigned_addresses.empty()) {
+      const ZeroTierWindowsAdapterBridge::AdapterRecord* exact_match = nullptr;
+      const ZeroTierWindowsAdapterBridge::AdapterRecord* fallback_candidate =
+          nullptr;
+      for (const auto& adapter : adapter_probe.adapters) {
+        const bool matched = std::any_of(
+            record.assigned_addresses.begin(), record.assigned_addresses.end(),
+            [&adapter](const std::string& address) {
+              return std::find(adapter.ipv4_addresses.begin(),
+                               adapter.ipv4_addresses.end(),
+                               address) != adapter.ipv4_addresses.end();
+            });
+        if (matched) {
+          exact_match = &adapter;
+          break;
+        }
+        if (!adapter.is_mount_candidate) {
+          continue;
+        }
+        if (fallback_candidate == nullptr ||
+            (!fallback_candidate->is_up && adapter.is_up)) {
+          fallback_candidate = &adapter;
+        }
+      }
+
+      const auto* selected_adapter =
+          exact_match != nullptr ? exact_match : fallback_candidate;
+      if (selected_adapter != nullptr) {
+        record.matched_interface_name =
+            !selected_adapter->friendly_name.empty()
+                ? selected_adapter->friendly_name
+                : (!selected_adapter->description.empty()
+                       ? selected_adapter->description
+                       : selected_adapter->adapter_name);
+        record.matched_interface_up = selected_adapter->is_up;
+        record.local_interface_ready =
+            exact_match != nullptr && selected_adapter->is_up;
+      }
+    }
+
+    record.local_mount_state =
+        ResolveLocalMountState(record, adapter_probe.has_virtual_adapter);
+    std::clog << "[ZT/WIN] RefreshSnapshot mount probe"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " local_mount_state=" << record.local_mount_state
+              << " local_interface_ready="
+              << (record.local_interface_ready ? "true" : "false")
+              << " matched_interface="
+              << (record.matched_interface_name.empty()
+                      ? "-"
+                      : record.matched_interface_name)
+              << " matched_interface_up="
+              << (record.matched_interface_up ? "true" : "false")
+              << std::endl;
+  }
 
   std::scoped_lock lock(mutex_);
   node_id_ = IsUsableNodeId(node_id) ? node_id : 0;

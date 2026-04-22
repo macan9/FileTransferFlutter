@@ -157,30 +157,30 @@ bool VirtualTap::addIp(const InetAddress& ip)
 {
     // TODO: Rewrite to allow for more addresses
     char ipbuf[128] = { 0 };
+    ip.toString(ipbuf);
     /* Limit address assignments to one per type.
     This limitation can be removed if some changes
     are made in the netif driver. */
     if (ip.isV4() && hasIpv4Addr()) {
-        ip.toString(ipbuf);
-        // DEBUG_INFO("failed to add IP (%s), only one per type per netif
-        // allowed\n", ipbuf);
+        fprintf(stderr, "[libzt] VirtualTap::addIp skip duplicate family ip=%s net=%llx reason=existing_ipv4\n", ipbuf, (unsigned long long)_net_id);
         return false;
     }
     if (ip.isV6() && hasIpv6Addr()) {
-        ip.toString(ipbuf);
-        // DEBUG_INFO("failed to add IP (%s), only one per type per netif
-        // allowed\n", ipbuf);
+        fprintf(stderr, "[libzt] VirtualTap::addIp skip duplicate family ip=%s net=%llx reason=existing_ipv6\n", ipbuf, (unsigned long long)_net_id);
         return false;
     }
 
     Mutex::Lock _l(_ips_m);
     if (_ips.size() >= ZT_MAX_ZT_ASSIGNED_ADDRESSES) {
+        fprintf(stderr, "[libzt] VirtualTap::addIp skip ip=%s net=%llx reason=max_addresses\n", ipbuf, (unsigned long long)_net_id);
         return false;
     }
     if (std::find(_ips.begin(), _ips.end(), ip) == _ips.end()) {
+        fprintf(stderr, "[libzt] VirtualTap::addIp apply ip=%s net=%llx family=%s beforeCount=%u\n", ipbuf, (unsigned long long)_net_id, ip.isV4() ? "ipv4" : (ip.isV6() ? "ipv6" : "other"), (unsigned int)_ips.size());
         zts_lwip_init_interface((void*)this, ip);
         _ips.push_back(ip);
         std::sort(_ips.begin(), _ips.end());
+        fprintf(stderr, "[libzt] VirtualTap::addIp applied ip=%s net=%llx afterCount=%u netif4=%p netif6=%p\n", ipbuf, (unsigned long long)_net_id, (unsigned int)_ips.size(), netif4, netif6);
     }
     return true;
 }
@@ -528,6 +528,8 @@ static err_t zts_netif_init6(struct netif* n)
 void zts_lwip_init_interface(void* tapref, const InetAddress& ip)
 {
     char macbuf[ZTS_MAC_ADDRSTRLEN] = { 0 };
+    char ipbuf[128] = { 0 };
+    ip.toString(ipbuf);
 
     VirtualTap* vtap = (VirtualTap*)tapref;
     struct netif* n = NULL;
@@ -561,6 +563,7 @@ void zts_lwip_init_interface(void* tapref, const InetAddress& ip)
             n->hwaddr[3],
             n->hwaddr[4],
             n->hwaddr[5]);
+        fprintf(stderr, "[libzt] zts_lwip_init_interface ipv4 net=%llx ip=%s isNewNetif=%d netif=%p mac=%s\n", (unsigned long long)vtap->_net_id, ipbuf, isNewNetif ? 1 : 0, n, macbuf);
     }
     if (ip.isV6()) {
         if (vtap->netif6) {
@@ -610,6 +613,7 @@ void zts_lwip_init_interface(void* tapref, const InetAddress& ip)
             n->hwaddr[3],
             n->hwaddr[4],
             n->hwaddr[5]);
+        fprintf(stderr, "[libzt] zts_lwip_init_interface ipv6 net=%llx ip=%s isNewNetif=%d netif=%p mac=%s\n", (unsigned long long)vtap->_net_id, ipbuf, isNewNetif ? 1 : 0, n, macbuf);
     }
 }
 

@@ -579,6 +579,14 @@ Network::Network(const RuntimeEnvironment *renv,void *tPtr,uint64_t nwid,void *u
 	}
 
 	if (nconf) {
+		fprintf(
+			stderr,
+			"[libzt-core] Network ctor using provided config net=%llx rev=%llu staticIpCount=%u routeCount=%u name=%s\n",
+			(unsigned long long)_id,
+			(unsigned long long)nconf->revision,
+			nconf->staticIpCount,
+			nconf->routeCount,
+			nconf->name);
 		this->setConfiguration(tPtr,*nconf,false);
 		_lastConfigUpdate = 0; // still want to re-request since it's likely outdated
 	} else {
@@ -590,10 +598,23 @@ Network::Network(const RuntimeEnvironment *renv,void *tPtr,uint64_t nwid,void *u
 		Dictionary<ZT_NETWORKCONFIG_DICT_CAPACITY> *dict = new Dictionary<ZT_NETWORKCONFIG_DICT_CAPACITY>();
 		try {
 			int n = RR->node->stateObjectGet(tPtr,ZT_STATE_OBJECT_NETWORK_CONFIG,tmp,dict->unsafeData(),ZT_NETWORKCONFIG_DICT_CAPACITY - 1);
+			fprintf(
+				stderr,
+				"[libzt-core] Network ctor stateObjectGet net=%llx bytes=%d\n",
+				(unsigned long long)_id,
+				n);
 			if (n > 1) {
 				NetworkConfig *nconf = new NetworkConfig();
 				try {
 					if (nconf->fromDictionary(*dict)) {
+						fprintf(
+							stderr,
+							"[libzt-core] Network ctor restored config net=%llx rev=%llu staticIpCount=%u routeCount=%u name=%s\n",
+							(unsigned long long)_id,
+							(unsigned long long)nconf->revision,
+							nconf->staticIpCount,
+							nconf->routeCount,
+							nconf->name);
 						this->setConfiguration(tPtr,*nconf,false);
 						_lastConfigUpdate = 0; // still want to re-request an update since it's likely outdated
 						got = true;
@@ -605,6 +626,10 @@ Network::Network(const RuntimeEnvironment *renv,void *tPtr,uint64_t nwid,void *u
 		delete dict;
 
 		if (!got) {
+			fprintf(
+				stderr,
+				"[libzt-core] Network ctor no cached config net=%llx writing placeholder state\n",
+				(unsigned long long)_id);
 			RR->node->stateObjectPut(tPtr,ZT_STATE_OBJECT_NETWORK_CONFIG,tmp,"\n",1);
 		}
 	}
@@ -1043,6 +1068,23 @@ uint64_t Network::handleConfigChunk(void *tPtr,const uint64_t packetId,const Add
 	}
 
 	if (nc) {
+		char sourceStr[24];
+		char controllerStr[24];
+		char selfStr[24];
+		(source ? source : Address()).toString(sourceStr);
+		controller().toString(controllerStr);
+		RR->identity.address().toString(selfStr);
+		fprintf(
+			stderr,
+			"[libzt-core] Network handleConfigChunk apply net=%llx source=%s controller=%s self=%s revision=%llu staticIpCount=%u routeCount=%u fromLocalController=%d\n",
+			(unsigned long long)_id,
+			sourceStr,
+			controllerStr,
+			selfStr,
+			(unsigned long long)nc->revision,
+			nc->staticIpCount,
+			nc->routeCount,
+			(source == RR->identity.address()) ? 1 : 0);
 		this->setConfiguration(tPtr, *nc, true);
 		delete nc;
 		return configUpdateId;
@@ -1085,11 +1127,28 @@ int Network::setConfiguration(void *tPtr,const NetworkConfig &nconf,bool saveToD
 
 		_portError = RR->node->configureVirtualNetworkPort(tPtr,_id,&_uPtr,(oldPortInitialized) ? ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE : ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_UP,&ctmp);
 		_authenticationURL = nconf.authenticationURL;
+		fprintf(
+			stderr,
+			"[libzt-core] Network setConfiguration net=%llx rev=%llu staticIpCount=%u routeCount=%u saveToDisk=%d portOp=%s name=%s\n",
+			(unsigned long long)_id,
+			(unsigned long long)nconf.revision,
+			nconf.staticIpCount,
+			nconf.routeCount,
+			saveToDisk ? 1 : 0,
+			oldPortInitialized ? "CONFIG_UPDATE" : "UP",
+			nconf.name);
 
 		if (saveToDisk) {
 			Dictionary<ZT_NETWORKCONFIG_DICT_CAPACITY> *const d = new Dictionary<ZT_NETWORKCONFIG_DICT_CAPACITY>();
 			try {
 				if (nconf.toDictionary(*d,false)) {
+					fprintf(
+						stderr,
+						"[libzt-core] Network setConfiguration save net=%llx bytes=%u staticIpCount=%u routeCount=%u\n",
+						(unsigned long long)_id,
+						d->sizeBytes(),
+						nconf.staticIpCount,
+						nconf.routeCount);
 					uint64_t tmp[2];
 					tmp[0] = _id;
 					tmp[1] = 0;

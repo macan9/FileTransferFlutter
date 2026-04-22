@@ -1,11 +1,20 @@
 #include "native/zerotier/zerotier_windows_adapter_bridge.h"
 
+#include <WinSock2.h>
+#include <Windows.h>
+#include <iphlpapi.h>
+#include <ws2tcpip.h>
+
 #include <algorithm>
-#include <array>
 #include <cctype>
-#include <cstdio>
-#include <regex>
+#include <cstdint>
+#include <cstdlib>
+#include <set>
 #include <sstream>
+#include <vector>
+
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 namespace {
 
@@ -28,13 +37,86 @@ std::string Trim(const std::string& text) {
   return text.substr(begin, end - begin);
 }
 
-bool LooksLikeVirtualAdapter(const std::string& name) {
-  const std::string lowered = ToLower(name);
-  return lowered.find("zerotier") != std::string::npos ||
-         lowered.find("wintun") != std::string::npos ||
-         lowered.find("tap") != std::string::npos ||
-         lowered.find("vpn") != std::string::npos ||
-         lowered.find("virtual") != std::string::npos;
+std::string WideToUtf8(const wchar_t* text) {
+  if (text == nullptr || *text == L'\0') {
+    return "";
+  }
+  const int required = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0,
+                                           nullptr, nullptr);
+  if (required <= 1) {
+    return "";
+  }
+  std::string result(static_cast<size_t>(required), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), required, nullptr,
+                      nullptr);
+  result.pop_back();
+  return result;
+}
+
+bool ContainsSubstring(const std::string& text,
+                       std::initializer_list<const char*> needles) {
+  for (const char* needle : needles) {
+    if (needle == nullptr || *needle == '\0') {
+      continue;
+    }
+    if (text.find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string AdapterDisplayName(
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& record) {
+  if (!record.friendly_name.empty()) {
+    return record.friendly_name;
+  }
+  if (!record.description.empty()) {
+    return record.description;
+  }
+  return record.adapter_name;
+}
+
+bool LooksLikeMountCandidateAdapter(const std::string& text) {
+  const std::string lowered = ToLower(text);
+  if (lowered.empty()) {
+    return false;
+  }
+  if (ContainsSubstring(lowered,
+                        {"vmware", "hyper-v", "vethernet", "virtualbox",
+                         "bluetooth", "loopback", "pseudo-interface"})) {
+    return false;
+  }
+  return ContainsSubstring(
+      lowered, {"zerotier", "libzt", "tap-windows", "tap windows",
+                "tap-windows adapter", "tap adapter", "wintun",
+                "wireguard", "openvpn"});
+}
+
+bool LooksLikeVirtualAdapter(const std::string& text) {
+  const std::string lowered = ToLower(text);
+  return LooksLikeMountCandidateAdapter(lowered);
+}
+
+std::string OperStatusToString(IF_OPER_STATUS status) {
+  switch (status) {
+    case IfOperStatusUp:
+      return "up";
+    case IfOperStatusDown:
+      return "down";
+    case IfOperStatusTesting:
+      return "testing";
+    case IfOperStatusUnknown:
+      return "unknown";
+    case IfOperStatusDormant:
+      return "dormant";
+    case IfOperStatusNotPresent:
+      return "not_present";
+    case IfOperStatusLowerLayerDown:
+      return "lower_layer_down";
+    default:
+      return "unknown";
+  }
 }
 
 std::string Join(const std::vector<std::string>& values) {
@@ -51,28 +133,25 @@ std::string Join(const std::vector<std::string>& values) {
   return stream.str();
 }
 
-std::string ReadCommandOutput(const char* command) {
-  std::string output;
-#ifdef _WIN32
-  FILE* pipe = _popen(command, "r");
-#else
-  FILE* pipe = popen(command, "r");
-#endif
-  if (pipe == nullptr) {
-    return output;
+bool AppendIpv4Address(const IP_ADAPTER_UNICAST_ADDRESS* address,
+                       std::vector<std::string>* output) {
+  if (address == nullptr || address->Address.lpSockaddr == nullptr ||
+      output == nullptr) {
+    return false;
   }
-
-  std::array<char, 4096> buffer{};
-  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-    output += buffer.data();
+  if (address->Address.lpSockaddr->sa_family != AF_INET) {
+    return false;
   }
-
-#ifdef _WIN32
-  _pclose(pipe);
-#else
-  pclose(pipe);
-#endif
-  return output;
+  char buffer[INET_ADDRSTRLEN] = {0};
+  const sockaddr_in* ipv4 =
+      reinterpret_cast<const sockaddr_in*>(address->Address.lpSockaddr);
+  const PCSTR result = inet_ntop(AF_INET, &(ipv4->sin_addr), buffer,
+                                 static_cast<DWORD>(sizeof(buffer)));
+  if (result == nullptr || buffer[0] == '\0') {
+    return false;
+  }
+  output->push_back(buffer);
+  return true;
 }
 
 }  // namespace
@@ -110,59 +189,122 @@ ZeroTierWindowsAdapterBridge::ProbeResult ZeroTierWindowsAdapterBridge::Probe(
     const std::vector<std::string>& expected_ipv4_addresses) const {
   ProbeResult result;
   result.expected_ipv4_addresses = expected_ipv4_addresses;
+  std::set<std::string> expected_set;
+  for (const auto& address : expected_ipv4_addresses) {
+    const std::string trimmed = Trim(address);
+    if (!trimmed.empty()) {
+      expected_set.insert(trimmed);
+    }
+  }
 
-  const std::string ipconfig = ReadCommandOutput("ipconfig");
-  if (ipconfig.empty()) {
-    result.summary = "ipconfig returned no output.";
+  ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                GAA_FLAG_SKIP_DNS_SERVER;
+  ULONG buffer_size = 15 * 1024;
+  std::vector<unsigned char> buffer(buffer_size);
+  DWORD api_result = GetAdaptersAddresses(
+      AF_UNSPEC, flags, nullptr,
+      reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()), &buffer_size);
+  if (api_result == ERROR_BUFFER_OVERFLOW) {
+    buffer.resize(buffer_size);
+    api_result = GetAdaptersAddresses(
+        AF_UNSPEC, flags, nullptr,
+        reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()), &buffer_size);
+  }
+  if (api_result != NO_ERROR) {
+    std::ostringstream summary;
+    summary << "GetAdaptersAddresses failed: " << api_result;
+    result.summary = summary.str();
     return result;
   }
 
-  const std::regex ip_pattern(R"((\d{1,3}\.){3}\d{1,3})");
-  std::istringstream stream(ipconfig);
-  std::string line;
-  std::string current_adapter;
+  std::set<std::string> detected_ip_set;
+  std::vector<std::string> matched_adapters;
+  std::vector<std::string> mount_candidate_adapters;
+  for (PIP_ADAPTER_ADDRESSES adapter =
+           reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+       adapter != nullptr; adapter = adapter->Next) {
+    ZeroTierWindowsAdapterBridge::AdapterRecord record;
+    record.adapter_name = adapter->AdapterName == nullptr ? "" : adapter->AdapterName;
+    record.friendly_name = WideToUtf8(adapter->FriendlyName);
+    record.description = WideToUtf8(adapter->Description);
+    record.if_index = adapter->IfIndex;
+    record.luid = adapter->Luid.Value;
+    record.oper_status = OperStatusToString(adapter->OperStatus);
+    record.is_up = adapter->OperStatus == IfOperStatusUp;
+    record.is_mount_candidate =
+        LooksLikeMountCandidateAdapter(record.friendly_name) ||
+        LooksLikeMountCandidateAdapter(record.description) ||
+        LooksLikeMountCandidateAdapter(record.adapter_name);
+    record.is_virtual =
+        LooksLikeVirtualAdapter(record.friendly_name) ||
+        LooksLikeVirtualAdapter(record.description) ||
+        LooksLikeVirtualAdapter(record.adapter_name);
 
-  while (std::getline(stream, line)) {
-    const std::string trimmed = Trim(line);
-    if (trimmed.empty()) {
-      continue;
+    for (IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress;
+         unicast != nullptr; unicast = unicast->Next) {
+      AppendIpv4Address(unicast, &record.ipv4_addresses);
     }
-
-    if (trimmed.back() == ':') {
-      current_adapter = trimmed.substr(0, trimmed.size() - 1);
-      if (LooksLikeVirtualAdapter(current_adapter)) {
-        result.has_virtual_adapter = true;
-        result.virtual_adapter_names.push_back(current_adapter);
+    for (const auto& address : record.ipv4_addresses) {
+      detected_ip_set.insert(address);
+      if (expected_set.find(address) != expected_set.end()) {
+        record.matches_expected_ip = true;
       }
-      continue;
     }
 
-    std::smatch match;
-    if (!std::regex_search(trimmed, match, ip_pattern)) {
-      continue;
+    if (record.is_virtual) {
+      result.has_virtual_adapter = true;
+      const std::string display_name = AdapterDisplayName(record);
+      if (!display_name.empty()) {
+        result.virtual_adapter_names.push_back(display_name);
+      }
     }
-    const std::string ip = match.str(0);
-    if (ip == "0.0.0.0") {
-      continue;
+    if (record.is_mount_candidate) {
+      result.has_mount_candidate = true;
+      const std::string display_name = AdapterDisplayName(record);
+      if (!display_name.empty()) {
+        mount_candidate_adapters.push_back(display_name);
+      }
     }
-    result.detected_ipv4_addresses.push_back(ip);
-  }
-
-  for (const auto& expected : result.expected_ipv4_addresses) {
-    if (std::find(result.detected_ipv4_addresses.begin(),
-                  result.detected_ipv4_addresses.end(),
-                  expected) != result.detected_ipv4_addresses.end()) {
+    if (record.matches_expected_ip) {
       result.has_expected_network_ip = true;
-      break;
+      matched_adapters.push_back(AdapterDisplayName(record));
+    }
+
+    if (record.is_virtual || record.is_mount_candidate ||
+        record.matches_expected_ip ||
+        !record.ipv4_addresses.empty()) {
+      result.adapters.push_back(std::move(record));
     }
   }
+
+  result.detected_ipv4_addresses.assign(detected_ip_set.begin(),
+                                        detected_ip_set.end());
+  std::sort(result.detected_ipv4_addresses.begin(),
+            result.detected_ipv4_addresses.end());
+  std::sort(result.virtual_adapter_names.begin(), result.virtual_adapter_names.end());
+  result.virtual_adapter_names.erase(
+      std::unique(result.virtual_adapter_names.begin(),
+                  result.virtual_adapter_names.end()),
+      result.virtual_adapter_names.end());
+  result.mount_candidate_names = std::move(mount_candidate_adapters);
+  std::sort(result.mount_candidate_names.begin(), result.mount_candidate_names.end());
+  result.mount_candidate_names.erase(
+      std::unique(result.mount_candidate_names.begin(),
+                  result.mount_candidate_names.end()),
+      result.mount_candidate_names.end());
 
   std::ostringstream summary;
   summary << "virtual_adapter=" << (result.has_virtual_adapter ? "true" : "false")
-          << " expected_ip_bound=" << (result.has_expected_network_ip ? "true" : "false")
+          << " mount_candidate="
+          << (result.has_mount_candidate ? "true" : "false")
+          << " expected_ip_bound="
+          << (result.has_expected_network_ip ? "true" : "false")
           << " expected_ips=" << Join(result.expected_ipv4_addresses)
-          << " adapters=" << Join(result.virtual_adapter_names)
-          << " detected_ips=" << Join(result.detected_ipv4_addresses);
+          << " matched_adapters=" << Join(matched_adapters)
+          << " mount_candidates=" << Join(result.mount_candidate_names)
+          << " virtual_names=" << Join(result.virtual_adapter_names)
+          << " detected_ips=" << Join(result.detected_ipv4_addresses)
+          << " adapter_records=" << result.adapters.size();
   result.summary = summary.str();
   return result;
 }

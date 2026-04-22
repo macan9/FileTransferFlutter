@@ -5,6 +5,7 @@ import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
+import 'package:file_transfer_flutter/core/models/zerotier_adapter_bridge_status.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_network_state.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_runtime_event.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_runtime_status.dart';
@@ -624,6 +625,8 @@ class _RuntimeInsightCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 16),
+          _AdapterBridgeCard(adapterBridge: runtimeStatus.adapterBridge),
+          const SizedBox(height: 16),
           if (recentEvents.isEmpty)
             _EmptyStateBox(
               message: '当前还没有收到运行时事件。可以先点击“立即同步”，或发起一次入网联调。',
@@ -645,6 +648,79 @@ class _RuntimeInsightCard extends StatelessWidget {
             icon: const Icon(Icons.refresh_rounded),
             label: const Text('刷新运行时状态'),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AdapterBridgeCard extends StatelessWidget {
+  const _AdapterBridgeCard({
+    required this.adapterBridge,
+  });
+
+  final ZeroTierAdapterBridgeStatus adapterBridge;
+
+  @override
+  Widget build(BuildContext context) {
+    final List<ZeroTierAdapterRecord> highlightedAdapters =
+        adapterBridge.adapters
+            .where(
+              (ZeroTierAdapterRecord item) =>
+                  item.isVirtual || item.matchesExpectedIp,
+            )
+            .toList(growable: false);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFFE5E7EB)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: <Widget>[
+              _InfoPill(
+                label: 'Adapter Probe',
+                value: adapterBridge.initialized ? 'Ready' : 'Pending',
+              ),
+              _InfoPill(
+                label: 'Virtual Adapter',
+                value: adapterBridge.hasVirtualAdapter ? 'Detected' : 'Missing',
+              ),
+              _InfoPill(
+                label: 'Expected IP',
+                value: adapterBridge.hasExpectedNetworkIp ? 'Bound' : 'Unbound',
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _LabeledBlock(
+            label: 'Adapter Summary',
+            value: adapterBridge.summary ?? 'No adapter diagnostics yet.',
+          ),
+          if (highlightedAdapters.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            ...highlightedAdapters.map(
+              (ZeroTierAdapterRecord adapter) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _LabeledBlock(
+                  label: adapter.displayName,
+                  value: 'status=${adapter.operStatus} up=${adapter.isUp} '
+                      'virtual=${adapter.isVirtual} '
+                      'expectedIp=${adapter.matchesExpectedIp} '
+                      'ifIndex=${adapter.ifIndex} '
+                      'ipv4=${adapter.ipv4Addresses.isEmpty ? "-" : adapter.ipv4Addresses.join(", ")}',
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -811,10 +887,10 @@ class _OneClickNetworkingTab extends StatelessWidget {
     );
     final bool isMembershipRevoked =
         currentMembershipStatus?.trim().toLowerCase() == 'revoked';
-    final ZeroTierNetworkState? localState = isMembershipRevoked &&
-            _isEffectivelyLeftLocalNetwork(rawLocalState)
-        ? null
-        : rawLocalState;
+    final ZeroTierNetworkState? localState =
+        isMembershipRevoked && _isEffectivelyLeftLocalNetwork(rawLocalState)
+            ? null
+            : rawLocalState;
     final bool isMembershipAccepted =
         _isAcceptedMembershipStatus(currentMembershipStatus);
     final bool isSubmittingJoin = activeAction == 'join-default-network';
@@ -827,9 +903,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
                 transitionNetworkId == defaultNetworkId);
     final bool hasLocalMapping = localState != null &&
         !isLocalAuthorizationPending &&
-        (localState.isConnected ||
-            localState.assignedAddresses.isNotEmpty ||
-            (localState.status == 'OK' && hasServiceAssignedIp));
+        _isLocalNetworkMounted(localState, hasServiceAssignedIp);
     final bool isClosing =
         isTransitionLocked || (isMembershipRevoked && localState != null);
     final bool isGrouped = !isMembershipRevoked && hasLocalMapping;
@@ -837,9 +911,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
         !isClosing && isLocalAuthorizationPending;
     final bool localStillNegotiating = localState != null &&
         !isGrouped &&
-        (localState.status == 'REQUESTING_CONFIGURATION' ||
-            localState.status == 'OK' ||
-            localState.status == 'UNKNOWN');
+        _isLocalNetworkNegotiating(localState, hasServiceAssignedIp);
     final bool hasJoinIntentEvidence = isSubmittingJoin ||
         localStillNegotiating ||
         _hasRecentJoinIntent(agentState.recentRuntimeEvents, defaultNetworkId);
@@ -1182,7 +1254,7 @@ class _ManagedNetworkCard extends StatelessWidget {
         : null;
     final bool showServerAssignedIp = localState != null &&
         localState!.status == 'OK' &&
-        localState!.assignedAddresses.isEmpty &&
+        !_isLocalNetworkMounted(localState!, true) &&
         serverAssignedIp != null;
 
     return Container(
@@ -1291,8 +1363,9 @@ class _LocalNetworkCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final Color accentColor =
-        network.isConnected ? const Color(0xFF15803D) : const Color(0xFFB45309);
+    final Color accentColor = network.localInterfaceReady
+        ? const Color(0xFF15803D)
+        : const Color(0xFFB45309);
     final _NetworkVisualState visualState = _resolveNetworkVisualState(
       localState: network,
       managedStatus: _currentMembershipStatus(
@@ -1351,11 +1424,22 @@ class _LocalNetworkCard extends StatelessWidget {
             children: <Widget>[
               _InfoPill(label: 'Network ID', value: network.networkId),
               _InfoPill(
-                  label: 'Authorized',
-                  value: network.isAuthorized ? 'Yes' : 'No'),
+                label: 'Authorized',
+                value: network.isAuthorized ? 'Yes' : 'No',
+              ),
               _InfoPill(
-                  label: 'Connected',
-                  value: network.isConnected ? 'Yes' : 'No'),
+                label: 'Connected',
+                value: network.isConnected ? 'Yes' : 'No',
+              ),
+              _InfoPill(
+                label: 'Local Mount',
+                value: network.localMountState,
+              ),
+              if (network.matchedInterfaceName.trim().isNotEmpty)
+                _InfoPill(
+                  label: 'Interface',
+                  value: network.matchedInterfaceName,
+                ),
               if (managedNetwork != null)
                 _InfoPill(label: '服务端网络', value: managedNetwork!.name),
             ],
@@ -2287,9 +2371,9 @@ _RuntimeSignal _resolveRuntimeSignal({
 }) {
   final bool hasActiveJoinedNetwork = runtimeStatus.joinedNetworks.any(
     (ZeroTierNetworkState network) =>
+        network.localInterfaceReady ||
         network.isConnected ||
-        network.assignedAddresses.isNotEmpty ||
-        network.status == 'OK',
+        network.assignedAddresses.isNotEmpty,
   );
   final ZeroTierRuntimeEvent? highlightedEvent =
       recentEvents.cast<ZeroTierRuntimeEvent?>().firstWhere(
@@ -2565,8 +2649,7 @@ _NetworkVisualState _resolveNetworkVisualState({
     );
   }
 
-  if (localState.assignedAddresses.isNotEmpty ||
-      (localState.status == 'OK' && hasServiceAssignedIp)) {
+  if (_isLocalNetworkMounted(localState, hasServiceAssignedIp)) {
     return const _NetworkVisualState(
       label: '网络已在线',
       message: '本机已经接入这条网络，当前可以继续查看托管地址与后续可达性。',
@@ -2583,6 +2666,40 @@ _NetworkVisualState _resolveNetworkVisualState({
       icon: Icons.hourglass_top_rounded,
       background: Color(0xFFEAF2FF),
       foreground: Color(0xFF1D4ED8),
+    );
+  }
+
+  if (localState.localMountState == 'ip_not_bound') {
+    return _NetworkVisualState(
+      label: '等待本地挂载',
+      message: localState.matchedInterfaceName.trim().isNotEmpty
+          ? 'ZeroTier 已分配地址，但 Windows 接口 ${localState.matchedInterfaceName} 还没有稳定挂载期望地址。'
+          : 'ZeroTier 已分配地址，但 Windows 还没有把期望地址挂载到可识别接口上。',
+      icon: Icons.hourglass_top_rounded,
+      background: const Color(0xFFEAF2FF),
+      foreground: const Color(0xFF1D4ED8),
+    );
+  }
+
+  if (localState.localMountState == 'adapter_down') {
+    return _NetworkVisualState(
+      label: '接口未就绪',
+      message: localState.matchedInterfaceName.trim().isNotEmpty
+          ? '已识别到接口 ${localState.matchedInterfaceName}，但它当前不是 up 状态。'
+          : '已识别到本地接口，但它当前不是 up 状态。',
+      icon: Icons.portable_wifi_off_rounded,
+      background: const Color(0xFFFFF4E8),
+      foreground: const Color(0xFFB45309),
+    );
+  }
+
+  if (localState.localMountState == 'missing_adapter') {
+    return const _NetworkVisualState(
+      label: '未发现虚拟网卡',
+      message: 'libzt 已进入本地组网流程，但 Windows 侧还没有识别到可用的 ZeroTier/TAP/Wintun 虚拟接口。',
+      icon: Icons.device_unknown_rounded,
+      background: Color(0xFFFFF4E8),
+      foreground: Color(0xFFB45309),
     );
   }
 
@@ -2632,6 +2749,38 @@ bool _isAuthorizationPendingLocalNetwork(ZeroTierNetworkState? localState) {
   return !localState.isAuthorized;
 }
 
+bool _isLocalNetworkMounted(
+  ZeroTierNetworkState localState,
+  bool hasServiceAssignedIp,
+) {
+  if (localState.localInterfaceReady) {
+    return true;
+  }
+  if (localState.assignedAddresses.isNotEmpty &&
+      localState.matchedInterfaceUp) {
+    return true;
+  }
+  return localState.status == 'OK' &&
+      hasServiceAssignedIp &&
+      localState.localMountState == 'ready';
+}
+
+bool _isLocalNetworkNegotiating(
+  ZeroTierNetworkState localState,
+  bool hasServiceAssignedIp,
+) {
+  if (_isLocalNetworkMounted(localState, hasServiceAssignedIp)) {
+    return false;
+  }
+  return localState.status == 'REQUESTING_CONFIGURATION' ||
+      localState.status == 'OK' ||
+      localState.status == 'UNKNOWN' ||
+      localState.localMountState == 'awaiting_address' ||
+      localState.localMountState == 'ip_not_bound' ||
+      localState.localMountState == 'adapter_down' ||
+      localState.localMountState == 'missing_adapter';
+}
+
 bool _isHandshakePendingLocalNetwork(
   ZeroTierNetworkState? localState,
   String? managedStatus,
@@ -2642,7 +2791,7 @@ bool _isHandshakePendingLocalNetwork(
   if (_isAuthorizationPendingLocalNetwork(localState)) {
     return false;
   }
-  if (localState.isConnected || localState.assignedAddresses.isNotEmpty) {
+  if (_isLocalNetworkMounted(localState, false)) {
     return false;
   }
 
@@ -2651,9 +2800,7 @@ bool _isHandshakePendingLocalNetwork(
   final bool serverAlreadyAccepted = normalizedManagedStatus == 'authorized' ||
       normalizedManagedStatus == 'active';
   final bool localStillNegotiating =
-      localState.status == 'REQUESTING_CONFIGURATION' ||
-          localState.status == 'OK' ||
-          localState.status == 'UNKNOWN';
+      _isLocalNetworkNegotiating(localState, false);
 
   return serverAlreadyAccepted || localStillNegotiating;
 }
@@ -2692,7 +2839,7 @@ bool _isEffectivelyLeftLocalNetwork(ZeroTierNetworkState? localState) {
   if (localState == null) {
     return true;
   }
-  if (localState.isConnected || localState.assignedAddresses.isNotEmpty) {
+  if (_isLocalNetworkMounted(localState, false)) {
     return false;
   }
   switch (localState.status) {
@@ -2734,7 +2881,8 @@ _DefaultNetworkFlowState _resolveDefaultNetworkFlowState({
   }
   if (localState != null &&
       (localState.status == 'REQUESTING_CONFIGURATION' ||
-          (localState.status == 'OK' && !hasServiceAssignedIp) ||
+          (localState.status == 'OK' &&
+              !_isLocalNetworkMounted(localState, hasServiceAssignedIp)) ||
           localState.status == 'UNKNOWN')) {
     return _DefaultNetworkFlowState.awaitingLocalConfig;
   }
