@@ -43,6 +43,11 @@ abstract class NetworkingService {
   });
   Future<PairingSession> fetchPairingSession({required String sessionId});
   Future<void> joinDefaultNetwork({required String deviceId});
+  Future<ManagedNetwork> leaveDefaultNetwork({required String deviceId});
+  Future<ManagedNetwork> leaveManagedNetwork({
+    required String networkId,
+    required String deviceId,
+  });
   Future<PairingSession> createPairingSession({
     required String initiatorDeviceId,
     required String targetDeviceId,
@@ -236,6 +241,33 @@ class HttpNetworkingService implements NetworkingService {
       }),
     );
     _decodeResponse(response);
+  }
+
+  @override
+  Future<ManagedNetwork> leaveDefaultNetwork({required String deviceId}) async {
+    final http.Response response = await _client.post(
+      _buildUri('/networking/default-network/leave'),
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{
+        'deviceId': deviceId,
+      }),
+    );
+    return _extractManagedNetwork(_decodeResponse(response));
+  }
+
+  @override
+  Future<ManagedNetwork> leaveManagedNetwork({
+    required String networkId,
+    required String deviceId,
+  }) async {
+    final http.Response response = await _client.post(
+      _buildUri('/networking/managed-networks/$networkId/leave'),
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{
+        'deviceId': deviceId,
+      }),
+    );
+    return _extractManagedNetwork(_decodeResponse(response));
   }
 
   @override

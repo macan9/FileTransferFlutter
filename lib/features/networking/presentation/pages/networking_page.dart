@@ -174,6 +174,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             ),
             const SizedBox(height: 16),
             _LocalNetworksCard(
+              currentDeviceId: config.deviceId,
               runtimeStatus: runtimeStatus,
               managedNetworks: dashboard.managedNetworks,
             ),
@@ -207,32 +208,41 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
               height: 920,
               child: TabBarView(
                 children: <Widget>[
-                  _OneClickNetworkingTab(
-                    defaultNetwork: dashboard.defaultNetwork,
-                    agentState: agentState,
-                    isBusy: dashboard.isSubmitting,
-                    isLocalReady: isLocalReady,
-                    runtimeStatus: runtimeStatus,
-                    onJoin: () => _joinDefaultNetwork(config),
-                    onLeave: () =>
-                        _leaveDefaultNetwork(dashboard.defaultNetwork),
-                    onCopyIp: (String ip) => _copyToClipboard(
-                      ip,
-                      successMessage: '已复制虚拟 IP',
+                  SingleChildScrollView(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: _OneClickNetworkingTab(
+                      defaultNetwork: dashboard.defaultNetwork,
+                      currentDeviceId: config.deviceId,
+                      agentState: agentState,
+                      isBusy: dashboard.isSubmitting,
+                      activeAction: dashboard.activeAction,
+                      isLocalReady: isLocalReady,
+                      runtimeStatus: runtimeStatus,
+                      onJoin: () => _joinDefaultNetwork(config),
+                      onLeave: () => _leaveDefaultNetwork(
+                          dashboard.defaultNetwork, runtimeStatus),
+                      onCopyIp: (String ip) => _copyToClipboard(
+                        ip,
+                        successMessage: '已复制虚拟 IP',
+                      ),
                     ),
                   ),
-                  _PrivateNetworkingTab(
-                    codeController: _networkCodeController,
-                    nameController: _networkNameController,
-                    descriptionController: _networkDescriptionController,
-                    generatedCode: _generatedNetworkCode,
-                    agentState: agentState,
-                    isBusy: dashboard.isSubmitting,
-                    isLocalReady: isLocalReady,
-                    managedNetworks: dashboard.managedNetworks,
-                    runtimeStatus: runtimeStatus,
-                    onJoinPressed: () => _joinByInviteCode(config),
-                    onHostPressed: () => _createPrivateNetwork(config),
+                  SingleChildScrollView(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: _PrivateNetworkingTab(
+                      codeController: _networkCodeController,
+                      nameController: _networkNameController,
+                      descriptionController: _networkDescriptionController,
+                      generatedCode: _generatedNetworkCode,
+                      currentDeviceId: config.deviceId,
+                      agentState: agentState,
+                      isBusy: dashboard.isSubmitting,
+                      isLocalReady: isLocalReady,
+                      managedNetworks: dashboard.managedNetworks,
+                      runtimeStatus: runtimeStatus,
+                      onJoinPressed: () => _joinByInviteCode(config),
+                      onHostPressed: () => _createPrivateNetwork(config),
+                    ),
                   ),
                 ],
               ),
@@ -273,7 +283,10 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     }
   }
 
-  Future<void> _leaveDefaultNetwork(ManagedNetwork? defaultNetwork) async {
+  Future<void> _leaveDefaultNetwork(
+    ManagedNetwork? defaultNetwork,
+    ZeroTierRuntimeStatus runtimeStatus,
+  ) async {
     final String networkId = defaultNetwork?.zeroTierNetworkId?.trim() ?? '';
     if (networkId.isEmpty) {
       _showPageMessage('当前默认网络缺少 ZeroTier Network ID，无法取消组网。');
@@ -281,11 +294,15 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     }
 
     try {
-      await ref.read(networkingAgentRuntimeProvider.notifier).leaveNetwork(
-            networkId,
-            deactivateWhenIdle: true,
-            source: 'ui.defaultNetworkCard',
+      final AppConfig readyConfig = ref.read(appConfigProvider);
+      if (!_ensureRegistered(readyConfig)) {
+        return;
+      }
+
+      await ref.read(networkingProvider.notifier).leaveDefaultNetwork(
+            deviceId: readyConfig.deviceId,
           );
+      unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
       await ref.read(networkingProvider.notifier).refresh();
       _showPageMessage('已取消默认网络组网。');
     } on RealtimeError catch (error) {
@@ -696,10 +713,12 @@ class _NetworkingAlignmentCard extends StatelessWidget {
 
 class _LocalNetworksCard extends StatelessWidget {
   const _LocalNetworksCard({
+    required this.currentDeviceId,
     required this.runtimeStatus,
     required this.managedNetworks,
   });
 
+  final String currentDeviceId;
   final ZeroTierRuntimeStatus runtimeStatus;
   final List<ManagedNetwork> managedNetworks;
 
@@ -722,6 +741,7 @@ class _LocalNetworksCard extends StatelessWidget {
                     (ZeroTierNetworkState network) => Padding(
                       padding: const EdgeInsets.only(bottom: 12),
                       child: _LocalNetworkCard(
+                        currentDeviceId: currentDeviceId,
                         network: network,
                         managedNetwork:
                             _matchManagedNetwork(network, managedNetworks),
@@ -752,8 +772,10 @@ class _LocalNetworksCard extends StatelessWidget {
 class _OneClickNetworkingTab extends StatelessWidget {
   const _OneClickNetworkingTab({
     required this.defaultNetwork,
+    required this.currentDeviceId,
     required this.agentState,
     required this.isBusy,
+    required this.activeAction,
     required this.isLocalReady,
     required this.runtimeStatus,
     required this.onJoin,
@@ -762,8 +784,10 @@ class _OneClickNetworkingTab extends StatelessWidget {
   });
 
   final ManagedNetwork? defaultNetwork;
+  final String currentDeviceId;
   final NetworkingAgentRuntimeState agentState;
   final bool isBusy;
+  final String? activeAction;
   final bool isLocalReady;
   final ZeroTierRuntimeStatus runtimeStatus;
   final VoidCallback onJoin;
@@ -779,23 +803,47 @@ class _OneClickNetworkingTab extends StatelessWidget {
         agentState.transitioningNetworkId?.trim().toLowerCase() ?? '';
     final String defaultNetworkId =
         defaultNetwork?.zeroTierNetworkId?.trim().toLowerCase() ?? '';
-    final bool isTransitionLocked = agentState.isNetworkActionLocked &&
-        (transitionNetworkId.isEmpty ||
-            transitionNetworkId == defaultNetworkId);
-    final bool isGrouped = localState != null &&
+    final String? currentMembershipStatus = _currentMembershipStatus(
+      defaultNetwork,
+      currentDeviceId,
+    );
+    final bool hasServiceAssignedIp = _hasCurrentServiceAssignedIp(
+      defaultNetwork,
+      currentDeviceId,
+    );
+    final bool isMembershipRevoked =
+        currentMembershipStatus?.trim().toLowerCase() == 'revoked';
+    final bool isSubmittingJoin = activeAction == 'join-default-network';
+    final bool isSubmittingLeave = activeAction == 'leave-default-network';
+    final bool isTransitionLocked =
+        (agentState.isNetworkActionLocked || isSubmittingLeave) &&
+            (transitionNetworkId.isEmpty ||
+                transitionNetworkId == defaultNetworkId);
+    final bool hasLocalMapping = localState != null &&
         (localState.isConnected ||
             localState.assignedAddresses.isNotEmpty ||
-            localState.status == 'OK');
-    final bool isConnecting = !isGrouped &&
-        (isBusy ||
-            agentState.isBootstrapping ||
-            localState?.status == 'REQUESTING_CONFIGURATION');
+            (localState.status == 'OK' && hasServiceAssignedIp));
+    final bool isClosing =
+        isTransitionLocked || (isMembershipRevoked && localState != null);
+    final bool isGrouped = !isMembershipRevoked && hasLocalMapping;
+    final bool localStillNegotiating = localState != null &&
+        !isGrouped &&
+        (localState.status == 'REQUESTING_CONFIGURATION' ||
+            localState.status == 'OK' ||
+            localState.status == 'UNKNOWN');
+    final bool isActivelyJoining =
+        isSubmittingJoin || agentState.isBootstrapping || localStillNegotiating;
+    final bool isConnecting = !isGrouped && !isClosing && isActivelyJoining;
     final bool isDisabled =
-        agentState.isLocalInitializing || !isLocalReady || isTransitionLocked;
+        agentState.isLocalInitializing || !isLocalReady || isClosing;
+    final String orbLabel = isDisabled
+        ? (isClosing ? '收口中' : '本地初始化')
+        : (isGrouped ? '取消组网' : (isConnecting ? '组网中' : '开始组网'));
     final _NetworkVisualState visualState = _resolveNetworkVisualState(
       localState: localState,
-      managedStatus: defaultNetwork?.status,
-      isBusy: isTransitionLocked || isConnecting,
+      managedStatus: currentMembershipStatus,
+      hasServiceAssignedIp: hasServiceAssignedIp,
+      isBusy: isClosing || isActivelyJoining,
       lastError: agentState.lastError,
       runtimeServiceState: runtimeStatus.serviceState,
     );
@@ -816,6 +864,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
           if (defaultNetwork != null) ...<Widget>[
             _ManagedNetworkCard(
               network: defaultNetwork!,
+              currentDeviceId: currentDeviceId,
               localState: localState,
               visualState: visualState,
               accentColor: const Color(0xFFF97316),
@@ -826,9 +875,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
             const SizedBox(height: 18),
           ],
           _NetworkingActionOrb(
-            label: isDisabled
-                ? (isTransitionLocked ? '收口中' : '本地初始化')
-                : (isGrouped ? '已组网' : (isConnecting ? '组网中' : '开始组网')),
+            label: orbLabel,
             icon: isDisabled
                 ? Icons.power_settings_new_rounded
                 : (isGrouped
@@ -844,7 +891,9 @@ class _OneClickNetworkingTab extends StatelessWidget {
                 : (isGrouped
                     ? '按钮为绿色\n点击即可取消组网'
                     : (isConnecting
-                        ? '按钮为蓝色\n点击即可中止组网'
+                        ? (hasServiceAssignedIp
+                            ? '服务端已分配地址\n等待本地链路接入'
+                            : '按钮为蓝色\n点击即可中止组网')
                         : '本地准备完成后\n点击开始接入默认网络')),
             tone: orbTone,
             spinning: isConnecting,
@@ -852,7 +901,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
                 ? null
                 : ((isGrouped || isConnecting) ? onLeave : onJoin),
           ),
-          if (localState != null &&
+          if (!isTransitionLocked &&
+              localState != null &&
               localState.assignedAddresses.isNotEmpty) ...<Widget>[
             const SizedBox(height: 16),
             _VirtualIpPanel(
@@ -901,6 +951,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
     required this.nameController,
     required this.descriptionController,
     required this.generatedCode,
+    required this.currentDeviceId,
     required this.agentState,
     required this.isBusy,
     required this.isLocalReady,
@@ -914,6 +965,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
   final TextEditingController nameController;
   final TextEditingController descriptionController;
   final String? generatedCode;
+  final String currentDeviceId;
   final NetworkingAgentRuntimeState agentState;
   final bool isBusy;
   final bool isLocalReady;
@@ -1054,10 +1106,18 @@ class _PrivateNetworkingTab extends StatelessWidget {
                       padding: const EdgeInsets.only(bottom: 12),
                       child: _ManagedNetworkCard(
                         network: network,
+                        currentDeviceId: currentDeviceId,
                         localState: _findLocal(runtimeStatus, network),
                         visualState: _resolveNetworkVisualState(
                           localState: _findLocal(runtimeStatus, network),
-                          managedStatus: network.status,
+                          managedStatus: _currentMembershipStatus(
+                            network,
+                            currentDeviceId,
+                          ),
+                          hasServiceAssignedIp: _hasCurrentServiceAssignedIp(
+                            network,
+                            currentDeviceId,
+                          ),
                           isBusy: isBusy,
                           lastError: agentState.lastError,
                           runtimeServiceState: runtimeStatus.serviceState,
@@ -1096,18 +1156,34 @@ class _PrivateNetworkingTab extends StatelessWidget {
 class _ManagedNetworkCard extends StatelessWidget {
   const _ManagedNetworkCard({
     required this.network,
+    required this.currentDeviceId,
     required this.localState,
     required this.visualState,
     required this.accentColor,
   });
 
   final ManagedNetwork network;
+  final String currentDeviceId;
   final ZeroTierNetworkState? localState;
   final _NetworkVisualState visualState;
   final Color accentColor;
 
   @override
   Widget build(BuildContext context) {
+    final ManagedNetworkMembership? currentMembership =
+        _findCurrentMembership();
+    final String? currentMembershipStatus = currentMembership?.status;
+    final bool hasAcceptedMembership =
+        _isAcceptedMembershipStatus(currentMembershipStatus);
+    final String? serverAssignedIp = hasAcceptedMembership &&
+            currentMembership?.zeroTierAssignedIp?.trim().isNotEmpty == true
+        ? currentMembership!.zeroTierAssignedIp!.trim()
+        : null;
+    final bool showServerAssignedIp = localState != null &&
+        localState!.status == 'OK' &&
+        localState!.assignedAddresses.isEmpty &&
+        serverAssignedIp != null;
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
@@ -1163,10 +1239,18 @@ class _ManagedNetworkCard extends StatelessWidget {
                 label: '本地映射',
                 value: localState == null ? '未发现' : localState!.status,
               ),
+              if (serverAssignedIp != null)
+                _InfoPill(label: 'Service IP', value: serverAssignedIp),
             ],
           ),
           const SizedBox(height: 12),
           _NetworkStateBanner(state: visualState),
+          if (showServerAssignedIp) ...<Widget>[
+            const SizedBox(height: 12),
+            _NetworkSegmentPanel(addresses: <String>[serverAssignedIp]),
+            const SizedBox(height: 12),
+            _AddressWrap(addresses: <String>[serverAssignedIp]),
+          ],
           if (localState != null &&
               localState!.assignedAddresses.isNotEmpty) ...<Widget>[
             const SizedBox(height: 12),
@@ -1178,14 +1262,29 @@ class _ManagedNetworkCard extends StatelessWidget {
       ),
     );
   }
+
+  ManagedNetworkMembership? _findCurrentMembership() {
+    final String targetDeviceId = currentDeviceId.trim();
+    if (targetDeviceId.isEmpty) {
+      return null;
+    }
+    for (final ManagedNetworkMembership membership in network.memberships) {
+      if (membership.deviceId.trim() == targetDeviceId) {
+        return membership;
+      }
+    }
+    return null;
+  }
 }
 
 class _LocalNetworkCard extends StatelessWidget {
   const _LocalNetworkCard({
+    required this.currentDeviceId,
     required this.network,
     required this.managedNetwork,
   });
 
+  final String currentDeviceId;
   final ZeroTierNetworkState network;
   final ManagedNetwork? managedNetwork;
 
@@ -1195,7 +1294,14 @@ class _LocalNetworkCard extends StatelessWidget {
         network.isConnected ? const Color(0xFF15803D) : const Color(0xFFB45309);
     final _NetworkVisualState visualState = _resolveNetworkVisualState(
       localState: network,
-      managedStatus: managedNetwork?.status,
+      managedStatus: _currentMembershipStatus(
+        managedNetwork,
+        currentDeviceId,
+      ),
+      hasServiceAssignedIp: _hasCurrentServiceAssignedIp(
+        managedNetwork,
+        currentDeviceId,
+      ),
       isBusy: false,
       lastError: null,
       runtimeServiceState: 'running',
@@ -2308,6 +2414,7 @@ _RuntimeSignal _resolveRuntimeSignal({
 _NetworkVisualState _resolveNetworkVisualState({
   required ZeroTierNetworkState? localState,
   required String? managedStatus,
+  required bool hasServiceAssignedIp,
   required bool isBusy,
   required String? lastError,
   required String runtimeServiceState,
@@ -2344,6 +2451,24 @@ _NetworkVisualState _resolveNetworkVisualState({
   }
 
   if (localState == null) {
+    if (_isAcceptedMembershipStatus(managedStatus) && hasServiceAssignedIp) {
+      return const _NetworkVisualState(
+        label: '等待本机入网',
+        message: '服务端已经分配 Service IP，正在等待本机 Agent 和 ZeroTier runtime 建立本地映射。',
+        icon: Icons.hourglass_top_rounded,
+        background: Color(0xFFEAF2FF),
+        foreground: Color(0xFF1D4ED8),
+      );
+    }
+    if (_isAcceptedMembershipStatus(managedStatus)) {
+      return const _NetworkVisualState(
+        label: '正在入网',
+        message: '服务端已接受当前设备入网，正在等待本机 ZeroTier 本地链路建立。',
+        icon: Icons.sync_rounded,
+        background: Color(0xFFEAF2FF),
+        foreground: Color(0xFF1D4ED8),
+      );
+    }
     if (isBusy) {
       return const _NetworkVisualState(
         label: '正在编排',
@@ -2364,7 +2489,17 @@ _NetworkVisualState _resolveNetworkVisualState({
     );
   }
 
-  if (localState.status == 'ACCESS_DENIED' || !localState.isAuthorized) {
+  if (_isRevokedMembershipStatus(managedStatus)) {
+    return const _NetworkVisualState(
+      label: '收口中',
+      message: '服务端已撤销当前设备的组网资格，正在等待本地 ZeroTier 链路完成离网收口。',
+      icon: Icons.hourglass_top_rounded,
+      background: Color(0xFFF3F4F6),
+      foreground: Color(0xFF6B7280),
+    );
+  }
+
+  if (_isAuthorizationPendingLocalNetwork(localState)) {
     return const _NetworkVisualState(
       label: '等待网络授权',
       message: 'ZeroTier 已看到这条网络，但当前仍处于等待授权阶段，还不能视为组网完成。',
@@ -2374,7 +2509,8 @@ _NetworkVisualState _resolveNetworkVisualState({
     );
   }
 
-  if (localState.assignedAddresses.isNotEmpty) {
+  if (localState.assignedAddresses.isNotEmpty ||
+      (localState.status == 'OK' && hasServiceAssignedIp)) {
     return const _NetworkVisualState(
       label: '网络已在线',
       message: '本机已经接入这条网络，当前可以继续查看托管地址与后续可达性。',
@@ -2430,7 +2566,15 @@ bool _isAuthorizationPendingLocalNetwork(ZeroTierNetworkState? localState) {
   if (localState == null) {
     return false;
   }
-  return localState.status == 'ACCESS_DENIED' || !localState.isAuthorized;
+  if (localState.status == 'ACCESS_DENIED') {
+    return true;
+  }
+  if (localState.status == 'REQUESTING_CONFIGURATION' ||
+      localState.status == 'OK' ||
+      localState.status == 'UNKNOWN') {
+    return false;
+  }
+  return !localState.isAuthorized;
 }
 
 bool _isHandshakePendingLocalNetwork(
@@ -2457,6 +2601,51 @@ bool _isHandshakePendingLocalNetwork(
           localState.status == 'UNKNOWN';
 
   return serverAlreadyAccepted || localStillNegotiating;
+}
+
+bool _hasCurrentServiceAssignedIp(
+  ManagedNetwork? network,
+  String currentDeviceId,
+) {
+  final String targetDeviceId = currentDeviceId.trim();
+  if (network == null || targetDeviceId.isEmpty) {
+    return false;
+  }
+  for (final ManagedNetworkMembership membership in network.memberships) {
+    if (membership.deviceId.trim() != targetDeviceId) {
+      continue;
+    }
+    if (!_isAcceptedMembershipStatus(membership.status)) {
+      return false;
+    }
+    return membership.zeroTierAssignedIp?.trim().isNotEmpty == true;
+  }
+  return false;
+}
+
+bool _isAcceptedMembershipStatus(String? status) {
+  final String normalized = status?.trim().toLowerCase() ?? '';
+  return normalized == 'authorized' || normalized == 'active';
+}
+
+bool _isRevokedMembershipStatus(String? status) {
+  return status?.trim().toLowerCase() == 'revoked';
+}
+
+String? _currentMembershipStatus(
+  ManagedNetwork? network,
+  String currentDeviceId,
+) {
+  final String targetDeviceId = currentDeviceId.trim();
+  if (network == null || targetDeviceId.isEmpty) {
+    return null;
+  }
+  for (final ManagedNetworkMembership membership in network.memberships) {
+    if (membership.deviceId.trim() == targetDeviceId) {
+      return membership.status.trim().isEmpty ? null : membership.status.trim();
+    }
+  }
+  return null;
 }
 
 _RuntimeEventStyle _runtimeEventStyle(ZeroTierRuntimeEventType type) {

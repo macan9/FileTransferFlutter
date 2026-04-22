@@ -21,6 +21,7 @@
 4. `zerotier_04_phase4_macos_native.md`
 5. `zerotier_05_phase5_android_native.md`
 6. `zerotier_06_phase6_ios_native.md`
+7. `zerotier_07_join_leave_flow.md`
 
 ## 4. 当前调整重点
 

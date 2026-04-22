@@ -114,6 +114,17 @@ class NetworkingController extends AsyncNotifier<NetworkingDashboardState> {
     );
   }
 
+  Future<ManagedNetwork> leaveDefaultNetwork({required String deviceId}) async {
+    late final ManagedNetwork result;
+    await _runAction(
+      action: 'leave-default-network',
+      run: () async {
+        result = await _service.leaveDefaultNetwork(deviceId: deviceId);
+      },
+    );
+    return result;
+  }
+
   Future<PairingSession> createPairingSession({
     required String initiatorDeviceId,
     required String targetDeviceId,
