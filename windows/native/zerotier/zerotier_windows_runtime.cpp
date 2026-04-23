@@ -7,9 +7,12 @@
 #include <ZeroTierSockets.h>
 #include <WinSock2.h>
 #include <Windows.h>
+#include <shellapi.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
 #include <ws2tcpip.h>
+
+#include "native/zerotier/zerotier_windows_privileged_mount_ipc.h"
 
 #include <algorithm>
 #include <cctype>
@@ -28,6 +31,7 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "Shell32.lib")
 
 namespace {
 
@@ -211,55 +215,11 @@ bool ShouldExposeNetworkRecord(
 
 bool IsJoinClosedLoopReady(const ZeroTierWindowsNetworkRecord& network,
                            bool allow_mount_degraded) {
+  (void)allow_mount_degraded;
   if (network.local_interface_ready) {
     return true;
   }
-  if (!allow_mount_degraded) {
-    return false;
-  }
-  // Phase-1 Wintun/no-zttap compatibility: allow join to succeed when
-  // ZeroTier control-plane is ready and managed addresses are present,
-  // even if system mount is still degraded on Windows.
-  if (network.status != "OK") {
-    return false;
-  }
-  if (network.assigned_addresses.empty()) {
-    return false;
-  }
-  if (!network.is_connected) {
-    return false;
-  }
-  return network.local_mount_state == "missing_adapter" ||
-         network.local_mount_state == "adapter_down" ||
-         network.local_mount_state == "ip_not_bound" ||
-         network.local_mount_state == "route_not_bound";
-}
-
-bool ShouldSoftSucceedJoinTimeout(const ZeroTierWindowsNetworkRecord& network) {
-  if (network.status == "ACCESS_DENIED" ||
-      IsTerminalNetworkFailureStatus(network.status)) {
-    return false;
-  }
-  // Keep join/leave command loop responsive in phase-1 compatibility mode.
-  // Runtime diagnostics still carry detailed state (awaiting_address, etc.).
-  return network.status == "REQUESTING_CONFIGURATION" ||
-         (network.status == "OK" && network.assigned_addresses.empty());
-}
-
-bool IsSoftJoinTimeoutAllowedByEnv() {
-  char* value = nullptr;
-  size_t value_size = 0;
-  if (_dupenv_s(&value, &value_size, "ZT_WIN_ALLOW_SOFT_JOIN_TIMEOUT") != 0 ||
-      value == nullptr) {
-    return false;
-  }
-  std::string lowered = value;
-  free(value);
-  std::transform(
-      lowered.begin(), lowered.end(), lowered.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return lowered == "1" || lowered == "true" || lowered == "yes" ||
-         lowered == "on";
+  return false;
 }
 
 std::string ComposeJoinFailureMessage(const ZeroTierWindowsNetworkRecord& network) {
@@ -354,6 +314,24 @@ std::wstring Utf8ToWide(const std::string& text) {
   return output;
 }
 
+std::string WideToUtf8(const std::wstring& text) {
+  if (text.empty()) {
+    return std::string();
+  }
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0,
+                                       nullptr, nullptr);
+  if (size <= 1) {
+    return std::string();
+  }
+  std::string output(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, output.data(), size, nullptr,
+                      nullptr);
+  if (!output.empty() && output.back() == '\0') {
+    output.pop_back();
+  }
+  return output;
+}
+
 std::wstring EscapePowerShellSingleQuotedLiteral(const std::wstring& input) {
   std::wstring escaped;
   escaped.reserve(input.size() + 8);
@@ -379,7 +357,185 @@ bool IsProcessElevated() {
   return ok && elevation.TokenIsElevated != 0;
 }
 
-bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code) {
+bool ParseTruthyEnvValue(const char* value) {
+  if (value == nullptr) {
+    return false;
+  }
+  std::string normalized(value);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return normalized == "1" || normalized == "true" || normalized == "yes" ||
+         normalized == "on";
+}
+
+enum class PowerShellMountResult {
+  kFailed = 0,
+  kExists = 1,
+  kCreated = 2,
+};
+
+bool IsPrivilegedMountExecutorEnabled() {
+  char* raw = nullptr;
+  size_t raw_size = 0;
+  if (_dupenv_s(&raw, &raw_size, "ZT_WIN_ENABLE_PRIVILEGED_MOUNT_EXECUTOR") !=
+          0 ||
+      raw == nullptr) {
+    return true;
+  }
+  const bool enabled = ParseTruthyEnvValue(raw);
+  free(raw);
+  return enabled;
+}
+
+bool IsPrivilegedMountServiceEnabled() {
+  char* raw = nullptr;
+  size_t raw_size = 0;
+  if (_dupenv_s(&raw, &raw_size, "ZT_WIN_ENABLE_PRIVILEGED_MOUNT_SERVICE") !=
+          0 ||
+      raw == nullptr) {
+    return true;
+  }
+  const bool enabled = ParseTruthyEnvValue(raw);
+  free(raw);
+  return enabled;
+}
+
+PowerShellMountResult MountResultFromServiceResult(
+    ztwin::privileged_mount::Result service_result) {
+  switch (service_result) {
+    case ztwin::privileged_mount::Result::kSuccess:
+      return PowerShellMountResult::kCreated;
+    case ztwin::privileged_mount::Result::kAlreadyExists:
+      return PowerShellMountResult::kExists;
+    case ztwin::privileged_mount::Result::kFailed:
+    case ztwin::privileged_mount::Result::kNotFound:
+    case ztwin::privileged_mount::Result::kUnavailable:
+    case ztwin::privileged_mount::Result::kInvalidRequest:
+    case ztwin::privileged_mount::Result::kPermissionDenied:
+    default:
+      return PowerShellMountResult::kFailed;
+  }
+}
+
+bool TryPrivilegedMountServiceRequest(
+    ztwin::privileged_mount::Command command, uint64_t network_id,
+    uint32_t if_index, const std::string& value, uint8_t prefix_length,
+    DWORD* service_error_code, DWORD* native_error_code,
+    PowerShellMountResult* mount_result, std::string* service_message) {
+  if (service_error_code != nullptr) {
+    *service_error_code = ERROR_GEN_FAILURE;
+  }
+  if (native_error_code != nullptr) {
+    *native_error_code = NO_ERROR;
+  }
+  if (mount_result != nullptr) {
+    *mount_result = PowerShellMountResult::kFailed;
+  }
+  if (if_index == 0 || value.empty()) {
+    if (service_error_code != nullptr) {
+      *service_error_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  if (!IsPrivilegedMountServiceEnabled()) {
+    if (service_error_code != nullptr) {
+      *service_error_code = ERROR_SERVICE_DISABLED;
+    }
+    return false;
+  }
+
+  ztwin::privileged_mount::Request request = {};
+  request.command = static_cast<uint32_t>(command);
+  request.network_id = network_id;
+  request.if_index = if_index;
+  request.prefix_length = prefix_length;
+  request.request_id =
+      static_cast<uint64_t>(GetTickCount64()) ^
+      (static_cast<uint64_t>(if_index) << 32) ^
+      static_cast<uint64_t>(network_id & 0xFFFFFFFFULL);
+  strncpy_s(request.value, value.c_str(), _TRUNCATE);
+
+  ztwin::privileged_mount::Response response = {};
+  DWORD transport_error = NO_ERROR;
+  const bool transport_ok = ztwin::privileged_mount::SendRequest(
+      request, &response, 3000, &transport_error);
+  if (!transport_ok) {
+    if (service_error_code != nullptr) {
+      *service_error_code = transport_error;
+    }
+    return false;
+  }
+
+  if (service_error_code != nullptr) {
+    *service_error_code = response.service_error;
+  }
+  if (native_error_code != nullptr) {
+    *native_error_code = response.native_error;
+  }
+  if (service_message != nullptr) {
+    service_message->assign(
+        response.message, strnlen_s(response.message, sizeof(response.message)));
+  }
+
+  const auto result =
+      static_cast<ztwin::privileged_mount::Result>(response.result);
+  if (mount_result != nullptr) {
+    *mount_result = MountResultFromServiceResult(result);
+  }
+  return result == ztwin::privileged_mount::Result::kSuccess ||
+         result == ztwin::privileged_mount::Result::kAlreadyExists;
+}
+
+bool CreateTempPowerShellScriptPath(const wchar_t* prefix,
+                                    std::wstring* script_path,
+                                    DWORD* error_code) {
+  if (script_path == nullptr) {
+    if (error_code != nullptr) {
+      *error_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  script_path->clear();
+  if (error_code != nullptr) {
+    *error_code = ERROR_GEN_FAILURE;
+  }
+
+  wchar_t temp_path[MAX_PATH] = {0};
+  const DWORD temp_path_len = GetTempPathW(MAX_PATH, temp_path);
+  if (temp_path_len == 0 || temp_path_len >= MAX_PATH) {
+    if (error_code != nullptr) {
+      *error_code = GetLastError();
+    }
+    return false;
+  }
+
+  wchar_t temp_file[MAX_PATH] = {0};
+  if (GetTempFileNameW(temp_path, prefix, 0, temp_file) == 0) {
+    if (error_code != nullptr) {
+      *error_code = GetLastError();
+    }
+    return false;
+  }
+
+  std::filesystem::path target_path(temp_file);
+  target_path += L".ps1";
+  const std::wstring target_wide = target_path.wstring();
+  if (!MoveFileExW(temp_file, target_wide.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (error_code != nullptr) {
+      *error_code = GetLastError();
+    }
+    DeleteFileW(temp_file);
+    return false;
+  }
+
+  *script_path = target_wide;
+  if (error_code != nullptr) {
+    *error_code = NO_ERROR;
+  }
+  return true;
+}
+
+bool RunPowerShellScriptElevated(const std::wstring& script, DWORD* exit_code) {
   if (exit_code != nullptr) {
     *exit_code = ERROR_GEN_FAILURE;
   }
@@ -388,6 +544,89 @@ bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code) {
       *exit_code = ERROR_INVALID_PARAMETER;
     }
     return false;
+  }
+
+  std::wstring temp_script_path;
+  DWORD temp_path_error = NO_ERROR;
+  if (!CreateTempPowerShellScriptPath(L"ztm", &temp_script_path,
+                                      &temp_path_error)) {
+    if (exit_code != nullptr) {
+      *exit_code = temp_path_error;
+    }
+    return false;
+  }
+  std::ofstream temp_script(std::filesystem::path(temp_script_path),
+                            std::ios::binary | std::ios::trunc);
+  if (!temp_script.is_open()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_OPEN_FAILED;
+    }
+    DeleteFileW(temp_script_path.c_str());
+    return false;
+  }
+  const std::string utf8_body = WideToUtf8(script);
+  const std::string utf8_script = "\xEF\xBB\xBF& { " + utf8_body + " }\r\n";
+  temp_script.write(utf8_script.data(),
+                    static_cast<std::streamsize>(utf8_script.size()));
+  temp_script.close();
+
+  std::wstring parameters =
+      L"-NoProfile -ExecutionPolicy Bypass -File \"" +
+      temp_script_path + L"\"";
+
+  SHELLEXECUTEINFOW info = {};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  info.hwnd = nullptr;
+  info.lpVerb = L"runas";
+  info.lpFile = L"powershell.exe";
+  info.lpParameters = parameters.c_str();
+  info.lpDirectory = nullptr;
+  info.nShow = SW_HIDE;
+
+  const BOOL launched = ShellExecuteExW(&info);
+  if (!launched) {
+    if (exit_code != nullptr) {
+      *exit_code = GetLastError();
+    }
+    DeleteFileW(temp_script_path.c_str());
+    return false;
+  }
+
+  DWORD process_exit_code = ERROR_GEN_FAILURE;
+  const DWORD wait_result = WaitForSingleObject(info.hProcess, 30000);
+  if (wait_result == WAIT_OBJECT_0) {
+    GetExitCodeProcess(info.hProcess, &process_exit_code);
+  } else if (wait_result == WAIT_TIMEOUT) {
+    process_exit_code = WAIT_TIMEOUT;
+    TerminateProcess(info.hProcess, WAIT_TIMEOUT);
+  } else {
+    process_exit_code = GetLastError();
+  }
+
+  CloseHandle(info.hProcess);
+  DeleteFileW(temp_script_path.c_str());
+  if (exit_code != nullptr) {
+    *exit_code = process_exit_code;
+  }
+  return wait_result == WAIT_OBJECT_0 && process_exit_code == 0;
+}
+
+bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code,
+                         bool allow_privileged_executor = false) {
+  if (exit_code != nullptr) {
+    *exit_code = ERROR_GEN_FAILURE;
+  }
+  if (script.empty()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+
+  if (allow_privileged_executor && !IsProcessElevated() &&
+      IsPrivilegedMountExecutorEnabled()) {
+    return RunPowerShellScriptElevated(script, exit_code);
   }
 
   std::wstring command_line =
@@ -428,14 +667,64 @@ bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code) {
   return wait_result == WAIT_OBJECT_0 && process_exit_code == 0;
 }
 
-bool TryAddIpViaPowerShell(uint32_t if_index, const std::string& ip_text,
-                           uint8_t prefix_length, DWORD* ps_exit_code) {
+PowerShellMountResult TryAddIpViaPowerShell(uint64_t network_id,
+                                            uint32_t if_index,
+                                            const std::string& ip_text,
+                                            uint8_t prefix_length,
+                                            DWORD* ps_exit_code,
+                                            bool allow_privileged_executor,
+                                            std::string* executor_used) {
+  if (executor_used != nullptr) {
+    *executor_used = "powershell";
+  }
   const std::wstring ip_wide = Utf8ToWide(ip_text);
   if (if_index == 0 || ip_wide.empty()) {
     if (ps_exit_code != nullptr) {
       *ps_exit_code = ERROR_INVALID_PARAMETER;
     }
-    return false;
+    return PowerShellMountResult::kFailed;
+  }
+  if (allow_privileged_executor && !IsProcessElevated()) {
+    DWORD service_error = NO_ERROR;
+    DWORD native_error = NO_ERROR;
+    PowerShellMountResult service_result = PowerShellMountResult::kFailed;
+    std::string service_message;
+    if (TryPrivilegedMountServiceRequest(
+            ztwin::privileged_mount::Command::kEnsureIpV4, network_id, if_index,
+            ip_text, prefix_length, &service_error, &native_error, &service_result,
+            &service_message)) {
+      if (executor_used != nullptr) {
+        *executor_used = "service";
+      }
+      if (ps_exit_code != nullptr) {
+        *ps_exit_code = 0;
+      }
+      std::clog << "[ZT/WIN] PrivilegedMount service ensure-ip"
+                << " network_id=" << std::hex << network_id << std::dec
+                << " if_index=" << if_index
+                << " ip=" << ip_text
+                << " prefix=" << static_cast<int>(prefix_length)
+                << " result="
+                << (service_result == PowerShellMountResult::kCreated
+                        ? "created"
+                        : "already_exists")
+                << " native_error=" << native_error
+                << " service_error=" << service_error
+                << " service_message="
+                << (service_message.empty() ? "-" : service_message)
+                << std::endl;
+      return service_result;
+    }
+    std::clog << "[ZT/WIN] PrivilegedMount service ensure-ip failed"
+              << " network_id=" << std::hex << network_id << std::dec
+              << " if_index=" << if_index
+              << " ip=" << ip_text
+              << " prefix=" << static_cast<int>(prefix_length)
+              << " native_error=" << native_error
+              << " service_error=" << service_error
+              << " service_message="
+              << (service_message.empty() ? "-" : service_message)
+              << std::endl;
   }
   const std::wstring escaped_ip = EscapePowerShellSingleQuotedLiteral(ip_wide);
 
@@ -449,20 +738,76 @@ bool TryAddIpViaPowerShell(uint32_t if_index, const std::string& ip_text,
          << L" -IPAddress '" << escaped_ip
          << L"' -PrefixLength " << static_cast<int>(prefix_length)
          << L" -AddressFamily IPv4 -Type Unicast -ErrorAction Stop | Out-Null "
+         << L"exit 2 "
          << L"}; "
          << L"exit 0 "
          << L"} catch { exit 1 }";
-  return RunPowerShellScript(script.str(), ps_exit_code);
+  const bool success = RunPowerShellScript(script.str(), ps_exit_code,
+                                           allow_privileged_executor);
+  if (success) {
+    return PowerShellMountResult::kExists;
+  }
+  if (ps_exit_code != nullptr && *ps_exit_code == 2) {
+    return PowerShellMountResult::kCreated;
+  }
+  return PowerShellMountResult::kFailed;
 }
 
-bool TryAddRouteViaPowerShell(uint32_t if_index, const std::string& cidr,
-                              DWORD* ps_exit_code) {
+PowerShellMountResult TryAddRouteViaPowerShell(uint32_t if_index,
+                                               const std::string& cidr,
+                                               DWORD* ps_exit_code,
+                                               bool allow_privileged_executor,
+                                               uint64_t network_id,
+                                               std::string* executor_used) {
+  if (executor_used != nullptr) {
+    *executor_used = "powershell";
+  }
   const std::wstring cidr_wide = Utf8ToWide(cidr);
   if (if_index == 0 || cidr_wide.empty()) {
     if (ps_exit_code != nullptr) {
       *ps_exit_code = ERROR_INVALID_PARAMETER;
     }
-    return false;
+    return PowerShellMountResult::kFailed;
+  }
+  if (allow_privileged_executor && !IsProcessElevated()) {
+    DWORD service_error = NO_ERROR;
+    DWORD native_error = NO_ERROR;
+    PowerShellMountResult service_result = PowerShellMountResult::kFailed;
+    std::string service_message;
+    if (TryPrivilegedMountServiceRequest(
+            ztwin::privileged_mount::Command::kEnsureRouteV4, network_id, if_index,
+            cidr, 0, &service_error, &native_error, &service_result,
+            &service_message)) {
+      if (executor_used != nullptr) {
+        *executor_used = "service";
+      }
+      if (ps_exit_code != nullptr) {
+        *ps_exit_code = 0;
+      }
+      std::clog << "[ZT/WIN] PrivilegedMount service ensure-route"
+                << " network_id=" << std::hex << network_id << std::dec
+                << " if_index=" << if_index
+                << " cidr=" << cidr
+                << " result="
+                << (service_result == PowerShellMountResult::kCreated
+                        ? "created"
+                        : "already_exists")
+                << " native_error=" << native_error
+                << " service_error=" << service_error
+                << " service_message="
+                << (service_message.empty() ? "-" : service_message)
+                << std::endl;
+      return service_result;
+    }
+    std::clog << "[ZT/WIN] PrivilegedMount service ensure-route failed"
+              << " network_id=" << std::hex << network_id << std::dec
+              << " if_index=" << if_index
+              << " cidr=" << cidr
+              << " native_error=" << native_error
+              << " service_error=" << service_error
+              << " service_message="
+              << (service_message.empty() ? "-" : service_message)
+              << std::endl;
   }
   const std::wstring escaped_cidr =
       EscapePowerShellSingleQuotedLiteral(cidr_wide);
@@ -477,10 +822,116 @@ bool TryAddRouteViaPowerShell(uint32_t if_index, const std::string& cidr,
          << L" -AddressFamily IPv4 -DestinationPrefix '" << escaped_cidr
          << L"' -NextHop '0.0.0.0' -RouteMetric 5 -PolicyStore ActiveStore "
          << L"-ErrorAction Stop | Out-Null "
+         << L"exit 2 "
          << L"}; "
          << L"exit 0 "
          << L"} catch { exit 1 }";
-  return RunPowerShellScript(script.str(), ps_exit_code);
+  const bool success = RunPowerShellScript(script.str(), ps_exit_code,
+                                           allow_privileged_executor);
+  if (success) {
+    return PowerShellMountResult::kExists;
+  }
+  if (ps_exit_code != nullptr && *ps_exit_code == 2) {
+    return PowerShellMountResult::kCreated;
+  }
+  return PowerShellMountResult::kFailed;
+}
+
+bool TryRemoveIpViaPowerShell(uint64_t network_id, uint32_t if_index,
+                              const std::string& ip_text, DWORD* ps_exit_code,
+                              bool allow_privileged_executor,
+                              std::string* executor_used) {
+  if (executor_used != nullptr) {
+    *executor_used = "powershell";
+  }
+  const std::wstring ip_wide = Utf8ToWide(ip_text);
+  if (if_index == 0 || ip_wide.empty()) {
+    if (ps_exit_code != nullptr) {
+      *ps_exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  if (allow_privileged_executor && !IsProcessElevated()) {
+    DWORD service_error = NO_ERROR;
+    DWORD native_error = NO_ERROR;
+    PowerShellMountResult ignored_result = PowerShellMountResult::kFailed;
+    std::string service_message;
+    if (TryPrivilegedMountServiceRequest(
+            ztwin::privileged_mount::Command::kRemoveIpV4, network_id, if_index,
+            ip_text, 0, &service_error, &native_error, &ignored_result,
+            &service_message)) {
+      if (executor_used != nullptr) {
+        *executor_used = "service";
+      }
+      if (ps_exit_code != nullptr) {
+        *ps_exit_code = 0;
+      }
+      return true;
+    }
+  }
+  const std::wstring escaped_ip = EscapePowerShellSingleQuotedLiteral(ip_wide);
+
+  std::wostringstream script;
+  script << L"try { "
+         << L"$existing = Get-NetIPAddress -InterfaceIndex " << if_index
+         << L" -AddressFamily IPv4 -IPAddress '" << escaped_ip
+         << L"' -ErrorAction SilentlyContinue; "
+         << L"if ($existing) { "
+         << L"$existing | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop "
+         << L"}; "
+         << L"exit 0 "
+         << L"} catch { exit 1 }";
+  return RunPowerShellScript(script.str(), ps_exit_code,
+                             allow_privileged_executor);
+}
+
+bool TryRemoveRouteViaPowerShell(uint64_t network_id, uint32_t if_index,
+                                 const std::string& cidr, DWORD* ps_exit_code,
+                                 bool allow_privileged_executor,
+                                 std::string* executor_used) {
+  if (executor_used != nullptr) {
+    *executor_used = "powershell";
+  }
+  const std::wstring cidr_wide = Utf8ToWide(cidr);
+  if (if_index == 0 || cidr_wide.empty()) {
+    if (ps_exit_code != nullptr) {
+      *ps_exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  if (allow_privileged_executor && !IsProcessElevated()) {
+    DWORD service_error = NO_ERROR;
+    DWORD native_error = NO_ERROR;
+    PowerShellMountResult ignored_result = PowerShellMountResult::kFailed;
+    std::string service_message;
+    if (TryPrivilegedMountServiceRequest(
+            ztwin::privileged_mount::Command::kRemoveRouteV4, network_id,
+            if_index, cidr, 0, &service_error, &native_error, &ignored_result,
+            &service_message)) {
+      if (executor_used != nullptr) {
+        *executor_used = "service";
+      }
+      if (ps_exit_code != nullptr) {
+        *ps_exit_code = 0;
+      }
+      return true;
+    }
+  }
+  const std::wstring escaped_cidr =
+      EscapePowerShellSingleQuotedLiteral(cidr_wide);
+
+  std::wostringstream script;
+  script << L"try { "
+         << L"$existing = Get-NetRoute -InterfaceIndex " << if_index
+         << L" -AddressFamily IPv4 -DestinationPrefix '" << escaped_cidr
+         << L"' -ErrorAction SilentlyContinue; "
+         << L"if ($existing) { "
+         << L"$existing | Remove-NetRoute -Confirm:$false -ErrorAction Stop "
+         << L"}; "
+         << L"exit 0 "
+         << L"} catch { exit 1 }";
+  return RunPowerShellScript(script.str(), ps_exit_code,
+                             allow_privileged_executor);
 }
 
 enum class EnsureRouteResult {
@@ -1180,29 +1631,9 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     }
   }
 
-  const auto timed_out_network_it = networks_.find(network_id);
-  if (allow_mount_degraded && timed_out_network_it != networks_.end() &&
-      IsSoftJoinTimeoutAllowedByEnv() &&
-      ShouldSoftSucceedJoinTimeout(timed_out_network_it->second)) {
-    const ZeroTierWindowsNetworkRecord& network = timed_out_network_it->second;
-    ClearLastErrorLocked();
-    if (error_message != nullptr) {
-      error_message->clear();
-    }
-    std::clog << "[ZT/WIN] JoinNetwork soft success"
-              << " network_id=" << ToHexNetworkId(network_id)
-              << " status=" << network.status
-              << " local_mount_state=" << network.local_mount_state
-              << " local_interface_ready="
-              << (network.local_interface_ready ? "true" : "false")
-              << " address_count=" << network.assigned_addresses.size()
-              << " reason=phase1_compat_timeout"
-              << std::endl;
-    return true;
-  }
-
   std::string message =
       "Timed out waiting for ZeroTier to mount the managed address on a Windows adapter.";
+  const auto timed_out_network_it = networks_.find(network_id);
   if (!node_started_) {
     message = "ZeroTier node stopped before the network became ready.";
   } else if (!node_online_) {
@@ -1537,18 +1968,22 @@ flutter::EncodableMap ZeroTierWindowsRuntime::BuildStatus() const {
     joined_networks.emplace_back(BuildNetworkMap(network));
   }
 
+  const bool process_elevated = IsProcessElevated();
   EncodableMap permission_state{
-      {EncodableValue("isGranted"), EncodableValue(true)},
-      {EncodableValue("requiresManualSetup"), EncodableValue(false)},
+      {EncodableValue("isGranted"), EncodableValue(process_elevated)},
+      {EncodableValue("requiresManualSetup"), EncodableValue(!process_elevated)},
       {EncodableValue("isFirewallSupported"), EncodableValue(true)},
       {EncodableValue("summary"),
-       EncodableValue("Windows libzt runtime is active.")},
+       EncodableValue(process_elevated
+                          ? "Windows libzt runtime is active."
+                          : "Administrator privileges are required for Windows IP and route mounting.")},
   };
   const EncodableMap adapter_payload = BuildAdapterDiagnosticsPayloadLocked();
   const auto summary_it =
       adapter_payload.find(EncodableValue("summary"));
   if (summary_it != adapter_payload.end() &&
-      std::holds_alternative<std::string>(summary_it->second)) {
+      std::holds_alternative<std::string>(summary_it->second) &&
+      process_elevated) {
     permission_state[EncodableValue("summary")] =
         EncodableValue(std::get<std::string>(summary_it->second));
   }
@@ -2805,27 +3240,47 @@ bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
                 << " native_error=" << native_error
                 << " native_error_hex=" << native_error_hex.str() << std::endl;
 
-      if (!IsProcessElevated()) {
+      const bool process_elevated = IsProcessElevated();
+      const bool privileged_executor_enabled = IsPrivilegedMountExecutorEnabled();
+      if (!process_elevated && !privileged_executor_enabled) {
         std::clog << "[ZT/WIN] IpBind powershell fallback skipped"
                   << " network_id=" << ToHexNetworkId(network_id)
                   << " if_index=" << adapter.if_index
                   << " ip=" << address
-                  << " reason=process_not_elevated" << std::endl;
+                  << " reason=process_not_elevated"
+                  << " privileged_executor_enabled=false" << std::endl;
         continue;
       }
 
       DWORD ps_exit_code = ERROR_GEN_FAILURE;
-      const bool ps_ok = TryAddIpViaPowerShell(adapter.if_index, address, prefix,
-                                               &ps_exit_code);
-      std::clog << "[ZT/WIN] IpBind powershell fallback"
+      std::string mount_executor = "powershell";
+      const PowerShellMountResult ps_result =
+          TryAddIpViaPowerShell(network_id, adapter.if_index, address, prefix,
+                                &ps_exit_code, true, &mount_executor);
+      std::clog << "[ZT/WIN] IpBind privileged fallback"
                 << " network_id=" << ToHexNetworkId(network_id)
                 << " if_index=" << adapter.if_index
                 << " ip=" << address
                 << " prefix=" << static_cast<int>(prefix)
-                << " result=" << (ps_ok ? "success" : "failed")
-                << " ps_exit_code=" << ps_exit_code << std::endl;
-      if (ps_ok) {
+                << " result="
+                << (ps_result == PowerShellMountResult::kCreated
+                        ? "created"
+                        : (ps_result == PowerShellMountResult::kExists
+                               ? "already_exists"
+                               : "failed"))
+                << " executor=" << mount_executor
+                << " ps_exit_code=" << ps_exit_code
+                << " process_elevated=" << (process_elevated ? "true" : "false")
+                << " privileged_executor_enabled="
+                << (privileged_executor_enabled ? "true" : "false")
+                << std::endl;
+      if (ps_result == PowerShellMountResult::kCreated ||
+          ps_result == PowerShellMountResult::kExists) {
         bound_any = true;
+        if (ps_result == PowerShellMountResult::kCreated && created_ips != nullptr) {
+          created_ips->push_back(MountedSystemIp{
+              adapter.if_index, parsed.S_un.S_addr, prefix, 0});
+        }
       }
       continue;
     }
@@ -2907,26 +3362,47 @@ bool ZeroTierWindowsRuntime::TryMountSystemRoutesForNetwork(
                 << " native_error=" << native_error
                 << " native_error_hex=" << native_error_hex.str() << std::endl;
 
-      if (!IsProcessElevated()) {
+      const bool process_elevated = IsProcessElevated();
+      const bool privileged_executor_enabled = IsPrivilegedMountExecutorEnabled();
+      if (!process_elevated && !privileged_executor_enabled) {
         std::clog << "[ZT/WIN] RouteMount powershell fallback skipped"
                   << " network_id=" << ToHexNetworkId(network_id)
                   << " if_index=" << adapter.if_index
                   << " cidr=" << cidr
-                  << " reason=process_not_elevated" << std::endl;
+                  << " reason=process_not_elevated"
+                  << " privileged_executor_enabled=false" << std::endl;
         continue;
       }
 
       DWORD ps_exit_code = ERROR_GEN_FAILURE;
-      const bool ps_ok =
-          TryAddRouteViaPowerShell(adapter.if_index, cidr, &ps_exit_code);
-      std::clog << "[ZT/WIN] RouteMount powershell fallback"
+      std::string mount_executor = "powershell";
+      const PowerShellMountResult ps_result =
+          TryAddRouteViaPowerShell(adapter.if_index, cidr, &ps_exit_code, true,
+                                   network_id, &mount_executor);
+      std::clog << "[ZT/WIN] RouteMount privileged fallback"
                 << " network_id=" << ToHexNetworkId(network_id)
                 << " if_index=" << adapter.if_index
                 << " cidr=" << cidr
-                << " result=" << (ps_ok ? "success" : "failed")
-                << " ps_exit_code=" << ps_exit_code << std::endl;
-      if (ps_ok) {
+                << " result="
+                << (ps_result == PowerShellMountResult::kCreated
+                        ? "created"
+                        : (ps_result == PowerShellMountResult::kExists
+                               ? "already_exists"
+                               : "failed"))
+                << " executor=" << mount_executor
+                << " ps_exit_code=" << ps_exit_code
+                << " process_elevated=" << (process_elevated ? "true" : "false")
+                << " privileged_executor_enabled="
+                << (privileged_executor_enabled ? "true" : "false")
+                << std::endl;
+      if (ps_result == PowerShellMountResult::kCreated ||
+          ps_result == PowerShellMountResult::kExists) {
         mounted_any_route = true;
+        if (ps_result == PowerShellMountResult::kCreated &&
+            created_routes != nullptr) {
+          created_routes->push_back(
+              MountedSystemRoute{adapter.if_index, destination, prefix});
+        }
       }
       continue;
     }
@@ -3007,15 +3483,25 @@ void ZeroTierWindowsRuntime::RemoveMountedSystemRoutesForNetwork(
     destination_addr.S_un.S_addr = route.destination_ipv4;
     inet_ntop(AF_INET, &destination_addr, destination_text,
               static_cast<DWORD>(sizeof(destination_text)));
-    const bool removed = RemoveOnLinkIpv4Route(
-        route.if_index, route.destination_ipv4, route.prefix_length);
+    const std::string cidr = std::string(destination_text) + "/" +
+                             std::to_string(static_cast<int>(route.prefix_length));
+    bool removed = RemoveOnLinkIpv4Route(route.if_index, route.destination_ipv4,
+                                         route.prefix_length);
+    DWORD ps_exit_code = NO_ERROR;
+    std::string remove_executor = "-";
+    if (!removed) {
+      removed = TryRemoveRouteViaPowerShell(network_id, route.if_index, cidr,
+                                            &ps_exit_code, true,
+                                            &remove_executor);
+    }
     std::clog << "[ZT/WIN] RouteMount cleanup"
               << " network_id=" << ToHexNetworkId(network_id)
               << " source=" << source
               << " if_index=" << route.if_index
-              << " cidr=" << destination_text << "/"
-              << static_cast<int>(route.prefix_length)
-              << " removed=" << (removed ? "true" : "false") << std::endl;
+              << " cidr=" << cidr
+              << " removed=" << (removed ? "true" : "false")
+              << " executor=" << remove_executor
+              << " ps_exit_code=" << ps_exit_code << std::endl;
   }
 }
 
@@ -3037,8 +3523,14 @@ void ZeroTierWindowsRuntime::RemoveMountedSystemIpsForNetwork(
     in_addr ip_addr = {};
     ip_addr.S_un.S_addr = ip.address_ipv4;
     inet_ntop(AF_INET, &ip_addr, ip_text, static_cast<DWORD>(sizeof(ip_text)));
-    const bool removed = RemoveIpv4AddressOnInterface(
-        ip.nte_context, ip.if_index, ip.address_ipv4);
+    bool removed = RemoveIpv4AddressOnInterface(ip.nte_context, ip.if_index,
+                                                ip.address_ipv4);
+    DWORD ps_exit_code = NO_ERROR;
+    std::string remove_executor = "-";
+    if (!removed) {
+      removed = TryRemoveIpViaPowerShell(network_id, ip.if_index, ip_text,
+                                         &ps_exit_code, true, &remove_executor);
+    }
     std::clog << "[ZT/WIN] IpBind cleanup"
               << " network_id=" << ToHexNetworkId(network_id)
               << " source=" << source
@@ -3046,7 +3538,9 @@ void ZeroTierWindowsRuntime::RemoveMountedSystemIpsForNetwork(
               << " context=" << ip.nte_context
               << " ip=" << ip_text
               << " prefix=" << static_cast<int>(ip.prefix_length)
-              << " removed=" << (removed ? "true" : "false") << std::endl;
+              << " removed=" << (removed ? "true" : "false")
+              << " executor=" << remove_executor
+              << " ps_exit_code=" << ps_exit_code << std::endl;
   }
 }
 
@@ -3090,6 +3584,8 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
   std::map<uint64_t, std::vector<MountedSystemRoute>> created_routes_by_network;
   std::set<uint64_t> missing_network_ids;
   std::vector<std::string> expected_addresses;
+  const bool process_elevated = IsProcessElevated();
+  const bool privileged_executor_enabled = IsPrivilegedMountExecutorEnabled();
 
   for (const uint64_t network_id : known_network_ids) {
     int status_code = 0;
@@ -3424,40 +3920,70 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
 
     if (!record.system_ip_bound && selected_adapter != nullptr &&
         selected_adapter->if_index != 0 && record.matched_interface_up) {
-      const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
-      const std::map<std::string, uint8_t> empty_prefix_hints;
-      std::vector<MountedSystemIp> created_ips;
-      const bool ip_bound = TryBindSystemIpForNetwork(
-          network_id, record, *selected_adapter,
-          hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
-                                                      : hints_it->second,
-          &created_ips);
-      if (!created_ips.empty()) {
-        created_ips_by_network[network_id] = std::move(created_ips);
-      }
-      if (ip_bound) {
-        record.system_ip_bound = true;
-        if (selected_exact_match || !record.matched_interface_name.empty()) {
-          record.local_interface_ready = true;
+      if (!process_elevated && !privileged_executor_enabled) {
+        const std::string message =
+            "permission_denied_for_ip_mount: Windows IP mounting requires administrator privileges.";
+        {
+          std::scoped_lock lock(mutex_);
+          SetLastErrorLocked(message);
+        }
+        std::clog << "[ZT/WIN] IpBind blocked"
+                  << " network_id=" << ToHexNetworkId(network_id)
+                  << " if_index=" << selected_adapter->if_index
+                  << " reason=process_not_elevated"
+                  << " privileged_executor_enabled=false"
+                  << " error=" << message << std::endl;
+      } else {
+        const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
+        const std::map<std::string, uint8_t> empty_prefix_hints;
+        std::vector<MountedSystemIp> created_ips;
+        const bool ip_bound = TryBindSystemIpForNetwork(
+            network_id, record, *selected_adapter,
+            hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
+                                                        : hints_it->second,
+            &created_ips);
+        if (!created_ips.empty()) {
+          created_ips_by_network[network_id] = std::move(created_ips);
+        }
+        if (ip_bound) {
+          record.system_ip_bound = true;
+          if (selected_exact_match || !record.matched_interface_name.empty()) {
+            record.local_interface_ready = true;
+          }
         }
       }
     }
     if (record.route_expected && !record.system_route_bound &&
         record.system_ip_bound && selected_adapter != nullptr &&
         selected_adapter->if_index != 0 && record.matched_interface_up) {
-      const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
-      const std::map<std::string, uint8_t> empty_prefix_hints;
-      std::vector<MountedSystemRoute> created_routes;
-      const bool mount_ok = TryMountSystemRoutesForNetwork(
-          network_id, record, *selected_adapter,
-          hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
-                                                      : hints_it->second,
-          &created_routes);
-      if (!created_routes.empty()) {
-        created_routes_by_network[network_id] = std::move(created_routes);
-      }
-      if (mount_ok) {
-        record.system_route_bound = true;
+      if (!process_elevated && !privileged_executor_enabled) {
+        const std::string message =
+            "permission_denied_for_route_mount: Windows route mounting requires administrator privileges.";
+        {
+          std::scoped_lock lock(mutex_);
+          SetLastErrorLocked(message);
+        }
+        std::clog << "[ZT/WIN] RouteMount blocked"
+                  << " network_id=" << ToHexNetworkId(network_id)
+                  << " if_index=" << selected_adapter->if_index
+                  << " reason=process_not_elevated"
+                  << " privileged_executor_enabled=false"
+                  << " error=" << message << std::endl;
+      } else {
+        const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
+        const std::map<std::string, uint8_t> empty_prefix_hints;
+        std::vector<MountedSystemRoute> created_routes;
+        const bool mount_ok = TryMountSystemRoutesForNetwork(
+            network_id, record, *selected_adapter,
+            hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
+                                                        : hints_it->second,
+            &created_routes);
+        if (!created_routes.empty()) {
+          created_routes_by_network[network_id] = std::move(created_routes);
+        }
+        if (mount_ok) {
+          record.system_route_bound = true;
+        }
       }
     }
 

@@ -14,6 +14,7 @@ add_executable(${BINARY_NAME} WIN32
   "../native/zerotier/zerotier_windows_adapter_bridge.cpp"
   "../native/zerotier/zerotier_windows_firewall_manager.cpp"
   "../native/zerotier/zerotier_windows_network_manager.cpp"
+  "../native/zerotier/zerotier_windows_privileged_mount_ipc.cpp"
   "../native/zerotier/zerotier_windows_plugin.cpp"
   "../native/zerotier/zerotier_windows_runtime.cpp"
   "../native/zerotier/zerotier_windows_tap_backend.cpp"
@@ -25,15 +26,22 @@ add_executable(${BINARY_NAME} WIN32
 add_executable(zt_runtime_smoke
   "../native/zerotier/zerotier_windows_adapter_bridge.cpp"
   "../native/zerotier/zerotier_windows_network_manager.cpp"
+  "../native/zerotier/zerotier_windows_privileged_mount_ipc.cpp"
   "../native/zerotier/zerotier_windows_runtime.cpp"
   "../native/zerotier/zerotier_windows_tap_backend.cpp"
   "../native/zerotier/zt_runtime_smoke.cpp"
+)
+
+add_executable(zt_mount_service
+  "../native/zerotier/zerotier_windows_privileged_mount_ipc.cpp"
+  "../native/zerotier/zt_mount_service_main.cpp"
 )
 
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
 apply_standard_settings(zt_runtime_smoke)
+apply_standard_settings(zt_mount_service)
 
 # Add preprocessor definitions for the build version.
 target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION=\"${FLUTTER_VERSION}\"")
@@ -45,6 +53,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION_BUILD=${FLUTT
 # Disable Windows macros that collide with C++ standard library functions.
 target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 target_compile_definitions(zt_runtime_smoke PRIVATE "NOMINMAX")
+target_compile_definitions(zt_mount_service PRIVATE "NOMINMAX")
 
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
@@ -62,6 +71,11 @@ target_link_libraries(zt_runtime_smoke PRIVATE
   "ws2_32.lib"
   zt-shared
 )
+target_link_libraries(zt_mount_service PRIVATE
+  "advapi32.lib"
+  "iphlpapi.lib"
+  "ws2_32.lib"
+)
 target_include_directories(${BINARY_NAME} PRIVATE
   "${CMAKE_SOURCE_DIR}"
   "${CMAKE_SOURCE_DIR}/../third_party/libzt/include"
@@ -70,6 +84,9 @@ target_include_directories(zt_runtime_smoke PRIVATE
   "${CMAKE_SOURCE_DIR}"
   "${FLUTTER_MANAGED_DIR}/ephemeral/cpp_client_wrapper/include"
   "${CMAKE_SOURCE_DIR}/../third_party/libzt/include"
+)
+target_include_directories(zt_mount_service PRIVATE
+  "${CMAKE_SOURCE_DIR}"
 )
 
 add_custom_command(TARGET ${BINARY_NAME} POST_BUILD

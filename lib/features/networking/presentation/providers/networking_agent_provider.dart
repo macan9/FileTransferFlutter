@@ -550,10 +550,10 @@ class NetworkingAgentRuntimeController
         _suppressCommandPollingDuringRuntimeRecovery = false;
         _commandPollingSuppressedAt = null;
       } else {
-      debugPrint(
-        'Skip polling agent commands while ZeroTier runtime recovery is running in background.',
-      );
-      return;
+        debugPrint(
+          'Skip polling agent commands while ZeroTier runtime recovery is running in background.',
+        );
+        return;
       }
     }
     AppConfig config = ref.read(appConfigProvider);
@@ -811,6 +811,7 @@ class NetworkingAgentRuntimeController
         ? error.message.toLowerCase()
         : '$error'.toLowerCase();
     return message.contains('timed out waiting for a managed address') ||
+        message.contains('system mount readiness') ||
         message.contains('requesting_configuration') ||
         message.contains('node stayed offline');
   }
@@ -1109,6 +1110,22 @@ class NetworkingAgentRuntimeController
     return latest;
   }
 
+  bool _isNetworkFullyReadyForCommand(ZeroTierNetworkState network) {
+    if (network.status != 'OK' || network.assignedAddresses.isEmpty) {
+      return false;
+    }
+    if (!Platform.isWindows) {
+      return network.localInterfaceReady || network.isConnected;
+    }
+    if (!network.systemIpBound) {
+      return false;
+    }
+    if (network.routeExpected && !network.systemRouteBound) {
+      return false;
+    }
+    return network.localMountState == 'ready';
+  }
+
   Future<void> _waitForNetworkReady(String networkId) async {
     for (int attempt = 0; attempt < 60; attempt += 1) {
       await Future<void>.delayed(const Duration(milliseconds: 500));
@@ -1141,14 +1158,12 @@ class NetworkingAgentRuntimeController
               : 'ZeroTier network failed with status ${network.status}.',
         );
       }
-      if (network.localInterfaceReady ||
-          network.assignedAddresses.isNotEmpty ||
-          network.isConnected) {
+      if (_isNetworkFullyReadyForCommand(network)) {
         return;
       }
     }
     throw const RealtimeError(
-      'Timed out waiting for a managed address from ZeroTier.',
+      'Timed out waiting for ZeroTier system mount readiness.',
     );
   }
 
@@ -1253,7 +1268,7 @@ class NetworkingAgentRuntimeController
       ? const Duration(minutes: 2)
       : const Duration(seconds: 30);
 
-  bool get _allowMountDegradedJoin => Platform.isWindows;
+  bool get _allowMountDegradedJoin => false;
 
   bool _isTerminalNetworkFailure(String status) {
     switch (status) {
@@ -1520,7 +1535,7 @@ class NetworkingAgentRuntimeController
           );
       if (network != null) {
         lastSeen = network;
-        if (network.assignedAddresses.isNotEmpty) {
+        if (_isNetworkFullyReadyForCommand(network)) {
           debugPrint(
             'Join command verification passed: networkId=$networkId, '
             'addresses=${network.assignedAddresses}, '
@@ -1545,7 +1560,7 @@ class NetworkingAgentRuntimeController
     }
 
     throw RealtimeError(
-      'Join command did not observe managed address assignment in time. '
+      'Join command did not observe ZeroTier system mount readiness in time. '
       'networkId=$networkId, '
       'status=${lastSeen?.status ?? '-'}, '
       'mountState=${lastSeen?.localMountState ?? '-'}, '

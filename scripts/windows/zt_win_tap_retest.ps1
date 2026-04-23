@@ -26,6 +26,8 @@ function Test-IsAdmin {
 
 function Resolve-CMakePath {
   $candidates = @(
+    "E:\DevSoftWare\VisualStudio2026\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+    "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
     "D:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
     "D:\Program Files\Microsoft Visual Studio\17\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
   )
@@ -167,9 +169,9 @@ if ($InstallDriver) {
   $pnputilOut | ForEach-Object { Write-Host $_ }
 }
 
-Write-Section "Build zt_runtime_smoke (ON)"
+Write-Section "Build zt_runtime_smoke (WINTUN)"
 $cmake = Resolve-CMakePath
-& $cmake -S (Join-Path $repoRoot "windows") -B $buildDir -DZTS_ENABLE_WINDOWS_OS_TAP=ON
+& $cmake -S (Join-Path $repoRoot "windows") -B $buildDir -DZTS_ENABLE_WINDOWS_OS_TAP=OFF
 & $cmake --build $buildDir --config Debug --target zt_runtime_smoke -- /m:1
 
 if (-not (Test-Path -LiteralPath $smokeExe)) {

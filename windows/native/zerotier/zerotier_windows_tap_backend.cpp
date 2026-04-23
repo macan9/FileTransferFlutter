@@ -1,6 +1,7 @@
 #include "native/zerotier/zerotier_windows_tap_backend.h"
 
 #include <Windows.h>
+#include <shellapi.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
 
@@ -8,11 +9,13 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <vector>
 
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "Shell32.lib")
 
 namespace {
 
@@ -63,6 +66,264 @@ std::string WideToUtf8(const std::wstring& text) {
                       nullptr, nullptr);
   utf8.pop_back();
   return utf8;
+}
+
+bool IsProcessElevated() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    return false;
+  }
+  TOKEN_ELEVATION elevation = {};
+  DWORD bytes_returned = 0;
+  const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation,
+                                      sizeof(elevation), &bytes_returned);
+  CloseHandle(token);
+  return ok && elevation.TokenIsElevated != 0;
+}
+
+bool ParseTruthyEnvValue(const char* value) {
+  if (value == nullptr) {
+    return false;
+  }
+  std::string normalized(value);
+  std::transform(
+      normalized.begin(), normalized.end(), normalized.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return normalized == "1" || normalized == "true" || normalized == "yes" ||
+         normalized == "on";
+}
+
+bool IsPrivilegedWintunBootstrapEnabled() {
+  char* raw = nullptr;
+  size_t raw_size = 0;
+  if (_dupenv_s(&raw, &raw_size, "ZT_WIN_ENABLE_PRIVILEGED_WINTUN_BOOTSTRAP") !=
+          0 ||
+      raw == nullptr) {
+    return true;
+  }
+  const bool enabled = ParseTruthyEnvValue(raw);
+  free(raw);
+  return enabled;
+}
+
+bool CreateTempPowerShellScriptPath(const wchar_t* prefix,
+                                    std::wstring* script_path,
+                                    DWORD* error_code) {
+  if (script_path == nullptr) {
+    if (error_code != nullptr) {
+      *error_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  script_path->clear();
+  if (error_code != nullptr) {
+    *error_code = ERROR_GEN_FAILURE;
+  }
+
+  wchar_t temp_path[MAX_PATH] = {0};
+  const DWORD temp_path_len = GetTempPathW(MAX_PATH, temp_path);
+  if (temp_path_len == 0 || temp_path_len >= MAX_PATH) {
+    if (error_code != nullptr) {
+      *error_code = GetLastError();
+    }
+    return false;
+  }
+
+  wchar_t temp_file[MAX_PATH] = {0};
+  if (GetTempFileNameW(temp_path, prefix, 0, temp_file) == 0) {
+    if (error_code != nullptr) {
+      *error_code = GetLastError();
+    }
+    return false;
+  }
+
+  std::filesystem::path target_path(temp_file);
+  target_path += L".ps1";
+  const std::wstring target_wide = target_path.wstring();
+  if (!MoveFileExW(temp_file, target_wide.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (error_code != nullptr) {
+      *error_code = GetLastError();
+    }
+    DeleteFileW(temp_file);
+    return false;
+  }
+
+  *script_path = target_wide;
+  if (error_code != nullptr) {
+    *error_code = NO_ERROR;
+  }
+  return true;
+}
+
+std::wstring EscapePowerShellSingleQuotedLiteral(const std::wstring& input) {
+  std::wstring escaped;
+  escaped.reserve(input.size() + 8);
+  for (const wchar_t ch : input) {
+    escaped.push_back(ch);
+    if (ch == L'\'') {
+      escaped.push_back(L'\'');
+    }
+  }
+  return escaped;
+}
+
+std::wstring GuidToWideString(const GUID& guid) {
+  wchar_t buffer[64] = {0};
+  if (StringFromGUID2(guid, buffer, 64) == 0) {
+    return L"";
+  }
+  std::wstring text(buffer);
+  if (!text.empty() && text.front() == L'{') {
+    text.erase(text.begin());
+  }
+  if (!text.empty() && text.back() == L'}') {
+    text.pop_back();
+  }
+  return text;
+}
+
+bool RunPowerShellScriptElevated(const std::wstring& script, DWORD* exit_code) {
+  if (exit_code != nullptr) {
+    *exit_code = ERROR_GEN_FAILURE;
+  }
+  if (script.empty()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+
+  std::wstring script_path;
+  DWORD temp_path_error = NO_ERROR;
+  if (!CreateTempPowerShellScriptPath(L"ztw", &script_path, &temp_path_error)) {
+    if (exit_code != nullptr) {
+      *exit_code = temp_path_error;
+    }
+    return false;
+  }
+  std::ofstream stream(std::filesystem::path(script_path),
+                       std::ios::binary | std::ios::trunc);
+  if (!stream.is_open()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_OPEN_FAILED;
+    }
+    DeleteFileW(script_path.c_str());
+    return false;
+  }
+  const std::string script_utf8 = "\xEF\xBB\xBF& { " + WideToUtf8(script) + " }\r\n";
+  stream.write(script_utf8.data(),
+               static_cast<std::streamsize>(script_utf8.size()));
+  stream.close();
+
+  std::wstring parameters =
+      L"-NoProfile -ExecutionPolicy Bypass -File \"" + script_path +
+      L"\"";
+
+  SHELLEXECUTEINFOW info = {};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  info.lpVerb = L"runas";
+  info.lpFile = L"powershell.exe";
+  info.lpParameters = parameters.c_str();
+  info.nShow = SW_HIDE;
+
+  if (!ShellExecuteExW(&info)) {
+    if (exit_code != nullptr) {
+      *exit_code = GetLastError();
+    }
+    DeleteFileW(script_path.c_str());
+    return false;
+  }
+
+  DWORD process_exit_code = ERROR_GEN_FAILURE;
+  const DWORD wait_result = WaitForSingleObject(info.hProcess, 45000);
+  if (wait_result == WAIT_OBJECT_0) {
+    GetExitCodeProcess(info.hProcess, &process_exit_code);
+  } else if (wait_result == WAIT_TIMEOUT) {
+    process_exit_code = WAIT_TIMEOUT;
+    TerminateProcess(info.hProcess, WAIT_TIMEOUT);
+  } else {
+    process_exit_code = GetLastError();
+  }
+  CloseHandle(info.hProcess);
+  DeleteFileW(script_path.c_str());
+
+  if (exit_code != nullptr) {
+    *exit_code = process_exit_code;
+  }
+  return wait_result == WAIT_OBJECT_0 && process_exit_code == 0;
+}
+
+bool TryBootstrapWintunAdapterViaElevatedPowerShell(
+    const std::wstring& wintun_dll_path, const std::wstring& adapter_name,
+    const std::wstring& tunnel_type, const GUID& adapter_guid,
+    DWORD* exit_code) {
+  if (exit_code != nullptr) {
+    *exit_code = ERROR_GEN_FAILURE;
+  }
+  if (wintun_dll_path.empty() || adapter_name.empty() || tunnel_type.empty()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+
+  const std::wstring guid_text = GuidToWideString(adapter_guid);
+  if (guid_text.empty()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+
+  const std::filesystem::path dll_path(wintun_dll_path);
+  const std::wstring dll_dir =
+      dll_path.has_parent_path() ? dll_path.parent_path().wstring() : L"";
+  if (dll_dir.empty()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+
+  const std::wstring ps_dll_dir = EscapePowerShellSingleQuotedLiteral(dll_dir);
+  const std::wstring ps_adapter = EscapePowerShellSingleQuotedLiteral(adapter_name);
+  const std::wstring ps_tunnel = EscapePowerShellSingleQuotedLiteral(tunnel_type);
+  const std::wstring ps_guid = EscapePowerShellSingleQuotedLiteral(guid_text);
+
+  std::wostringstream script;
+  script << LR"(
+$ErrorActionPreference = 'Stop';
+$env:Path = ')" << ps_dll_dir << LR"(' + ';' + $env:Path;
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class ZTWintunNative {
+  [DllImport("wintun.dll", EntryPoint="WintunOpenAdapter", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern IntPtr OpenAdapter(string name);
+  [DllImport("wintun.dll", EntryPoint="WintunCreateAdapter", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern IntPtr CreateAdapter(string name, string tunnelType, ref Guid requestedGuid);
+  [DllImport("wintun.dll", EntryPoint="WintunCloseAdapter", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern void CloseAdapter(IntPtr adapter);
+}
+"@;
+$name = ')" << ps_adapter << LR"(';
+$type = ')" << ps_tunnel << LR"(';
+$guid = [Guid]::Parse(')" << ps_guid << LR"(');
+$handle = [ZTWintunNative]::OpenAdapter($name);
+if ($handle -ne [IntPtr]::Zero) {
+  [ZTWintunNative]::CloseAdapter($handle);
+  exit 0
+}
+$handle = [ZTWintunNative]::CreateAdapter($name, $type, [ref]$guid);
+if ($handle -eq [IntPtr]::Zero) {
+  exit 101
+}
+[ZTWintunNative]::CloseAdapter($handle);
+exit 0
+)";
+
+  return RunPowerShellScriptElevated(script.str(), exit_code);
 }
 
 std::wstring CurrentModuleDirectory() {
@@ -227,6 +488,23 @@ struct WintunApi {
   }
 };
 
+WintunApi* GetSharedWintunApi(std::string* load_message) {
+  static WintunApi api;
+  static bool loaded = false;
+  if (!loaded) {
+    if (!api.Load(load_message)) {
+      return nullptr;
+    }
+    loaded = true;
+  }
+  return &api;
+}
+
+WintunAdapterHandle& SharedPinnedWintunHandle() {
+  static WintunAdapterHandle handle = nullptr;
+  return handle;
+}
+
 void TryBringInterfaceUp(WintunGetAdapterLuidFn get_adapter_luid,
                          WintunAdapterHandle adapter) {
   if (get_adapter_luid == nullptr || adapter == nullptr) {
@@ -295,6 +573,8 @@ std::string ZeroTierWindowsWintunTapBackend::InstallStateLabel() const {
       return "installed";
     case InstallState::kRepairNeeded:
       return "repair_needed";
+    case InstallState::kPermissionDenied:
+      return "permission_denied";
     default:
       return "unknown";
   }
@@ -355,9 +635,10 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
   install_state_ = InstallState::kInstalling;
   ++bootstrap_attempts_;
 
-  WintunApi api;
+  WintunApi* api = nullptr;
   std::string load_message;
-  if (!api.Load(&load_message)) {
+  api = GetSharedWintunApi(&load_message);
+  if (api == nullptr) {
     ++consecutive_failures_;
     install_state_ = consecutive_failures_ >= 3 ? InstallState::kRepairNeeded
                                                  : InstallState::kNotInstalled;
@@ -374,34 +655,78 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
   const GUID kAdapterGuid = {0x9f0f6f21, 0x2a6b, 0x4bbf,
                               {0xb9, 0x30, 0x7a, 0xe2, 0x63, 0x85, 0x5d, 0x11}};
 
-  WintunAdapterHandle handle = api.open_adapter(kAdapterName);
+  WintunAdapterHandle handle = api->open_adapter(kAdapterName);
+  DWORD open_error = handle == nullptr ? GetLastError() : NO_ERROR;
   bool created = false;
   if (handle == nullptr) {
-    handle = api.create_adapter(kAdapterName, kTunnelType, &kAdapterGuid);
+    handle = api->create_adapter(kAdapterName, kTunnelType, &kAdapterGuid);
     created = handle != nullptr;
   }
+  DWORD create_error = created || handle != nullptr ? NO_ERROR : GetLastError();
+  DWORD helper_exit_code = NO_ERROR;
+  bool helper_attempted = false;
+  bool helper_succeeded = false;
+
+  if (handle == nullptr &&
+      (open_error == ERROR_ACCESS_DENIED || create_error == ERROR_ACCESS_DENIED) &&
+      !IsProcessElevated() && IsPrivilegedWintunBootstrapEnabled()) {
+    helper_attempted = true;
+    helper_succeeded = TryBootstrapWintunAdapterViaElevatedPowerShell(
+        api->loaded_from.empty() ? L"wintun.dll" : api->loaded_from, kAdapterName,
+        kTunnelType, kAdapterGuid, &helper_exit_code);
+    if (helper_succeeded) {
+      handle = api->open_adapter(kAdapterName);
+      open_error = handle == nullptr ? GetLastError() : NO_ERROR;
+      if (handle == nullptr) {
+        handle = api->create_adapter(kAdapterName, kTunnelType, &kAdapterGuid);
+        created = handle != nullptr;
+        create_error = created || handle != nullptr ? NO_ERROR : GetLastError();
+      }
+    }
+  }
+
   if (handle == nullptr) {
     ++consecutive_failures_;
-    install_state_ = consecutive_failures_ >= 3 ? InstallState::kRepairNeeded
-                                                 : InstallState::kNotInstalled;
+    if ((open_error == ERROR_ACCESS_DENIED ||
+         create_error == ERROR_ACCESS_DENIED) &&
+        !IsProcessElevated()) {
+      install_state_ = InstallState::kPermissionDenied;
+    } else {
+      install_state_ = consecutive_failures_ >= 3 ? InstallState::kRepairNeeded
+                                                   : InstallState::kNotInstalled;
+    }
     next_bootstrap_tick_ms_ = now + BootstrapRetryDelayMs(bootstrap_attempts_);
     if (action_summary != nullptr) {
       std::ostringstream stream;
       stream << "wintun bootstrap failed: open/create adapter returned null"
-             << " last_error=" << GetLastError()
+             << " open_error=" << open_error
+             << " create_error=" << create_error
+             << " process_elevated=" << (IsProcessElevated() ? "true" : "false")
+             << " helper_attempted=" << (helper_attempted ? "true" : "false")
+             << " helper_succeeded=" << (helper_succeeded ? "true" : "false");
+      if (helper_attempted) {
+        stream << " helper_exit_code=" << helper_exit_code;
+      }
+      stream << " last_error=" << GetLastError()
              << " state=" << InstallStateLabel();
       *action_summary = stream.str();
     }
     return false;
   }
 
+  WintunAdapterHandle& pinned_handle = SharedPinnedWintunHandle();
+  if (pinned_handle == nullptr) {
+    pinned_handle = handle;
+  } else if (handle != pinned_handle) {
+    api->close_adapter(handle);
+  }
+
   NET_LUID luid = {};
-  api.get_adapter_luid(handle, &luid);
+  api->get_adapter_luid(pinned_handle, &luid);
   NET_IFINDEX if_index = 0;
   if (ConvertInterfaceLuidToIndex(&luid, &if_index) == NO_ERROR && if_index != 0) {
-    TryBringInterfaceUp(api.get_adapter_luid, handle);
+    TryBringInterfaceUp(api->get_adapter_luid, pinned_handle);
   }
-  api.close_adapter(handle);
 
   bool enumerated = false;
   if (if_index != 0) {
@@ -432,7 +757,7 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
   next_bootstrap_tick_ms_ = 0;
 
   if (action_summary != nullptr) {
-    std::string loaded_from = WideToUtf8(api.loaded_from);
+    std::string loaded_from = WideToUtf8(api->loaded_from);
     if (loaded_from.empty()) {
       loaded_from = "wintun.dll";
     }

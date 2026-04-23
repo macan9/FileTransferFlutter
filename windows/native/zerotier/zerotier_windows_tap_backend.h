@@ -40,6 +40,7 @@ class ZeroTierWindowsWintunTapBackend : public ZeroTierWindowsTapBackend {
     kInstalling = 1,
     kInstalled = 2,
     kRepairNeeded = 3,
+    kPermissionDenied = 4,
   };
 
   std::string InstallStateLabel() const;
