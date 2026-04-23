@@ -166,7 +166,8 @@ int main() {
 
     std::string join_error;
     const bool join_ok = runtime.JoinNetworkAndWaitForIp(
-        std::stoull(join_network_id, nullptr, 16), join_timeout_ms, &join_error);
+        std::stoull(join_network_id, nullptr, 16), join_timeout_ms,
+        allow_mount_degraded, &join_error);
     status = runtime.DetectStatus();
     PrintStatus(status, "post-join-target");
     std::cout << "[smoke] join ok=" << (join_ok ? "true" : "false")
@@ -343,7 +344,8 @@ int main() {
   std::cout << "[smoke] joinTimeoutMs=" << join_timeout_ms << std::endl;
   std::string join_error;
   const bool join_ok = runtime.JoinNetworkAndWaitForIp(
-      std::stoull(network_id, nullptr, 16), join_timeout_ms, &join_error);
+      std::stoull(network_id, nullptr, 16), join_timeout_ms,
+      allow_mount_degraded, &join_error);
   std::cout << "[smoke] join ok=" << (join_ok ? "true" : "false")
             << " error=" << join_error << std::endl;
   status = runtime.DetectStatus();

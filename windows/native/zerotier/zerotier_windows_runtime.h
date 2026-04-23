@@ -82,6 +82,7 @@ class ZeroTierWindowsRuntime {
   void ClearEventCallback();
 
   bool JoinNetworkAndWaitForIp(uint64_t network_id, int timeout_ms,
+                               bool allow_mount_degraded,
                                std::string* error_message);
   bool LeaveNetwork(uint64_t network_id, const std::string& source,
                     std::string* error_message);

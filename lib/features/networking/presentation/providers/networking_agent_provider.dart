@@ -853,6 +853,7 @@ class NetworkingAgentRuntimeController
           .joinNetworkAndWaitForIp(
             networkId,
             timeout: nativeTimeout,
+            allowMountDegraded: _allowMountDegradedJoin,
           )
           .timeout(guardTimeout);
     } on TimeoutException {
@@ -1251,6 +1252,8 @@ class NetworkingAgentRuntimeController
   Duration get _joinWaitTimeout => Platform.isWindows
       ? const Duration(minutes: 2)
       : const Duration(seconds: 30);
+
+  bool get _allowMountDegradedJoin => Platform.isWindows;
 
   bool _isTerminalNetworkFailure(String status) {
     switch (status) {

@@ -40,7 +40,8 @@ flutter::EncodableMap ZeroTierWindowsNetworkManager::ProbeNetworkStateNow(
 }
 
 bool ZeroTierWindowsNetworkManager::JoinNetworkAndWaitForIp(
-    const std::string& network_id, int timeout_ms, std::string* error_message) {
+    const std::string& network_id, int timeout_ms, bool allow_mount_degraded,
+    std::string* error_message) {
   if (runtime_ == nullptr) {
     if (error_message != nullptr) {
       *error_message = "ZeroTier runtime is unavailable.";
@@ -55,7 +56,7 @@ bool ZeroTierWindowsNetworkManager::JoinNetworkAndWaitForIp(
     return false;
   }
   return runtime_->JoinNetworkAndWaitForIp(parsed_network_id, timeout_ms,
-                                           error_message);
+                                           allow_mount_degraded, error_message);
 }
 
 bool ZeroTierWindowsNetworkManager::LeaveNetwork(const std::string& network_id,

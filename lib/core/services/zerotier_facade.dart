@@ -29,10 +29,12 @@ class ZeroTierFacade implements ZeroTierPlatformApi {
   Future<void> joinNetworkAndWaitForIp(
     String networkId, {
     Duration timeout = const Duration(seconds: 30),
+    bool allowMountDegraded = false,
   }) {
     return _platformApi.joinNetworkAndWaitForIp(
       networkId,
       timeout: timeout,
+      allowMountDegraded: allowMountDegraded,
     );
   }
 

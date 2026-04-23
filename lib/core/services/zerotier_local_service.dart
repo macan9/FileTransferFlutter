@@ -127,6 +127,7 @@ class ProcessZeroTierLocalService implements ZeroTierLocalService {
   Future<void> joinNetworkAndWaitForIp(
     String networkId, {
     Duration timeout = const Duration(seconds: 30),
+    bool allowMountDegraded = false,
   }) async {
     final String executable = await _requireCliExecutable();
     _emit(

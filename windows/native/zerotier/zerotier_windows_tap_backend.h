@@ -35,7 +35,19 @@ class ZeroTierWindowsWintunTapBackend : public ZeroTierWindowsTapBackend {
       std::string* action_summary) override;
 
  private:
-  bool attempted_bootstrap_ = false;
+  enum class InstallState {
+    kNotInstalled = 0,
+    kInstalling = 1,
+    kInstalled = 2,
+    kRepairNeeded = 3,
+  };
+
+  std::string InstallStateLabel() const;
+
+  InstallState install_state_ = InstallState::kNotInstalled;
+  int bootstrap_attempts_ = 0;
+  int consecutive_failures_ = 0;
+  unsigned long long next_bootstrap_tick_ms_ = 0;
 };
 
 class ZeroTierWindowsZtTapBackend : public ZeroTierWindowsTapBackend {
@@ -49,6 +61,9 @@ class ZeroTierWindowsZtTapBackend : public ZeroTierWindowsTapBackend {
       const ZeroTierWindowsAdapterBridge::ProbeResult& probe_result,
       const std::vector<std::string>& expected_ipv4_addresses,
       std::string* action_summary) override;
+
+ private:
+  ZeroTierWindowsWintunTapBackend wintun_fallback_;
 };
 
 class ZeroTierWindowsAutoTapBackend : public ZeroTierWindowsTapBackend {
@@ -62,6 +77,9 @@ class ZeroTierWindowsAutoTapBackend : public ZeroTierWindowsTapBackend {
       const ZeroTierWindowsAdapterBridge::ProbeResult& probe_result,
       const std::vector<std::string>& expected_ipv4_addresses,
       std::string* action_summary) override;
+
+ private:
+  ZeroTierWindowsWintunTapBackend wintun_backend_;
 };
 
 std::unique_ptr<ZeroTierWindowsTapBackend> CreateWindowsTapBackendFromEnv();

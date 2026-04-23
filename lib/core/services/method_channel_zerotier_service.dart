@@ -53,12 +53,14 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
   Future<void> joinNetworkAndWaitForIp(
     String networkId, {
     Duration timeout = const Duration(seconds: 30),
+    bool allowMountDegraded = false,
   }) async {
     await _invoke(
       'joinNetworkAndWaitForIp',
       <String, Object?>{
         'networkId': networkId,
         'timeoutMs': timeout.inMilliseconds,
+        'allowMountDegraded': allowMountDegraded,
       },
     );
   }

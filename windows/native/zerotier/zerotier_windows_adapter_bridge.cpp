@@ -176,10 +176,11 @@ std::string ReadRegistryStringValue(HKEY root_key, const std::string& sub_key,
 std::string ClassifyDriverKind(const std::string& friendly_name,
                                const std::string& description,
                                const std::string& adapter_name,
-                               const std::string& device_instance_id) {
+                               const std::string& device_instance_id,
+                               const std::string& driver_service_name) {
   const std::string merged =
       ToLower(friendly_name + " " + description + " " + adapter_name + " " +
-              device_instance_id);
+              device_instance_id + " " + driver_service_name);
   if (ContainsSubstring(merged, {"zerotier"})) {
     return "zerotier";
   }
@@ -223,6 +224,13 @@ void LoadAdapterRegistryMetadata(ZeroTierWindowsAdapterBridge::AdapterRecord* re
       ReadRegistryStringValue(HKEY_LOCAL_MACHINE, connection_key, "PnpInstanceID");
   if (!pnp_instance_id.empty()) {
     record->device_instance_id = pnp_instance_id;
+    const std::string enum_key =
+        "SYSTEM\\CurrentControlSet\\Enum\\" + pnp_instance_id;
+    const std::string service_name =
+        ReadRegistryStringValue(HKEY_LOCAL_MACHINE, enum_key, "Service");
+    if (!service_name.empty()) {
+      record->driver_service_name = service_name;
+    }
   }
 }
 
@@ -346,7 +354,7 @@ ZeroTierWindowsAdapterBridge::ProbeResult ZeroTierWindowsAdapterBridge::Probe(
   }
 
   ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                GAA_FLAG_SKIP_DNS_SERVER;
+                GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_ALL_INTERFACES;
   ULONG buffer_size = 15 * 1024;
   std::vector<unsigned char> buffer(buffer_size);
   DWORD api_result = GetAdaptersAddresses(
@@ -383,12 +391,14 @@ ZeroTierWindowsAdapterBridge::ProbeResult ZeroTierWindowsAdapterBridge::Probe(
     LoadAdapterRegistryMetadata(&record);
     record.driver_kind =
         ClassifyDriverKind(record.friendly_name, record.description,
-                           record.adapter_name, record.device_instance_id);
+                           record.adapter_name, record.device_instance_id,
+                           record.driver_service_name);
     record.is_mount_candidate =
         LooksLikeMountCandidateAdapter(record.friendly_name) ||
         LooksLikeMountCandidateAdapter(record.description) ||
         LooksLikeMountCandidateAdapter(record.adapter_name) ||
-        LooksLikeMountCandidateAdapter(record.device_instance_id);
+        LooksLikeMountCandidateAdapter(record.device_instance_id) ||
+        LooksLikeMountCandidateAdapter(record.driver_service_name);
     record.is_virtual =
         LooksLikeVirtualAdapter(record.friendly_name) ||
         LooksLikeVirtualAdapter(record.description) ||

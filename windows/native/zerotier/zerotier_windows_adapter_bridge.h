@@ -25,6 +25,7 @@ class ZeroTierWindowsAdapterBridge {
     std::string media_status = "unknown";
     std::string netcfg_instance_id;
     std::string device_instance_id;
+    std::string driver_service_name;
     std::vector<std::string> ipv4_addresses;
     std::map<std::string, uint8_t> ipv4_prefix_lengths;
   };

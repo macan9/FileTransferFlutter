@@ -12,6 +12,7 @@ abstract class ZeroTierPlatformApi {
   Future<void> joinNetworkAndWaitForIp(
     String networkId, {
     Duration timeout,
+    bool allowMountDegraded,
   });
   Future<void> leaveNetwork(
     String networkId, {

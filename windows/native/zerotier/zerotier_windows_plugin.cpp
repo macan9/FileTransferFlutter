@@ -34,6 +34,24 @@ int ReadIntArgument(const flutter::EncodableMap& arguments, const char* key) {
   return 0;
 }
 
+bool ReadBoolArgument(const flutter::EncodableMap& arguments, const char* key,
+                      bool fallback = false) {
+  const auto it = arguments.find(flutter::EncodableValue(key));
+  if (it == arguments.end()) {
+    return fallback;
+  }
+  if (std::holds_alternative<bool>(it->second)) {
+    return std::get<bool>(it->second);
+  }
+  if (std::holds_alternative<int32_t>(it->second)) {
+    return std::get<int32_t>(it->second) != 0;
+  }
+  if (std::holds_alternative<int64_t>(it->second)) {
+    return std::get<int64_t>(it->second) != 0;
+  }
+  return fallback;
+}
+
 }  // namespace
 
 ZeroTierWindowsPlugin::ZeroTierWindowsPlugin() : network_manager_(&runtime_) {
@@ -206,12 +224,14 @@ void ZeroTierWindowsPlugin::HandleJoinNetworkCall(
     std::unique_ptr<MethodResult> result) {
   const std::string network_id = ReadStringArgument(args, "networkId");
   const int timeout_ms = ReadIntArgument(args, "timeoutMs");
+  const bool allow_mount_degraded =
+      ReadBoolArgument(args, "allowMountDegraded", false);
   auto* plugin = this;
-  std::thread([plugin, network_id, timeout_ms,
+  std::thread([plugin, network_id, timeout_ms, allow_mount_degraded,
                result = std::move(result)]() mutable {
     std::string error_message;
     const bool success = plugin->network_manager_.JoinNetworkAndWaitForIp(
-        network_id, timeout_ms, &error_message);
+        network_id, timeout_ms, allow_mount_degraded, &error_message);
     plugin->QueueMethodResult(PendingMethodResult{
         std::move(result),
         success,

@@ -23,9 +23,11 @@
 #include <sstream>
 #include <iostream>
 #include <limits>
+#include <vector>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace {
 
@@ -207,9 +209,13 @@ bool ShouldExposeNetworkRecord(
   return false;
 }
 
-bool IsJoinClosedLoopReady(const ZeroTierWindowsNetworkRecord& network) {
+bool IsJoinClosedLoopReady(const ZeroTierWindowsNetworkRecord& network,
+                           bool allow_mount_degraded) {
   if (network.local_interface_ready) {
     return true;
+  }
+  if (!allow_mount_degraded) {
+    return false;
   }
   // Phase-1 Wintun/no-zttap compatibility: allow join to succeed when
   // ZeroTier control-plane is ready and managed addresses are present,
@@ -224,6 +230,7 @@ bool IsJoinClosedLoopReady(const ZeroTierWindowsNetworkRecord& network) {
     return false;
   }
   return network.local_mount_state == "missing_adapter" ||
+         network.local_mount_state == "adapter_down" ||
          network.local_mount_state == "ip_not_bound" ||
          network.local_mount_state == "route_not_bound";
 }
@@ -331,6 +338,151 @@ bool ParseIpv4(const std::string& text, in_addr* output) {
   return true;
 }
 
+std::wstring Utf8ToWide(const std::string& text) {
+  if (text.empty()) {
+    return std::wstring();
+  }
+  const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+  if (size <= 1) {
+    return std::wstring();
+  }
+  std::wstring output(static_cast<size_t>(size), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, output.data(), size);
+  if (!output.empty() && output.back() == L'\0') {
+    output.pop_back();
+  }
+  return output;
+}
+
+std::wstring EscapePowerShellSingleQuotedLiteral(const std::wstring& input) {
+  std::wstring escaped;
+  escaped.reserve(input.size() + 8);
+  for (const wchar_t ch : input) {
+    escaped.push_back(ch);
+    if (ch == L'\'') {
+      escaped.push_back(L'\'');
+    }
+  }
+  return escaped;
+}
+
+bool IsProcessElevated() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    return false;
+  }
+  TOKEN_ELEVATION elevation = {};
+  DWORD bytes_returned = 0;
+  const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation,
+                                      sizeof(elevation), &bytes_returned);
+  CloseHandle(token);
+  return ok && elevation.TokenIsElevated != 0;
+}
+
+bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code) {
+  if (exit_code != nullptr) {
+    *exit_code = ERROR_GEN_FAILURE;
+  }
+  if (script.empty()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+
+  std::wstring command_line =
+      L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& { " +
+      script + L" }\"";
+  std::vector<wchar_t> command_line_buffer(command_line.begin(),
+                                           command_line.end());
+  command_line_buffer.push_back(L'\0');
+
+  STARTUPINFOW startup = {};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process = {};
+  if (!CreateProcessW(nullptr, command_line_buffer.data(), nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+    if (exit_code != nullptr) {
+      *exit_code = GetLastError();
+    }
+    return false;
+  }
+
+  const DWORD wait_result = WaitForSingleObject(process.hProcess, 30000);
+  DWORD process_exit_code = ERROR_GEN_FAILURE;
+  if (wait_result == WAIT_OBJECT_0) {
+    GetExitCodeProcess(process.hProcess, &process_exit_code);
+  } else if (wait_result == WAIT_TIMEOUT) {
+    process_exit_code = WAIT_TIMEOUT;
+    TerminateProcess(process.hProcess, WAIT_TIMEOUT);
+  } else {
+    process_exit_code = GetLastError();
+  }
+
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+
+  if (exit_code != nullptr) {
+    *exit_code = process_exit_code;
+  }
+  return wait_result == WAIT_OBJECT_0 && process_exit_code == 0;
+}
+
+bool TryAddIpViaPowerShell(uint32_t if_index, const std::string& ip_text,
+                           uint8_t prefix_length, DWORD* ps_exit_code) {
+  const std::wstring ip_wide = Utf8ToWide(ip_text);
+  if (if_index == 0 || ip_wide.empty()) {
+    if (ps_exit_code != nullptr) {
+      *ps_exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  const std::wstring escaped_ip = EscapePowerShellSingleQuotedLiteral(ip_wide);
+
+  std::wostringstream script;
+  script << L"try { "
+         << L"$existing = Get-NetIPAddress -InterfaceIndex " << if_index
+         << L" -AddressFamily IPv4 -IPAddress '" << escaped_ip
+         << L"' -ErrorAction SilentlyContinue; "
+         << L"if (-not $existing) { "
+         << L"New-NetIPAddress -InterfaceIndex " << if_index
+         << L" -IPAddress '" << escaped_ip
+         << L"' -PrefixLength " << static_cast<int>(prefix_length)
+         << L" -AddressFamily IPv4 -Type Unicast -ErrorAction Stop | Out-Null "
+         << L"}; "
+         << L"exit 0 "
+         << L"} catch { exit 1 }";
+  return RunPowerShellScript(script.str(), ps_exit_code);
+}
+
+bool TryAddRouteViaPowerShell(uint32_t if_index, const std::string& cidr,
+                              DWORD* ps_exit_code) {
+  const std::wstring cidr_wide = Utf8ToWide(cidr);
+  if (if_index == 0 || cidr_wide.empty()) {
+    if (ps_exit_code != nullptr) {
+      *ps_exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  const std::wstring escaped_cidr =
+      EscapePowerShellSingleQuotedLiteral(cidr_wide);
+
+  std::wostringstream script;
+  script << L"try { "
+         << L"$existing = Get-NetRoute -InterfaceIndex " << if_index
+         << L" -AddressFamily IPv4 -DestinationPrefix '" << escaped_cidr
+         << L"' -ErrorAction SilentlyContinue; "
+         << L"if (-not $existing) { "
+         << L"New-NetRoute -InterfaceIndex " << if_index
+         << L" -AddressFamily IPv4 -DestinationPrefix '" << escaped_cidr
+         << L"' -NextHop '0.0.0.0' -RouteMetric 5 -PolicyStore ActiveStore "
+         << L"-ErrorAction Stop | Out-Null "
+         << L"}; "
+         << L"exit 0 "
+         << L"} catch { exit 1 }";
+  return RunPowerShellScript(script.str(), ps_exit_code);
+}
+
 enum class EnsureRouteResult {
   kFailed = 0,
   kExists = 1,
@@ -339,8 +491,15 @@ enum class EnsureRouteResult {
 
 EnsureRouteResult EnsureOnLinkIpv4Route(uint32_t if_index,
                                         uint32_t destination_network_order,
-                                        uint8_t prefix_length) {
+                                        uint8_t prefix_length,
+                                        DWORD* native_error_code) {
+  if (native_error_code != nullptr) {
+    *native_error_code = NO_ERROR;
+  }
   if (if_index == 0) {
+    if (native_error_code != nullptr) {
+      *native_error_code = ERROR_INVALID_PARAMETER;
+    }
     return EnsureRouteResult::kFailed;
   }
 
@@ -386,6 +545,9 @@ EnsureRouteResult EnsureOnLinkIpv4Route(uint32_t if_index,
     return result == NO_ERROR ? EnsureRouteResult::kCreated
                               : EnsureRouteResult::kExists;
   }
+  if (native_error_code != nullptr) {
+    *native_error_code = result;
+  }
   return EnsureRouteResult::kFailed;
 }
 
@@ -430,11 +592,18 @@ enum class EnsureIpResult {
 EnsureIpResult EnsureIpv4AddressOnInterface(uint32_t if_index,
                                             uint32_t address_network_order,
                                             uint8_t prefix_length,
-                                            uint32_t* created_context) {
+                                            uint32_t* created_context,
+                                            DWORD* native_error_code) {
   if (created_context != nullptr) {
     *created_context = 0;
   }
+  if (native_error_code != nullptr) {
+    *native_error_code = NO_ERROR;
+  }
   if (if_index == 0) {
+    if (native_error_code != nullptr) {
+      *native_error_code = ERROR_INVALID_PARAMETER;
+    }
     return EnsureIpResult::kFailed;
   }
 
@@ -464,6 +633,9 @@ EnsureIpResult EnsureIpv4AddressOnInterface(uint32_t if_index,
     }
     return EnsureIpResult::kCreated;
   }
+  if (native_error_code != nullptr) {
+    *native_error_code = add_result;
+  }
 
   ip_table_size = 0;
   if (GetIpAddrTable(nullptr, &ip_table_size, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
@@ -482,11 +654,38 @@ EnsureIpResult EnsureIpv4AddressOnInterface(uint32_t if_index,
   return EnsureIpResult::kFailed;
 }
 
-bool RemoveIpv4AddressOnInterface(uint32_t nte_context) {
-  if (nte_context == 0) {
+bool RemoveIpv4AddressOnInterface(uint32_t nte_context, uint32_t if_index,
+                                  uint32_t address_network_order) {
+  (void)if_index;
+  (void)address_network_order;
+  if (nte_context != 0) {
+    return DeleteIPAddress(nte_context) == NO_ERROR;
+  }
+  return false;
+}
+
+bool EnsureInterfaceAdminUp(uint32_t if_index) {
+  if (if_index == 0) {
     return false;
   }
-  return DeleteIPAddress(nte_context) == NO_ERROR;
+  MIB_IFROW row = {};
+  row.dwIndex = if_index;
+  if (GetIfEntry(&row) != NO_ERROR) {
+    return false;
+  }
+  if (row.dwAdminStatus != MIB_IF_ADMIN_STATUS_UP) {
+    row.dwAdminStatus = MIB_IF_ADMIN_STATUS_UP;
+    if (SetIfEntry(&row) != NO_ERROR) {
+      return false;
+    }
+    Sleep(150);
+    row = {};
+    row.dwIndex = if_index;
+    if (GetIfEntry(&row) != NO_ERROR) {
+      return false;
+    }
+  }
+  return row.dwAdminStatus == MIB_IF_ADMIN_STATUS_UP;
 }
 
 void ResetJoinTrace(ZeroTierWindowsNetworkRecord* network) {
@@ -745,6 +944,7 @@ void ZeroTierWindowsRuntime::ClearEventCallback() {
 
 bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
                                                      int timeout_ms,
+                                                     bool allow_mount_degraded,
                                                      std::string* error_message) {
   if (network_id == 0) {
     if (error_message != nullptr) {
@@ -817,6 +1017,8 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
             << " network_id=" << ToHexNetworkId(network_id)
             << " result=" << result
             << " timeout_ms=" << timeout_ms
+            << " allow_mount_degraded="
+            << (allow_mount_degraded ? "true" : "false")
             << std::endl;
   if (result != ZTS_ERR_OK) {
     if (error_message != nullptr) {
@@ -851,7 +1053,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     const auto remaining = deadline - now;
     const auto wait_slice =
         remaining < probe_interval ? remaining : probe_interval;
-    state_cv_.wait_for(lock, wait_slice, [this, network_id]() {
+    state_cv_.wait_for(lock, wait_slice, [this, network_id, allow_mount_degraded]() {
       const auto network_it = networks_.find(network_id);
       if (network_it == networks_.end()) {
         return !last_error_.empty() || !node_started_;
@@ -862,7 +1064,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
           IsTerminalNetworkFailureStatus(network.status)) {
         return true;
       }
-      if (IsJoinClosedLoopReady(network)) {
+      if (IsJoinClosedLoopReady(network, allow_mount_degraded)) {
         return true;
       }
       return !last_error_.empty() || !node_started_;
@@ -923,7 +1125,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
                 << " node_online=" << (node_online_ ? "true" : "false")
                 << " last_error=" << (last_error_.empty() ? "-" : last_error_)
                 << std::endl;
-      if (IsJoinClosedLoopReady(network)) {
+      if (IsJoinClosedLoopReady(network, allow_mount_degraded)) {
         ClearLastErrorLocked();
         pending_join_networks_.erase(network_id);
         if (error_message != nullptr) {
@@ -979,7 +1181,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
   }
 
   const auto timed_out_network_it = networks_.find(network_id);
-  if (timed_out_network_it != networks_.end() &&
+  if (allow_mount_degraded && timed_out_network_it != networks_.end() &&
       IsSoftJoinTimeoutAllowedByEnv() &&
       ShouldSoftSucceedJoinTimeout(timed_out_network_it->second)) {
     const ZeroTierWindowsNetworkRecord& network = timed_out_network_it->second;
@@ -1788,6 +1990,8 @@ ZeroTierWindowsRuntime::BuildAdapterDiagnosticsPayloadLocked() const {
          EncodableValue(adapter.device_instance_id)},
         {EncodableValue("tapNetCfgInstanceId"),
          EncodableValue(adapter.netcfg_instance_id)},
+        {EncodableValue("driverServiceName"),
+         EncodableValue(adapter.driver_service_name)},
         {EncodableValue("ipv4Addresses"), EncodableValue(ipv4_addresses)},
     });
   }
@@ -1899,6 +2103,29 @@ bool ZeroTierWindowsRuntime::EnsurePrepared(std::string* error_message) {
   std::clog << "[ZT/WIN] AdapterBridge initialized"
             << " summary=" << adapter_probe_.summary
             << std::endl;
+  if (tap_backend_ != nullptr) {
+    std::string backend_action;
+    if (tap_backend_->EnsureAdapterPresent(adapter_probe_, {}, &backend_action)) {
+      std::clog << "[ZT/WIN] TapBackend ensure adapter(preflight)"
+                << " backend=" << tap_backend_id_
+                << " action=" << (backend_action.empty() ? "-" : backend_action)
+                << std::endl;
+      constexpr int kProbeRetryCount = 6;
+      for (int attempt = 0; attempt < kProbeRetryCount; ++attempt) {
+        adapter_probe_ = adapter_bridge_.Refresh({});
+        if (adapter_probe_.has_virtual_adapter || adapter_probe_.has_mount_candidate) {
+          break;
+        }
+        Sleep(250);
+      }
+      std::clog << "[ZT/WIN] AdapterBridge probe(preflight ensure)"
+                << " summary=" << adapter_probe_.summary << std::endl;
+    } else if (!backend_action.empty()) {
+      std::clog << "[ZT/WIN] TapBackend ensure adapter(preflight) skipped"
+                << " backend=" << tap_backend_id_
+                << " reason=" << backend_action << std::endl;
+    }
+  }
   ClearLastErrorLocked();
   if (error_message != nullptr) {
     error_message->clear();
@@ -2563,14 +2790,43 @@ bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
     }
 
     uint32_t created_context = 0;
+    DWORD native_error = NO_ERROR;
     const EnsureIpResult ip_result = EnsureIpv4AddressOnInterface(
-        adapter.if_index, parsed.S_un.S_addr, prefix, &created_context);
+        adapter.if_index, parsed.S_un.S_addr, prefix, &created_context,
+        &native_error);
     if (ip_result == EnsureIpResult::kFailed) {
+      std::ostringstream native_error_hex;
+      native_error_hex << "0x" << std::hex << std::uppercase << native_error;
       std::clog << "[ZT/WIN] IpBind attempt failed"
                 << " network_id=" << ToHexNetworkId(network_id)
                 << " if_index=" << adapter.if_index
                 << " ip=" << address
-                << " prefix=" << static_cast<int>(prefix) << std::endl;
+                << " prefix=" << static_cast<int>(prefix)
+                << " native_error=" << native_error
+                << " native_error_hex=" << native_error_hex.str() << std::endl;
+
+      if (!IsProcessElevated()) {
+        std::clog << "[ZT/WIN] IpBind powershell fallback skipped"
+                  << " network_id=" << ToHexNetworkId(network_id)
+                  << " if_index=" << adapter.if_index
+                  << " ip=" << address
+                  << " reason=process_not_elevated" << std::endl;
+        continue;
+      }
+
+      DWORD ps_exit_code = ERROR_GEN_FAILURE;
+      const bool ps_ok = TryAddIpViaPowerShell(adapter.if_index, address, prefix,
+                                               &ps_exit_code);
+      std::clog << "[ZT/WIN] IpBind powershell fallback"
+                << " network_id=" << ToHexNetworkId(network_id)
+                << " if_index=" << adapter.if_index
+                << " ip=" << address
+                << " prefix=" << static_cast<int>(prefix)
+                << " result=" << (ps_ok ? "success" : "failed")
+                << " ps_exit_code=" << ps_exit_code << std::endl;
+      if (ps_ok) {
+        bound_any = true;
+      }
       continue;
     }
     bound_any = true;
@@ -2638,13 +2894,40 @@ bool ZeroTierWindowsRuntime::TryMountSystemRoutesForNetwork(
       continue;
     }
 
-    const EnsureRouteResult route_result =
-        EnsureOnLinkIpv4Route(adapter.if_index, destination, prefix);
+    DWORD native_error = NO_ERROR;
+    const EnsureRouteResult route_result = EnsureOnLinkIpv4Route(
+        adapter.if_index, destination, prefix, &native_error);
     if (route_result == EnsureRouteResult::kFailed) {
+      std::ostringstream native_error_hex;
+      native_error_hex << "0x" << std::hex << std::uppercase << native_error;
       std::clog << "[ZT/WIN] RouteMount attempt failed"
                 << " network_id=" << ToHexNetworkId(network_id)
                 << " if_index=" << adapter.if_index
-                << " cidr=" << cidr << std::endl;
+                << " cidr=" << cidr
+                << " native_error=" << native_error
+                << " native_error_hex=" << native_error_hex.str() << std::endl;
+
+      if (!IsProcessElevated()) {
+        std::clog << "[ZT/WIN] RouteMount powershell fallback skipped"
+                  << " network_id=" << ToHexNetworkId(network_id)
+                  << " if_index=" << adapter.if_index
+                  << " cidr=" << cidr
+                  << " reason=process_not_elevated" << std::endl;
+        continue;
+      }
+
+      DWORD ps_exit_code = ERROR_GEN_FAILURE;
+      const bool ps_ok =
+          TryAddRouteViaPowerShell(adapter.if_index, cidr, &ps_exit_code);
+      std::clog << "[ZT/WIN] RouteMount powershell fallback"
+                << " network_id=" << ToHexNetworkId(network_id)
+                << " if_index=" << adapter.if_index
+                << " cidr=" << cidr
+                << " result=" << (ps_ok ? "success" : "failed")
+                << " ps_exit_code=" << ps_exit_code << std::endl;
+      if (ps_ok) {
+        mounted_any_route = true;
+      }
       continue;
     }
 
@@ -2754,7 +3037,8 @@ void ZeroTierWindowsRuntime::RemoveMountedSystemIpsForNetwork(
     in_addr ip_addr = {};
     ip_addr.S_un.S_addr = ip.address_ipv4;
     inet_ntop(AF_INET, &ip_addr, ip_text, static_cast<DWORD>(sizeof(ip_text)));
-    const bool removed = RemoveIpv4AddressOnInterface(ip.nte_context);
+    const bool removed = RemoveIpv4AddressOnInterface(
+        ip.nte_context, ip.if_index, ip.address_ipv4);
     std::clog << "[ZT/WIN] IpBind cleanup"
               << " network_id=" << ToHexNetworkId(network_id)
               << " source=" << source
@@ -3021,7 +3305,15 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                 << " backend=" << tap_backend_id_
                 << " action=" << (backend_action.empty() ? "-" : backend_action)
                 << std::endl;
-      adapter_probe = adapter_bridge_.Refresh(expected_addresses);
+      constexpr int kProbeRetryCount = 6;
+      for (int attempt = 0; attempt < kProbeRetryCount; ++attempt) {
+        adapter_probe = adapter_bridge_.Refresh(expected_addresses);
+        if (adapter_probe.has_virtual_adapter || adapter_probe.has_mount_candidate ||
+            adapter_probe.has_expected_network_ip) {
+          break;
+        }
+        Sleep(250);
+      }
       std::clog << "[ZT/WIN] AdapterBridge probe(after backend ensure)"
                 << " summary=" << adapter_probe.summary << std::endl;
     } else if (!backend_action.empty()) {
@@ -3045,6 +3337,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     record.tap_netcfg_instance_id.clear();
     const ZeroTierWindowsAdapterBridge::AdapterRecord* selected_adapter =
         nullptr;
+    bool selected_exact_match = false;
 
     if (!record.assigned_addresses.empty()) {
       const ZeroTierWindowsAdapterBridge::AdapterRecord* exact_match = nullptr;
@@ -3089,6 +3382,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
       }
 
       selected_adapter = exact_match != nullptr ? exact_match : fallback_candidate;
+      selected_exact_match = exact_match != nullptr;
       if (selected_adapter != nullptr) {
         record.matched_interface_name =
             !selected_adapter->friendly_name.empty()
@@ -3102,17 +3396,34 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         record.tap_media_status = selected_adapter->media_status;
         record.tap_device_instance_id = selected_adapter->device_instance_id;
         record.tap_netcfg_instance_id = selected_adapter->netcfg_instance_id;
-        record.system_ip_bound = exact_match != nullptr;
+        record.system_ip_bound = selected_exact_match;
         record.system_route_bound =
             !record.route_expected ||
-            ((exact_match != nullptr) && selected_adapter->has_expected_route);
+            (selected_exact_match && selected_adapter->has_expected_route);
         record.local_interface_ready =
-            exact_match != nullptr && selected_adapter->is_up;
+            selected_exact_match && selected_adapter->is_up;
+      }
+    }
+
+    if (selected_adapter != nullptr && selected_adapter->if_index != 0 &&
+        !record.matched_interface_up) {
+      if (EnsureInterfaceAdminUp(selected_adapter->if_index)) {
+        record.matched_interface_up = true;
+        record.tap_media_status = "up";
+        std::clog << "[ZT/WIN] RefreshSnapshot adapter bring-up"
+                  << " network_id=" << ToHexNetworkId(network_id)
+                  << " if_index=" << selected_adapter->if_index
+                  << " name="
+                  << (record.matched_interface_name.empty()
+                          ? "-"
+                          : record.matched_interface_name)
+                  << " result=admin_up"
+                  << std::endl;
       }
     }
 
     if (!record.system_ip_bound && selected_adapter != nullptr &&
-        selected_adapter->if_index != 0 && selected_adapter->is_up) {
+        selected_adapter->if_index != 0 && record.matched_interface_up) {
       const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
       const std::map<std::string, uint8_t> empty_prefix_hints;
       std::vector<MountedSystemIp> created_ips;
@@ -3126,11 +3437,14 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
       }
       if (ip_bound) {
         record.system_ip_bound = true;
+        if (selected_exact_match || !record.matched_interface_name.empty()) {
+          record.local_interface_ready = true;
+        }
       }
     }
     if (record.route_expected && !record.system_route_bound &&
         record.system_ip_bound && selected_adapter != nullptr &&
-        selected_adapter->if_index != 0 && selected_adapter->is_up) {
+        selected_adapter->if_index != 0 && record.matched_interface_up) {
       const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
       const std::map<std::string, uint8_t> empty_prefix_hints;
       std::vector<MountedSystemRoute> created_routes;
