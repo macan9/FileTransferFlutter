@@ -7,6 +7,7 @@
 .pub-cache/
 build/
 *.log
+logs/
 
 # Android Studio / IntelliJ
 *.iml
@@ -24,3 +25,4 @@ desktop.ini
 
 # Generated
 coverage/
+*.zip

@@ -10,7 +10,13 @@ class ZeroTierAdapterRecord extends Equatable {
     required this.operStatus,
     required this.isUp,
     required this.isVirtual,
+    required this.isMountCandidate,
     required this.matchesExpectedIp,
+    required this.hasExpectedRoute,
+    required this.driverKind,
+    required this.mediaStatus,
+    required this.tapDeviceInstanceId,
+    required this.tapNetCfgInstanceId,
     required this.ipv4Addresses,
   });
 
@@ -22,7 +28,13 @@ class ZeroTierAdapterRecord extends Equatable {
   final String operStatus;
   final bool isUp;
   final bool isVirtual;
+  final bool isMountCandidate;
   final bool matchesExpectedIp;
+  final bool hasExpectedRoute;
+  final String driverKind;
+  final String mediaStatus;
+  final String tapDeviceInstanceId;
+  final String tapNetCfgInstanceId;
   final List<String> ipv4Addresses;
 
   String get displayName {
@@ -48,7 +60,13 @@ class ZeroTierAdapterRecord extends Equatable {
         operStatus,
         isUp,
         isVirtual,
+        isMountCandidate,
         matchesExpectedIp,
+        hasExpectedRoute,
+        driverKind,
+        mediaStatus,
+        tapDeviceInstanceId,
+        tapNetCfgInstanceId,
         ipv4Addresses,
       ];
 }
@@ -57,8 +75,12 @@ class ZeroTierAdapterBridgeStatus extends Equatable {
   const ZeroTierAdapterBridgeStatus({
     required this.initialized,
     required this.hasVirtualAdapter,
+    required this.hasMountCandidate,
     required this.hasExpectedNetworkIp,
+    required this.hasExpectedRoute,
     required this.virtualAdapterNames,
+    required this.matchedAdapterNames,
+    required this.mountCandidateNames,
     required this.detectedIpv4Addresses,
     required this.expectedIpv4Addresses,
     required this.adapters,
@@ -68,8 +90,12 @@ class ZeroTierAdapterBridgeStatus extends Equatable {
   const ZeroTierAdapterBridgeStatus.unknown()
       : initialized = false,
         hasVirtualAdapter = false,
+        hasMountCandidate = false,
         hasExpectedNetworkIp = false,
+        hasExpectedRoute = false,
         virtualAdapterNames = const <String>[],
+        matchedAdapterNames = const <String>[],
+        mountCandidateNames = const <String>[],
         detectedIpv4Addresses = const <String>[],
         expectedIpv4Addresses = const <String>[],
         adapters = const <ZeroTierAdapterRecord>[],
@@ -77,8 +103,12 @@ class ZeroTierAdapterBridgeStatus extends Equatable {
 
   final bool initialized;
   final bool hasVirtualAdapter;
+  final bool hasMountCandidate;
   final bool hasExpectedNetworkIp;
+  final bool hasExpectedRoute;
   final List<String> virtualAdapterNames;
+  final List<String> matchedAdapterNames;
+  final List<String> mountCandidateNames;
   final List<String> detectedIpv4Addresses;
   final List<String> expectedIpv4Addresses;
   final List<ZeroTierAdapterRecord> adapters;
@@ -88,8 +118,12 @@ class ZeroTierAdapterBridgeStatus extends Equatable {
   List<Object?> get props => <Object?>[
         initialized,
         hasVirtualAdapter,
+        hasMountCandidate,
         hasExpectedNetworkIp,
+        hasExpectedRoute,
         virtualAdapterNames,
+        matchedAdapterNames,
+        mountCandidateNames,
         detectedIpv4Addresses,
         expectedIpv4Addresses,
         adapters,

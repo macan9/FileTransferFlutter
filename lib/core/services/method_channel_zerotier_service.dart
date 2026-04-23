@@ -177,8 +177,18 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
     return ZeroTierAdapterBridgeStatus(
       initialized: _readBool(map, 'initialized'),
       hasVirtualAdapter: _readBool(map, 'hasVirtualAdapter'),
+      hasMountCandidate: _readBool(map, 'hasMountCandidate'),
       hasExpectedNetworkIp: _readBool(map, 'hasExpectedNetworkIp'),
+      hasExpectedRoute: _readBool(map, 'hasExpectedRoute'),
       virtualAdapterNames: _readList(map, 'virtualAdapterNames')
+          .map((Object? item) => item?.toString() ?? '')
+          .where((String item) => item.trim().isNotEmpty)
+          .toList(growable: false),
+      matchedAdapterNames: _readList(map, 'matchedAdapterNames')
+          .map((Object? item) => item?.toString() ?? '')
+          .where((String item) => item.trim().isNotEmpty)
+          .toList(growable: false),
+      mountCandidateNames: _readList(map, 'mountCandidateNames')
           .map((Object? item) => item?.toString() ?? '')
           .where((String item) => item.trim().isNotEmpty)
           .toList(growable: false),
@@ -208,7 +218,13 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
       operStatus: _readString(map, 'operStatus', fallback: 'unknown'),
       isUp: _readBool(map, 'isUp'),
       isVirtual: _readBool(map, 'isVirtual'),
+      isMountCandidate: _readBool(map, 'isMountCandidate'),
       matchesExpectedIp: _readBool(map, 'matchesExpectedIp'),
+      hasExpectedRoute: _readBool(map, 'hasExpectedRoute'),
+      driverKind: _readString(map, 'driverKind', fallback: 'unknown'),
+      mediaStatus: _readString(map, 'mediaStatus', fallback: 'unknown'),
+      tapDeviceInstanceId: _readString(map, 'tapDeviceInstanceId'),
+      tapNetCfgInstanceId: _readString(map, 'tapNetCfgInstanceId'),
       ipv4Addresses: _readList(map, 'ipv4Addresses')
           .map((Object? item) => item?.toString() ?? '')
           .where((String item) => item.trim().isNotEmpty)
@@ -246,6 +262,18 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
       localInterfaceReady: _readBool(map, 'localInterfaceReady'),
       matchedInterfaceName: _readString(map, 'matchedInterfaceName'),
       matchedInterfaceUp: _readBool(map, 'matchedInterfaceUp'),
+      mountDriverKind: _readString(map, 'mountDriverKind', fallback: 'unknown'),
+      mountCandidateNames: _readList(map, 'mountCandidateNames')
+          .map((Object? item) => item?.toString() ?? '')
+          .where((String item) => item.trim().isNotEmpty)
+          .toList(growable: false),
+      routeExpected: _readBool(map, 'routeExpected'),
+      expectedRouteCount: _readInt(map, 'expectedRouteCount'),
+      systemIpBound: _readBool(map, 'systemIpBound'),
+      systemRouteBound: _readBool(map, 'systemRouteBound'),
+      tapMediaStatus: _readString(map, 'tapMediaStatus', fallback: 'unknown'),
+      tapDeviceInstanceId: _readString(map, 'tapDeviceInstanceId'),
+      tapNetCfgInstanceId: _readString(map, 'tapNetCfgInstanceId'),
       localMountState: _readString(map, 'localMountState', fallback: 'unknown'),
     );
   }

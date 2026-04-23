@@ -11,6 +11,15 @@ class ZeroTierNetworkState extends Equatable {
     required this.localInterfaceReady,
     required this.matchedInterfaceName,
     required this.matchedInterfaceUp,
+    required this.mountDriverKind,
+    required this.mountCandidateNames,
+    required this.routeExpected,
+    required this.expectedRouteCount,
+    required this.systemIpBound,
+    required this.systemRouteBound,
+    required this.tapMediaStatus,
+    required this.tapDeviceInstanceId,
+    required this.tapNetCfgInstanceId,
     required this.localMountState,
   });
 
@@ -23,6 +32,15 @@ class ZeroTierNetworkState extends Equatable {
   final bool localInterfaceReady;
   final String matchedInterfaceName;
   final bool matchedInterfaceUp;
+  final String mountDriverKind;
+  final List<String> mountCandidateNames;
+  final bool routeExpected;
+  final int expectedRouteCount;
+  final bool systemIpBound;
+  final bool systemRouteBound;
+  final String tapMediaStatus;
+  final String tapDeviceInstanceId;
+  final String tapNetCfgInstanceId;
   final String localMountState;
 
   @override
@@ -36,6 +54,15 @@ class ZeroTierNetworkState extends Equatable {
         localInterfaceReady,
         matchedInterfaceName,
         matchedInterfaceUp,
+        mountDriverKind,
+        mountCandidateNames,
+        routeExpected,
+        expectedRouteCount,
+        systemIpBound,
+        systemRouteBound,
+        tapMediaStatus,
+        tapDeviceInstanceId,
+        tapNetCfgInstanceId,
         localMountState,
       ];
 }

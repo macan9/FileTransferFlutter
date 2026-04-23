@@ -667,7 +667,10 @@ class _AdapterBridgeCard extends StatelessWidget {
         adapterBridge.adapters
             .where(
               (ZeroTierAdapterRecord item) =>
-                  item.isVirtual || item.matchesExpectedIp,
+                  item.isVirtual ||
+                  item.matchesExpectedIp ||
+                  item.isMountCandidate ||
+                  item.hasExpectedRoute,
             )
             .toList(growable: false);
 
@@ -695,11 +698,33 @@ class _AdapterBridgeCard extends StatelessWidget {
                 value: adapterBridge.hasVirtualAdapter ? 'Detected' : 'Missing',
               ),
               _InfoPill(
+                label: 'Mount Candidate',
+                value: adapterBridge.hasMountCandidate ? 'Detected' : 'Missing',
+              ),
+              _InfoPill(
                 label: 'Expected IP',
                 value: adapterBridge.hasExpectedNetworkIp ? 'Bound' : 'Unbound',
               ),
+              _InfoPill(
+                label: 'Expected Route',
+                value: adapterBridge.hasExpectedRoute ? 'Bound' : 'Unbound',
+              ),
             ],
           ),
+          if (adapterBridge.mountCandidateNames.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            _LabeledBlock(
+              label: 'Mount Candidates',
+              value: adapterBridge.mountCandidateNames.join(', '),
+            ),
+          ],
+          if (adapterBridge.matchedAdapterNames.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            _LabeledBlock(
+              label: 'Matched Adapters',
+              value: adapterBridge.matchedAdapterNames.join(', '),
+            ),
+          ],
           const SizedBox(height: 12),
           _LabeledBlock(
             label: 'Adapter Summary',
@@ -714,8 +739,14 @@ class _AdapterBridgeCard extends StatelessWidget {
                   label: adapter.displayName,
                   value: 'status=${adapter.operStatus} up=${adapter.isUp} '
                       'virtual=${adapter.isVirtual} '
+                      'mountCandidate=${adapter.isMountCandidate} '
                       'expectedIp=${adapter.matchesExpectedIp} '
+                      'expectedRoute=${adapter.hasExpectedRoute} '
+                      'driver=${adapter.driverKind} '
+                      'media=${adapter.mediaStatus} '
                       'ifIndex=${adapter.ifIndex} '
+                      'tapDevId=${adapter.tapDeviceInstanceId.isEmpty ? "-" : adapter.tapDeviceInstanceId} '
+                      'tapCfgId=${adapter.tapNetCfgInstanceId.isEmpty ? "-" : adapter.tapNetCfgInstanceId} '
                       'ipv4=${adapter.ipv4Addresses.isEmpty ? "-" : adapter.ipv4Addresses.join(", ")}',
                 ),
               ),
@@ -2681,6 +2712,18 @@ _NetworkVisualState _resolveNetworkVisualState({
     );
   }
 
+  if (localState.localMountState == 'route_not_bound') {
+    return _NetworkVisualState(
+      label: '等待本地路由',
+      message: localState.matchedInterfaceName.trim().isNotEmpty
+          ? '接口 ${localState.matchedInterfaceName} 已识别，但系统路由尚未挂载完成。'
+          : 'ZeroTier 本地地址已进入挂载流程，但系统路由尚未生效。',
+      icon: Icons.route_rounded,
+      background: const Color(0xFFEAF2FF),
+      foreground: const Color(0xFF1D4ED8),
+    );
+  }
+
   if (localState.localMountState == 'adapter_down') {
     return _NetworkVisualState(
       label: '接口未就绪',
@@ -2777,6 +2820,7 @@ bool _isLocalNetworkNegotiating(
       localState.status == 'UNKNOWN' ||
       localState.localMountState == 'awaiting_address' ||
       localState.localMountState == 'ip_not_bound' ||
+      localState.localMountState == 'route_not_bound' ||
       localState.localMountState == 'adapter_down' ||
       localState.localMountState == 'missing_adapter';
 }

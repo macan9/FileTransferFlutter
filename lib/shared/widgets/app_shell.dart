@@ -1,11 +1,13 @@
 import 'dart:io';
 
 import 'package:file_transfer_flutter/core/constants/app_constants.dart';
+import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_agent_provider.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:window_manager/window_manager.dart';
 
-class AppShell extends StatelessWidget {
+class AppShell extends ConsumerStatefulWidget {
   const AppShell({super.key, required this.navigationShell});
 
   final StatefulNavigationShell navigationShell;
@@ -35,13 +37,26 @@ class AppShell extends StatelessWidget {
   ];
 
   @override
+  ConsumerState<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends ConsumerState<AppShell> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.read(networkingAgentRuntimeProvider.notifier).activate();
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
     final bool isDesktop =
         Platform.isWindows || Platform.isLinux || Platform.isMacOS;
     final Widget content = Column(
       children: <Widget>[
         if (isDesktop) const _DesktopTitleBar(),
-        Expanded(child: navigationShell),
+        Expanded(child: widget.navigationShell),
       ],
     );
 
@@ -52,12 +67,12 @@ class AppShell extends StatelessWidget {
         child: content,
       ),
       bottomNavigationBar: NavigationBar(
-        selectedIndex: navigationShell.currentIndex,
-        destinations: _destinations,
+        selectedIndex: widget.navigationShell.currentIndex,
+        destinations: AppShell._destinations,
         onDestinationSelected: (int index) {
-          navigationShell.goBranch(
+          widget.navigationShell.goBranch(
             index,
-            initialLocation: index == navigationShell.currentIndex,
+            initialLocation: index == widget.navigationShell.currentIndex,
           );
         },
       ),

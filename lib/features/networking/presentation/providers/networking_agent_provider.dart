@@ -185,6 +185,7 @@ class NetworkingAgentRuntimeController
   bool _busyBootstrapping = false;
   bool _busyPolling = false;
   bool _suppressCommandPollingDuringRuntimeRecovery = false;
+  DateTime? _commandPollingSuppressedAt;
   int _runtimeRefreshRevision = 0;
 
   NetworkingService get _networkingService =>
@@ -314,6 +315,7 @@ class NetworkingAgentRuntimeController
     required bool deactivateWhenIdle,
   }) async {
     _suppressCommandPollingDuringRuntimeRecovery = true;
+    _commandPollingSuppressedAt = DateTime.now();
     try {
       await _waitForRuntimeRecoveryAfterLeave(networkId);
       await _refreshRuntimeStatus();
@@ -338,6 +340,7 @@ class NetworkingAgentRuntimeController
       );
     } finally {
       _suppressCommandPollingDuringRuntimeRecovery = false;
+      _commandPollingSuppressedAt = null;
       unawaited(_pollCommands());
     }
   }
@@ -366,6 +369,7 @@ class NetworkingAgentRuntimeController
     _busyBootstrapping = false;
     _busyPolling = false;
     _suppressCommandPollingDuringRuntimeRecovery = false;
+    _commandPollingSuppressedAt = null;
     state = state.copyWith(
       runtimeStatus: status,
       isActivated: false,
@@ -489,7 +493,20 @@ class NetworkingAgentRuntimeController
   }
 
   Future<void> _sendHeartbeat() async {
-    final AppConfig config = ref.read(appConfigProvider);
+    AppConfig config = ref.read(appConfigProvider);
+    if (config.agentToken.trim().isEmpty ||
+        config.deviceId.trim().isEmpty ||
+        config.zeroTierNodeId.trim().isEmpty) {
+      await _initializeIdentity();
+      config = ref.read(appConfigProvider);
+    }
+    if (config.agentToken.trim().isEmpty ||
+        config.deviceId.trim().isEmpty ||
+        config.zeroTierNodeId.trim().isEmpty) {
+      return;
+    }
+
+    config = await _alignIdentityWithRuntimeNode(config);
     if (config.agentToken.trim().isEmpty ||
         config.deviceId.trim().isEmpty ||
         config.zeroTierNodeId.trim().isEmpty) {
@@ -521,12 +538,38 @@ class NetworkingAgentRuntimeController
       return;
     }
     if (_suppressCommandPollingDuringRuntimeRecovery) {
+      final DateTime now = DateTime.now();
+      final DateTime? suppressedAt = _commandPollingSuppressedAt;
+      final bool suppressionExpired = suppressedAt == null ||
+          now.difference(suppressedAt) > const Duration(seconds: 20);
+      if (suppressionExpired) {
+        debugPrint(
+          'Command polling suppression exceeded safety timeout; '
+          'resuming polling automatically.',
+        );
+        _suppressCommandPollingDuringRuntimeRecovery = false;
+        _commandPollingSuppressedAt = null;
+      } else {
       debugPrint(
         'Skip polling agent commands while ZeroTier runtime recovery is running in background.',
       );
       return;
+      }
     }
-    final AppConfig config = ref.read(appConfigProvider);
+    AppConfig config = ref.read(appConfigProvider);
+    if (config.agentToken.trim().isEmpty ||
+        config.deviceId.trim().isEmpty ||
+        config.zeroTierNodeId.trim().isEmpty) {
+      await _initializeIdentity();
+      config = ref.read(appConfigProvider);
+    }
+    if (config.agentToken.trim().isEmpty ||
+        config.deviceId.trim().isEmpty ||
+        config.zeroTierNodeId.trim().isEmpty) {
+      return;
+    }
+
+    config = await _alignIdentityWithRuntimeNode(config);
     if (config.agentToken.trim().isEmpty ||
         config.deviceId.trim().isEmpty ||
         config.zeroTierNodeId.trim().isEmpty) {
@@ -582,22 +625,6 @@ class NetworkingAgentRuntimeController
     NetworkAgentCommand command,
   ) async {
     try {
-      await _networkingService.ackAgentCommand(
-        commandId: command.id,
-        deviceId: config.deviceId,
-        agentToken: config.agentToken,
-        status: 'processing',
-      );
-    } catch (error) {
-      state = state.copyWith(
-        lastCommandAt: DateTime.now(),
-        lastCommandSummary: 'Skipped ${command.type}',
-        lastError: error is RealtimeError ? error.message : '$error',
-      );
-      return;
-    }
-
-    try {
       switch (command.type) {
         case 'join_zerotier_network':
           {
@@ -612,6 +639,7 @@ class NetworkingAgentRuntimeController
               'networkId=$networkId, sessionId=${command.sessionId ?? '-'}',
             );
             await _joinNetworkWithRecovery(networkId);
+            await _ensureManagedAddressAssignedForCommand(networkId);
             await _refreshRuntimeStatus();
             await ref.read(networkingProvider.notifier).refresh();
             break;
@@ -758,10 +786,7 @@ class NetworkingAgentRuntimeController
   Future<void> _joinNetworkWithRecovery(String networkId) async {
     await _ensureNodeOnlineForJoin();
     try {
-      await _zeroTierService.joinNetworkAndWaitForIp(
-        networkId,
-        timeout: _joinWaitTimeout,
-      );
+      await _joinNetworkWithNativeTimeoutGuard(networkId);
     } catch (error) {
       if (!_shouldAttemptWindowsJoinRecovery(error)) {
         rethrow;
@@ -817,10 +842,25 @@ class NetworkingAgentRuntimeController
     );
     await _ensureNodeOnlineForJoin();
     await Future<void>.delayed(const Duration(milliseconds: 500));
-    await _zeroTierService.joinNetworkAndWaitForIp(
-      networkId,
-      timeout: _joinWaitTimeout,
-    );
+    await _joinNetworkWithNativeTimeoutGuard(networkId);
+  }
+
+  Future<void> _joinNetworkWithNativeTimeoutGuard(String networkId) async {
+    final Duration nativeTimeout = _joinWaitTimeout;
+    final Duration guardTimeout = nativeTimeout + const Duration(seconds: 15);
+    try {
+      await _zeroTierService
+          .joinNetworkAndWaitForIp(
+            networkId,
+            timeout: nativeTimeout,
+          )
+          .timeout(guardTimeout);
+    } on TimeoutException {
+      throw RealtimeError(
+        'ZeroTier native join call timed out after '
+        '${guardTimeout.inSeconds}s (networkId=$networkId).',
+      );
+    }
   }
 
   Future<bool> _shouldSuppressLeaveCommand(
@@ -1330,6 +1370,15 @@ class NetworkingAgentRuntimeController
             localInterfaceReady: false,
             matchedInterfaceName: '',
             matchedInterfaceUp: false,
+            mountDriverKind: 'unknown',
+            mountCandidateNames: const <String>[],
+            routeExpected: false,
+            expectedRouteCount: 0,
+            systemIpBound: false,
+            systemRouteBound: false,
+            tapMediaStatus: 'unknown',
+            tapDeviceInstanceId: '',
+            tapNetCfgInstanceId: '',
             localMountState: 'unknown',
           );
 
@@ -1348,6 +1397,33 @@ class NetworkingAgentRuntimeController
     final bool mergedMatchedInterfaceUp =
         (event.payload['matchedInterfaceUp'] as bool?) == true ||
             previous.matchedInterfaceUp;
+    final String mergedMountDriverKind =
+        event.payload['mountDriverKind']?.toString() ??
+            previous.mountDriverKind;
+    final List<String> payloadMountCandidateNames =
+        _readEventStringList(event, 'mountCandidateNames');
+    final List<String> mergedMountCandidateNames =
+        payloadMountCandidateNames.isNotEmpty
+            ? payloadMountCandidateNames
+            : previous.mountCandidateNames;
+    final bool mergedRouteExpected =
+        (event.payload['routeExpected'] as bool?) ?? previous.routeExpected;
+    final int mergedExpectedRouteCount =
+        _readEventInt(event, 'expectedRouteCount') ??
+            previous.expectedRouteCount;
+    final bool mergedSystemIpBound =
+        (event.payload['systemIpBound'] as bool?) ?? previous.systemIpBound;
+    final bool mergedSystemRouteBound =
+        (event.payload['systemRouteBound'] as bool?) ??
+            previous.systemRouteBound;
+    final String mergedTapMediaStatus =
+        event.payload['tapMediaStatus']?.toString() ?? previous.tapMediaStatus;
+    final String mergedTapDeviceInstanceId =
+        event.payload['tapDeviceInstanceId']?.toString() ??
+            previous.tapDeviceInstanceId;
+    final String mergedTapNetCfgInstanceId =
+        event.payload['tapNetCfgInstanceId']?.toString() ??
+            previous.tapNetCfgInstanceId;
     final String mergedLocalMountState =
         event.payload['localMountState']?.toString() ??
             previous.localMountState;
@@ -1363,6 +1439,15 @@ class NetworkingAgentRuntimeController
       localInterfaceReady: mergedLocalInterfaceReady,
       matchedInterfaceName: mergedMatchedInterfaceName,
       matchedInterfaceUp: mergedMatchedInterfaceUp,
+      mountDriverKind: mergedMountDriverKind,
+      mountCandidateNames: mergedMountCandidateNames,
+      routeExpected: mergedRouteExpected,
+      expectedRouteCount: mergedExpectedRouteCount,
+      systemIpBound: mergedSystemIpBound,
+      systemRouteBound: mergedSystemRouteBound,
+      tapMediaStatus: mergedTapMediaStatus,
+      tapDeviceInstanceId: mergedTapDeviceInstanceId,
+      tapNetCfgInstanceId: mergedTapNetCfgInstanceId,
       localMountState: mergedLocalMountState,
     );
 
@@ -1386,6 +1471,106 @@ class NetworkingAgentRuntimeController
         .map((Object? item) => item?.toString() ?? '')
         .where((String item) => item.trim().isNotEmpty)
         .toList(growable: false);
+  }
+
+  Future<AppConfig> _alignIdentityWithRuntimeNode(AppConfig config) async {
+    final String configuredNodeId = config.zeroTierNodeId.trim();
+    String runtimeNodeId = state.runtimeStatus.nodeId.trim();
+    if (runtimeNodeId.isEmpty) {
+      try {
+        final ZeroTierRuntimeStatus status =
+            await _zeroTierService.detectStatus();
+        runtimeNodeId = status.nodeId.trim();
+      } catch (_) {
+        runtimeNodeId = '';
+      }
+    }
+    if (runtimeNodeId.isEmpty || runtimeNodeId == configuredNodeId) {
+      return config;
+    }
+
+    debugPrint(
+      'ZeroTier identity drift detected: configNodeId=$configuredNodeId, '
+      'runtimeNodeId=$runtimeNodeId. Rebootstrapping agent identity.',
+    );
+    await _initializeIdentity();
+    return ref.read(appConfigProvider);
+  }
+
+  Future<void> _ensureManagedAddressAssignedForCommand(String networkId) async {
+    final DateTime deadline = DateTime.now().add(
+      Platform.isWindows
+          ? const Duration(seconds: 20)
+          : const Duration(seconds: 8),
+    );
+    ZeroTierNetworkState? lastSeen;
+
+    while (DateTime.now().isBefore(deadline)) {
+      final ZeroTierRuntimeStatus status =
+          await _zeroTierService.detectStatus();
+      final ZeroTierNetworkState? network = status.joinedNetworks
+          .where((ZeroTierNetworkState item) => item.networkId == networkId)
+          .cast<ZeroTierNetworkState?>()
+          .firstWhere(
+            (ZeroTierNetworkState? item) => item != null,
+            orElse: () => null,
+          );
+      if (network != null) {
+        lastSeen = network;
+        if (network.assignedAddresses.isNotEmpty) {
+          debugPrint(
+            'Join command verification passed: networkId=$networkId, '
+            'addresses=${network.assignedAddresses}, '
+            'mountState=${network.localMountState}, '
+            'systemIpBound=${network.systemIpBound}, '
+            'systemRouteBound=${network.systemRouteBound}',
+          );
+          return;
+        }
+        if (network.status == 'ACCESS_DENIED') {
+          throw const RealtimeError(
+            'ZeroTier network authorization is still pending.',
+          );
+        }
+        if (_isTerminalNetworkFailure(network.status)) {
+          throw RealtimeError(
+            'ZeroTier network failed with status ${network.status}.',
+          );
+        }
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+    }
+
+    throw RealtimeError(
+      'Join command did not observe managed address assignment in time. '
+      'networkId=$networkId, '
+      'status=${lastSeen?.status ?? '-'}, '
+      'mountState=${lastSeen?.localMountState ?? '-'}, '
+      'systemIpBound=${lastSeen?.systemIpBound ?? false}, '
+      'systemRouteBound=${lastSeen?.systemRouteBound ?? false}',
+    );
+  }
+
+  List<String> _readEventStringList(ZeroTierRuntimeEvent event, String key) {
+    final Object? raw = event.payload[key];
+    if (raw is! List) {
+      return const <String>[];
+    }
+    return raw
+        .map((Object? item) => item?.toString() ?? '')
+        .where((String item) => item.trim().isNotEmpty)
+        .toList(growable: false);
+  }
+
+  int? _readEventInt(ZeroTierRuntimeEvent event, String key) {
+    final Object? raw = event.payload[key];
+    if (raw is int) {
+      return raw;
+    }
+    if (raw is num) {
+      return raw.toInt();
+    }
+    return int.tryParse(raw?.toString() ?? '');
   }
 
   bool _shouldIgnoreRuntimeEvent(ZeroTierRuntimeEvent event) {
