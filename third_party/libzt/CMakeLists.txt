@@ -111,6 +111,12 @@ option(BUILD_STATIC_LIB         "Build static library"        TRUE)
 option(BUILD_SHARED_LIB         "Build shared libary"         TRUE)
 option(BUILD_HOST_SELFTEST      "Build host selftest binary"  TRUE)
 option(ZTS_DISABLE_CENTRAL_API  "Disable central API"         TRUE)
+option(ZTS_ENABLE_WINDOWS_OS_TAP "Enable experimental Windows OS-level tap integration sources" FALSE)
+
+if(ZTS_ENABLE_WINDOWS_OS_TAP)
+    add_definitions(-DZTS_ENABLE_WINDOWS_OS_TAP=1)
+endif()
+message(STATUS "ZTS_ENABLE_WINDOWS_OS_TAP=${ZTS_ENABLE_WINDOWS_OS_TAP}")
 
 # C# language bindings (libzt.dll/dylib/so)
 if (ZTS_ENABLE_PINVOKE)
@@ -440,6 +446,43 @@ if(BUILD_WIN)
     set(ws2_32_LIBRARY_PATH "${WINLIBDIR}/WS2_32.Lib")
     set(shlwapi_LIBRARY_PATH "${WINLIBDIR}/ShLwApi.Lib")
     set(iphlpapi_LIBRARY_PATH "${WINLIBDIR}/iphlpapi.Lib")
+    set(setupapi_LIBRARY_PATH "${WINLIBDIR}/SetupAPI.Lib")
+    set(newdev_LIBRARY_PATH "${WINLIBDIR}/Newdev.Lib")
+    set(ole32_LIBRARY_PATH "${WINLIBDIR}/Ole32.Lib")
+    set(oleaut32_LIBRARY_PATH "${WINLIBDIR}/OleAut32.Lib")
+    set(shell32_LIBRARY_PATH "${WINLIBDIR}/Shell32.Lib")
+    set(rpcrt4_LIBRARY_PATH "${WINLIBDIR}/Rpcrt4.Lib")
+    set(wbemuuid_LIBRARY_PATH "${WINLIBDIR}/Wbemuuid.Lib")
+    if(NOT EXISTS "${ws2_32_LIBRARY_PATH}")
+        set(ws2_32_LIBRARY_PATH ws2_32)
+    endif()
+    if(NOT EXISTS "${shlwapi_LIBRARY_PATH}")
+        set(shlwapi_LIBRARY_PATH shlwapi)
+    endif()
+    if(NOT EXISTS "${iphlpapi_LIBRARY_PATH}")
+        set(iphlpapi_LIBRARY_PATH iphlpapi)
+    endif()
+    if(NOT EXISTS "${setupapi_LIBRARY_PATH}")
+        set(setupapi_LIBRARY_PATH setupapi)
+    endif()
+    if(NOT EXISTS "${newdev_LIBRARY_PATH}")
+        set(newdev_LIBRARY_PATH newdev)
+    endif()
+    if(NOT EXISTS "${ole32_LIBRARY_PATH}")
+        set(ole32_LIBRARY_PATH ole32)
+    endif()
+    if(NOT EXISTS "${oleaut32_LIBRARY_PATH}")
+        set(oleaut32_LIBRARY_PATH oleaut32)
+    endif()
+    if(NOT EXISTS "${shell32_LIBRARY_PATH}")
+        set(shell32_LIBRARY_PATH shell32)
+    endif()
+    if(NOT EXISTS "${rpcrt4_LIBRARY_PATH}")
+        set(rpcrt4_LIBRARY_PATH rpcrt4)
+    endif()
+    if(NOT EXISTS "${wbemuuid_LIBRARY_PATH}")
+        set(wbemuuid_LIBRARY_PATH wbemuuid)
+    endif()
     message(STATUS ${WINLIBDIR})
     message(STATUS "WS2_32=${ws2_32_LIBRARY_PATH}")
     message(STATUS "ShLwApi=${shlwapi_LIBRARY_PATH}")
@@ -522,6 +565,16 @@ endif() # ZTS_ENABLE_JAVA
 file(GLOB ztcoreSrcGlob ${ZTO_SRC_DIR}/node/*.cpp
          ${ZTO_SRC_DIR}/osdep/OSUtils.cpp ${ZTO_SRC_DIR}/osdep/PortMapper.cpp)
 
+# Required after VirtualTap inherits EthernetTap in SDK mode.
+list(APPEND ztcoreSrcGlob
+    ${ZTO_SRC_DIR}/osdep/EthernetTap.cpp)
+
+if(BUILD_WIN AND ZTS_ENABLE_WINDOWS_OS_TAP)
+list(APPEND ztcoreSrcGlob
+    ${ZTO_SRC_DIR}/osdep/WindowsEthernetTap.cpp
+    ${ZTO_SRC_DIR}/osdep/WinDNSHelper.cpp)
+endif()
+
 file(GLOB libnatpmpSrcGlob ${ZTO_SRC_DIR}/ext/libnatpmp/natpmp.c
     ${ZTO_SRC_DIR}/ext/libnatpmp/wingettimeofday.c
     ${ZTO_SRC_DIR}/ext/libnatpmp/getgateway.c)
@@ -576,6 +629,15 @@ if(BUILD_STATIC_LIB)
         target_link_libraries(zto_obj ws2_32)
         target_link_libraries(zto_obj ${shlwapi_LIBRARY_PATH})
         target_link_libraries(zto_obj ${iphlpapi_LIBRARY_PATH})
+    endif()
+    if(BUILD_WIN AND ZTS_ENABLE_WINDOWS_OS_TAP)
+        target_link_libraries(zto_obj ${setupapi_LIBRARY_PATH})
+        target_link_libraries(zto_obj ${newdev_LIBRARY_PATH})
+        target_link_libraries(zto_obj ${ole32_LIBRARY_PATH})
+        target_link_libraries(zto_obj ${oleaut32_LIBRARY_PATH})
+        target_link_libraries(zto_obj ${shell32_LIBRARY_PATH})
+        target_link_libraries(zto_obj ${rpcrt4_LIBRARY_PATH})
+        target_link_libraries(zto_obj ${wbemuuid_LIBRARY_PATH})
     endif()
 
     # libnatpmp_obj
@@ -677,7 +739,18 @@ if(BUILD_STATIC_LIB)
 
     if(BUILD_WIN)
         target_link_libraries(${STATIC_LIB_NAME} ${ws2_32_LIBRARY_PATH}
-            ${shlwapi_LIBRARY_PATH} ${iphlpapi_LIBRARY_PATH})
+            ${shlwapi_LIBRARY_PATH}
+            ${iphlpapi_LIBRARY_PATH})
+    endif()
+    if(BUILD_WIN AND ZTS_ENABLE_WINDOWS_OS_TAP)
+        target_link_libraries(${STATIC_LIB_NAME}
+            ${setupapi_LIBRARY_PATH}
+            ${newdev_LIBRARY_PATH}
+            ${ole32_LIBRARY_PATH}
+            ${oleaut32_LIBRARY_PATH}
+            ${shell32_LIBRARY_PATH}
+            ${rpcrt4_LIBRARY_PATH}
+            ${wbemuuid_LIBRARY_PATH})
     endif()
     if(NOT ZTS_DISABLE_CENTRAL_API)
         target_link_libraries(${STATIC_LIB_NAME} ${CURL_LIBRARIES})
@@ -711,6 +784,20 @@ if(BUILD_SHARED_LIB)
         zto_pic
         natpmp_pic
         miniupnpc_pic)
+    if(BUILD_WIN AND ZTS_ENABLE_WINDOWS_OS_TAP)
+        target_link_libraries(
+            ${DYNAMIC_LIB_NAME}
+            ${ws2_32_LIBRARY_PATH}
+            ${shlwapi_LIBRARY_PATH}
+            ${iphlpapi_LIBRARY_PATH}
+            ${setupapi_LIBRARY_PATH}
+            ${newdev_LIBRARY_PATH}
+            ${ole32_LIBRARY_PATH}
+            ${oleaut32_LIBRARY_PATH}
+            ${shell32_LIBRARY_PATH}
+            ${rpcrt4_LIBRARY_PATH}
+            ${wbemuuid_LIBRARY_PATH})
+    endif()
     set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
     if(BUILD_ANDROID)

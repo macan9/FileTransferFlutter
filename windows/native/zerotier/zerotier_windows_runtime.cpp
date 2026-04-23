@@ -1,8 +1,18 @@
 #include "native/zerotier/zerotier_windows_runtime.h"
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include <ZeroTierSockets.h>
+#include <WinSock2.h>
+#include <Windows.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
+#include <ws2tcpip.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -12,6 +22,10 @@
 #include <optional>
 #include <sstream>
 #include <iostream>
+#include <limits>
+
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 namespace {
 
@@ -139,9 +153,6 @@ bool IsEmptyShellNetwork(const ZeroTierWindowsNetworkRecord& network) {
 std::string ResolveLocalMountState(
     const ZeroTierWindowsNetworkRecord& network,
     bool has_virtual_adapter) {
-  if (network.local_interface_ready) {
-    return "ready";
-  }
   if (network.status == "ACCESS_DENIED" ||
       IsTerminalNetworkFailureStatus(network.status)) {
     return "not_ready";
@@ -159,7 +170,13 @@ std::string ResolveLocalMountState(
   if (!network.matched_interface_up) {
     return "adapter_down";
   }
-  return "ip_not_bound";
+  if (!network.system_ip_bound) {
+    return "ip_not_bound";
+  }
+  if (network.route_expected && !network.system_route_bound) {
+    return "route_not_bound";
+  }
+  return "ready";
 }
 
 bool ShouldExposeNetworkRecord(
@@ -183,10 +200,59 @@ bool ShouldExposeNetworkRecord(
   }
   if (network.local_mount_state == "ip_not_bound" ||
       network.local_mount_state == "adapter_down" ||
-      network.local_mount_state == "missing_adapter") {
+      network.local_mount_state == "missing_adapter" ||
+      network.local_mount_state == "route_not_bound") {
     return true;
   }
   return false;
+}
+
+bool IsJoinClosedLoopReady(const ZeroTierWindowsNetworkRecord& network) {
+  if (network.local_interface_ready) {
+    return true;
+  }
+  // Phase-1 Wintun/no-zttap compatibility: allow join to succeed when
+  // ZeroTier control-plane is ready and managed addresses are present,
+  // even if system mount is still degraded on Windows.
+  if (network.status != "OK") {
+    return false;
+  }
+  if (network.assigned_addresses.empty()) {
+    return false;
+  }
+  if (!network.is_connected) {
+    return false;
+  }
+  return network.local_mount_state == "missing_adapter" ||
+         network.local_mount_state == "ip_not_bound" ||
+         network.local_mount_state == "route_not_bound";
+}
+
+bool ShouldSoftSucceedJoinTimeout(const ZeroTierWindowsNetworkRecord& network) {
+  if (network.status == "ACCESS_DENIED" ||
+      IsTerminalNetworkFailureStatus(network.status)) {
+    return false;
+  }
+  // Keep join/leave command loop responsive in phase-1 compatibility mode.
+  // Runtime diagnostics still carry detailed state (awaiting_address, etc.).
+  return network.status == "REQUESTING_CONFIGURATION" ||
+         (network.status == "OK" && network.assigned_addresses.empty());
+}
+
+bool IsSoftJoinTimeoutAllowedByEnv() {
+  char* value = nullptr;
+  size_t value_size = 0;
+  if (_dupenv_s(&value, &value_size, "ZT_WIN_ALLOW_SOFT_JOIN_TIMEOUT") != 0 ||
+      value == nullptr) {
+    return false;
+  }
+  std::string lowered = value;
+  free(value);
+  std::transform(
+      lowered.begin(), lowered.end(), lowered.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lowered == "1" || lowered == "true" || lowered == "yes" ||
+         lowered == "on";
 }
 
 std::string ComposeJoinFailureMessage(const ZeroTierWindowsNetworkRecord& network) {
@@ -222,6 +288,205 @@ std::string JoinAddresses(const std::vector<std::string>& addresses) {
     stream << addresses[index];
   }
   return stream.str();
+}
+
+std::optional<uint8_t> ExtractIpv4PrefixLength(const zts_sockaddr_storage& address) {
+  const zts_sockaddr* sockaddr =
+      reinterpret_cast<const zts_sockaddr*>(&address);
+  if (sockaddr->sa_family != ZTS_AF_INET) {
+    return std::nullopt;
+  }
+  const auto* ipv4 = reinterpret_cast<const zts_sockaddr_in*>(&address);
+  const uint16_t netmask_bits = ntohs(ipv4->sin_port);
+  if (netmask_bits > 32) {
+    return std::nullopt;
+  }
+  return static_cast<uint8_t>(netmask_bits);
+}
+
+uint8_t ClampIpv4PrefixLength(uint8_t prefix_length) {
+  return prefix_length > 32 ? 32 : prefix_length;
+}
+
+uint32_t PrefixMaskNetworkOrder(uint8_t prefix_length) {
+  const uint8_t clamped = ClampIpv4PrefixLength(prefix_length);
+  if (clamped == 0) {
+    return 0;
+  }
+  const uint32_t mask_host_order = (clamped == 32)
+                                       ? 0xFFFFFFFFu
+                                       : (0xFFFFFFFFu << (32 - clamped));
+  return htonl(mask_host_order);
+}
+
+bool ParseIpv4(const std::string& text, in_addr* output) {
+  if (output == nullptr || text.empty()) {
+    return false;
+  }
+  in_addr parsed = {};
+  if (inet_pton(AF_INET, text.c_str(), &parsed) != 1) {
+    return false;
+  }
+  *output = parsed;
+  return true;
+}
+
+enum class EnsureRouteResult {
+  kFailed = 0,
+  kExists = 1,
+  kCreated = 2,
+};
+
+EnsureRouteResult EnsureOnLinkIpv4Route(uint32_t if_index,
+                                        uint32_t destination_network_order,
+                                        uint8_t prefix_length) {
+  if (if_index == 0) {
+    return EnsureRouteResult::kFailed;
+  }
+
+  const uint32_t route_mask = PrefixMaskNetworkOrder(prefix_length);
+  ULONG route_table_size = 0;
+  if (GetIpForwardTable(nullptr, &route_table_size, FALSE) ==
+      ERROR_INSUFFICIENT_BUFFER) {
+    std::vector<unsigned char> route_table_buffer(route_table_size);
+    MIB_IPFORWARDTABLE* route_table =
+        reinterpret_cast<MIB_IPFORWARDTABLE*>(route_table_buffer.data());
+    if (GetIpForwardTable(route_table, &route_table_size, FALSE) == NO_ERROR) {
+      for (DWORD i = 0; i < route_table->dwNumEntries; ++i) {
+        const MIB_IPFORWARDROW& row = route_table->table[i];
+        if (row.dwForwardIfIndex != if_index ||
+            row.dwForwardDest != destination_network_order ||
+            row.dwForwardMask != route_mask ||
+            row.dwForwardNextHop != htonl(INADDR_ANY)) {
+          continue;
+        }
+        return EnsureRouteResult::kExists;
+      }
+    }
+  }
+
+  MIB_IPFORWARDROW route_row = {};
+  route_row.dwForwardDest = destination_network_order;
+  route_row.dwForwardMask = route_mask;
+  route_row.dwForwardPolicy = 0;
+  route_row.dwForwardNextHop = htonl(INADDR_ANY);
+  route_row.dwForwardIfIndex = if_index;
+  route_row.dwForwardType = MIB_IPROUTE_TYPE_DIRECT;
+  route_row.dwForwardProto = MIB_IPPROTO_NETMGMT;
+  route_row.dwForwardAge = INFINITE;
+  route_row.dwForwardNextHopAS = 0;
+  route_row.dwForwardMetric1 = 5;
+  route_row.dwForwardMetric2 = static_cast<DWORD>(-1);
+  route_row.dwForwardMetric3 = static_cast<DWORD>(-1);
+  route_row.dwForwardMetric4 = static_cast<DWORD>(-1);
+  route_row.dwForwardMetric5 = static_cast<DWORD>(-1);
+
+  const DWORD result = CreateIpForwardEntry(&route_row);
+  if (result == NO_ERROR || result == ERROR_OBJECT_ALREADY_EXISTS) {
+    return result == NO_ERROR ? EnsureRouteResult::kCreated
+                              : EnsureRouteResult::kExists;
+  }
+  return EnsureRouteResult::kFailed;
+}
+
+bool RemoveOnLinkIpv4Route(uint32_t if_index, uint32_t destination_network_order,
+                           uint8_t prefix_length) {
+  ULONG route_table_size = 0;
+  if (GetIpForwardTable(nullptr, &route_table_size, FALSE) !=
+      ERROR_INSUFFICIENT_BUFFER) {
+    return false;
+  }
+
+  std::vector<unsigned char> route_table_buffer(route_table_size);
+  MIB_IPFORWARDTABLE* route_table =
+      reinterpret_cast<MIB_IPFORWARDTABLE*>(route_table_buffer.data());
+  if (GetIpForwardTable(route_table, &route_table_size, FALSE) != NO_ERROR) {
+    return false;
+  }
+
+  bool removed = false;
+  const uint32_t route_mask = PrefixMaskNetworkOrder(prefix_length);
+  for (DWORD i = 0; i < route_table->dwNumEntries; ++i) {
+    MIB_IPFORWARDROW entry = route_table->table[i];
+    if (entry.dwForwardIfIndex != if_index ||
+        entry.dwForwardDest != destination_network_order ||
+        entry.dwForwardMask != route_mask ||
+        entry.dwForwardNextHop != htonl(INADDR_ANY)) {
+      continue;
+    }
+    if (DeleteIpForwardEntry(&entry) == NO_ERROR) {
+      removed = true;
+    }
+  }
+  return removed;
+}
+
+enum class EnsureIpResult {
+  kFailed = 0,
+  kExists = 1,
+  kCreated = 2,
+};
+
+EnsureIpResult EnsureIpv4AddressOnInterface(uint32_t if_index,
+                                            uint32_t address_network_order,
+                                            uint8_t prefix_length,
+                                            uint32_t* created_context) {
+  if (created_context != nullptr) {
+    *created_context = 0;
+  }
+  if (if_index == 0) {
+    return EnsureIpResult::kFailed;
+  }
+
+  ULONG ip_table_size = 0;
+  if (GetIpAddrTable(nullptr, &ip_table_size, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
+    std::vector<unsigned char> ip_table_buffer(ip_table_size);
+    MIB_IPADDRTABLE* ip_table =
+        reinterpret_cast<MIB_IPADDRTABLE*>(ip_table_buffer.data());
+    if (GetIpAddrTable(ip_table, &ip_table_size, FALSE) == NO_ERROR) {
+      for (DWORD i = 0; i < ip_table->dwNumEntries; ++i) {
+        const MIB_IPADDRROW& row = ip_table->table[i];
+        if (row.dwIndex == if_index && row.dwAddr == address_network_order) {
+          return EnsureIpResult::kExists;
+        }
+      }
+    }
+  }
+
+  ULONG context = 0;
+  ULONG instance = 0;
+  const DWORD mask = PrefixMaskNetworkOrder(prefix_length);
+  const DWORD add_result =
+      AddIPAddress(address_network_order, mask, if_index, &context, &instance);
+  if (add_result == NO_ERROR) {
+    if (created_context != nullptr) {
+      *created_context = context;
+    }
+    return EnsureIpResult::kCreated;
+  }
+
+  ip_table_size = 0;
+  if (GetIpAddrTable(nullptr, &ip_table_size, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
+    std::vector<unsigned char> ip_table_buffer(ip_table_size);
+    MIB_IPADDRTABLE* ip_table =
+        reinterpret_cast<MIB_IPADDRTABLE*>(ip_table_buffer.data());
+    if (GetIpAddrTable(ip_table, &ip_table_size, FALSE) == NO_ERROR) {
+      for (DWORD i = 0; i < ip_table->dwNumEntries; ++i) {
+        const MIB_IPADDRROW& row = ip_table->table[i];
+        if (row.dwIndex == if_index && row.dwAddr == address_network_order) {
+          return EnsureIpResult::kExists;
+        }
+      }
+    }
+  }
+  return EnsureIpResult::kFailed;
+}
+
+bool RemoveIpv4AddressOnInterface(uint32_t nte_context) {
+  if (nte_context == 0) {
+    return false;
+  }
+  return DeleteIPAddress(nte_context) == NO_ERROR;
 }
 
 void ResetJoinTrace(ZeroTierWindowsNetworkRecord* network) {
@@ -291,6 +556,12 @@ void AppendJoinTraceEvent(ZeroTierWindowsNetworkRecord* network,
 ZeroTierWindowsRuntime::ZeroTierWindowsRuntime() {
   g_runtime_instance = this;
   adapter_probe_.summary = "Adapter bridge not initialized yet.";
+  tap_backend_ = CreateWindowsTapBackendFromEnv();
+  if (tap_backend_) {
+    tap_backend_id_ = tap_backend_->BackendId();
+  }
+  std::clog << "[ZT/WIN] TapBackend selected"
+            << " backend=" << tap_backend_id_ << std::endl;
 }
 
 flutter::EncodableMap ZeroTierWindowsRuntime::DetectStatus() {
@@ -416,8 +687,18 @@ flutter::EncodableMap ZeroTierWindowsRuntime::StartNode() {
 
 flutter::EncodableMap ZeroTierWindowsRuntime::StopNode() {
   std::string error_message;
+  std::vector<uint64_t> networks_to_cleanup;
   {
     std::scoped_lock lock(mutex_);
+    for (const auto& entry : mounted_system_ips_) {
+      networks_to_cleanup.push_back(entry.first);
+    }
+    for (const auto& entry : mounted_system_routes_) {
+      if (std::find(networks_to_cleanup.begin(), networks_to_cleanup.end(),
+                    entry.first) == networks_to_cleanup.end()) {
+        networks_to_cleanup.push_back(entry.first);
+      }
+    }
     stop_requested_ = true;
     leaving_networks_.clear();
     leave_request_sources_.clear();
@@ -438,6 +719,10 @@ flutter::EncodableMap ZeroTierWindowsRuntime::StopNode() {
     if (error_message.empty()) {
       ClearLastErrorLocked();
     }
+  }
+  for (const uint64_t network_id : networks_to_cleanup) {
+    RemoveMountedSystemIpsForNetwork(network_id, "stopNode");
+    RemoveMountedSystemRoutesForNetwork(network_id, "stopNode");
   }
   state_cv_.notify_all();
   if (!error_message.empty()) {
@@ -506,6 +791,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
       networks_[network_id].assigned_addresses.clear();
       networks_[network_id].local_interface_ready = false;
       networks_[network_id].matched_interface_name.clear();
+      networks_[network_id].matched_interface_if_index = 0;
       networks_[network_id].matched_interface_up = false;
       networks_[network_id].local_mount_state = "awaiting_address";
       ResetJoinTrace(&networks_[network_id]);
@@ -576,7 +862,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
           IsTerminalNetworkFailureStatus(network.status)) {
         return true;
       }
-      if (network.local_interface_ready) {
+      if (IsJoinClosedLoopReady(network)) {
         return true;
       }
       return !last_error_.empty() || !node_started_;
@@ -637,12 +923,22 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
                 << " node_online=" << (node_online_ ? "true" : "false")
                 << " last_error=" << (last_error_.empty() ? "-" : last_error_)
                 << std::endl;
-      if (network.local_interface_ready) {
+      if (IsJoinClosedLoopReady(network)) {
         ClearLastErrorLocked();
         pending_join_networks_.erase(network_id);
         if (error_message != nullptr) {
           error_message->clear();
         }
+        std::clog << "[ZT/WIN] JoinNetwork closed-loop success"
+                  << " network_id=" << ToHexNetworkId(network_id)
+                  << " local_mount_state=" << network.local_mount_state
+                  << " local_interface_ready="
+                  << (network.local_interface_ready ? "true" : "false")
+                  << " system_ip_bound="
+                  << (network.system_ip_bound ? "true" : "false")
+                  << " system_route_bound="
+                  << (network.system_route_bound ? "true" : "false")
+                  << std::endl;
         return true;
       }
       if (network.status == "ACCESS_DENIED" ||
@@ -682,6 +978,27 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     }
   }
 
+  const auto timed_out_network_it = networks_.find(network_id);
+  if (timed_out_network_it != networks_.end() &&
+      IsSoftJoinTimeoutAllowedByEnv() &&
+      ShouldSoftSucceedJoinTimeout(timed_out_network_it->second)) {
+    const ZeroTierWindowsNetworkRecord& network = timed_out_network_it->second;
+    ClearLastErrorLocked();
+    if (error_message != nullptr) {
+      error_message->clear();
+    }
+    std::clog << "[ZT/WIN] JoinNetwork soft success"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " status=" << network.status
+              << " local_mount_state=" << network.local_mount_state
+              << " local_interface_ready="
+              << (network.local_interface_ready ? "true" : "false")
+              << " address_count=" << network.assigned_addresses.size()
+              << " reason=phase1_compat_timeout"
+              << std::endl;
+    return true;
+  }
+
   std::string message =
       "Timed out waiting for ZeroTier to mount the managed address on a Windows adapter.";
   if (!node_started_) {
@@ -689,8 +1006,7 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
   } else if (!node_online_) {
     message =
         "ZeroTier node stayed offline while waiting for the network to become ready.";
-  } else if (const auto timed_out_network_it = networks_.find(network_id);
-             timed_out_network_it != networks_.end()) {
+  } else if (timed_out_network_it != networks_.end()) {
     const ZeroTierWindowsNetworkRecord& network = timed_out_network_it->second;
     if (network.join_saw_network_ok &&
         !network.join_saw_ready_ip4 &&
@@ -703,7 +1019,6 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     }
   }
   SetLastErrorLocked(message);
-  const auto timed_out_network_it = networks_.find(network_id);
   if (timed_out_network_it != networks_.end()) {
     const ZeroTierWindowsNetworkRecord& network = timed_out_network_it->second;
     std::clog << "[ZT/WIN] JoinNetwork timed out"
@@ -792,6 +1107,9 @@ bool ZeroTierWindowsRuntime::LeaveNetwork(uint64_t network_id,
     EmitError(*error_message, network_id_hex);
     return false;
   }
+
+  RemoveMountedSystemIpsForNetwork(network_id, "leaveRequested");
+  RemoveMountedSystemRoutesForNetwork(network_id, "leaveRequested");
 
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -1094,6 +1412,10 @@ flutter::EncodableMap ZeroTierWindowsRuntime::BuildNetworkMap(
   for (const auto& address : network.assigned_addresses) {
     assigned_addresses.emplace_back(address);
   }
+  EncodableList mount_candidate_names;
+  for (const auto& item : network.mount_candidate_names) {
+    mount_candidate_names.emplace_back(item);
+  }
   return EncodableMap{
       {EncodableValue("networkId"), EncodableValue(ToHexNetworkId(network.network_id))},
       {EncodableValue("networkName"), EncodableValue(network.network_name)},
@@ -1105,8 +1427,28 @@ flutter::EncodableMap ZeroTierWindowsRuntime::BuildNetworkMap(
        EncodableValue(network.local_interface_ready)},
       {EncodableValue("matchedInterfaceName"),
        EncodableValue(network.matched_interface_name)},
+      {EncodableValue("matchedInterfaceIfIndex"),
+       EncodableValue(static_cast<int64_t>(network.matched_interface_if_index))},
       {EncodableValue("matchedInterfaceUp"),
        EncodableValue(network.matched_interface_up)},
+      {EncodableValue("mountDriverKind"),
+       EncodableValue(network.mount_driver_kind)},
+      {EncodableValue("mountCandidateNames"),
+       EncodableValue(mount_candidate_names)},
+      {EncodableValue("expectedRouteCount"),
+       EncodableValue(network.expected_route_count)},
+      {EncodableValue("routeExpected"),
+       EncodableValue(network.route_expected)},
+      {EncodableValue("systemIpBound"),
+       EncodableValue(network.system_ip_bound)},
+      {EncodableValue("systemRouteBound"),
+       EncodableValue(network.system_route_bound)},
+      {EncodableValue("tapMediaStatus"),
+       EncodableValue(network.tap_media_status)},
+      {EncodableValue("tapDeviceInstanceId"),
+       EncodableValue(network.tap_device_instance_id)},
+      {EncodableValue("tapNetCfgInstanceId"),
+       EncodableValue(network.tap_netcfg_instance_id)},
       {EncodableValue("localMountState"),
        EncodableValue(network.local_mount_state)},
       {EncodableValue("lastEventCode"),
@@ -1251,10 +1593,47 @@ ZeroTierWindowsRuntime::BuildNetworkDiagnosticsPayloadLocked(
        EncodableValue(network_it == networks_.end()
                           ? ""
                           : network_it->second.matched_interface_name)},
+      {EncodableValue("matchedInterfaceIfIndex"),
+       EncodableValue(network_it == networks_.end()
+                          ? static_cast<int64_t>(0)
+                          : static_cast<int64_t>(
+                                network_it->second.matched_interface_if_index))},
       {EncodableValue("matchedInterfaceUp"),
        EncodableValue(network_it == networks_.end()
                           ? false
                           : network_it->second.matched_interface_up)},
+      {EncodableValue("mountDriverKind"),
+       EncodableValue(network_it == networks_.end()
+                          ? "unknown"
+                          : network_it->second.mount_driver_kind)},
+      {EncodableValue("expectedRouteCount"),
+       EncodableValue(network_it == networks_.end()
+                          ? 0
+                          : network_it->second.expected_route_count)},
+      {EncodableValue("routeExpected"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.route_expected)},
+      {EncodableValue("systemIpBound"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.system_ip_bound)},
+      {EncodableValue("systemRouteBound"),
+       EncodableValue(network_it == networks_.end()
+                          ? false
+                          : network_it->second.system_route_bound)},
+      {EncodableValue("tapMediaStatus"),
+       EncodableValue(network_it == networks_.end()
+                          ? "unknown"
+                          : network_it->second.tap_media_status)},
+      {EncodableValue("tapDeviceInstanceId"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.tap_device_instance_id)},
+      {EncodableValue("tapNetCfgInstanceId"),
+       EncodableValue(network_it == networks_.end()
+                          ? ""
+                          : network_it->second.tap_netcfg_instance_id)},
       {EncodableValue("localMountState"),
        EncodableValue(network_it == networks_.end()
                           ? "unknown"
@@ -1401,12 +1780,24 @@ ZeroTierWindowsRuntime::BuildAdapterDiagnosticsPayloadLocked() const {
          EncodableValue(adapter.is_mount_candidate)},
         {EncodableValue("matchesExpectedIp"),
          EncodableValue(adapter.matches_expected_ip)},
+        {EncodableValue("hasExpectedRoute"),
+         EncodableValue(adapter.has_expected_route)},
+        {EncodableValue("driverKind"), EncodableValue(adapter.driver_kind)},
+        {EncodableValue("mediaStatus"), EncodableValue(adapter.media_status)},
+        {EncodableValue("tapDeviceInstanceId"),
+         EncodableValue(adapter.device_instance_id)},
+        {EncodableValue("tapNetCfgInstanceId"),
+         EncodableValue(adapter.netcfg_instance_id)},
         {EncodableValue("ipv4Addresses"), EncodableValue(ipv4_addresses)},
     });
   }
   EncodableList adapter_names;
   for (const auto& item : adapter_probe_.virtual_adapter_names) {
     adapter_names.emplace_back(item);
+  }
+  EncodableList matched_adapter_names;
+  for (const auto& item : adapter_probe_.matched_adapter_names) {
+    matched_adapter_names.emplace_back(item);
   }
   EncodableList mount_candidate_names;
   for (const auto& item : adapter_probe_.mount_candidate_names) {
@@ -1422,13 +1813,18 @@ ZeroTierWindowsRuntime::BuildAdapterDiagnosticsPayloadLocked() const {
   }
   return EncodableMap{
       {EncodableValue("initialized"), EncodableValue(adapter_probe_.initialized)},
+      {EncodableValue("mountBackend"), EncodableValue(tap_backend_id_)},
       {EncodableValue("hasVirtualAdapter"),
        EncodableValue(adapter_probe_.has_virtual_adapter)},
       {EncodableValue("hasMountCandidate"),
        EncodableValue(adapter_probe_.has_mount_candidate)},
       {EncodableValue("hasExpectedNetworkIp"),
        EncodableValue(adapter_probe_.has_expected_network_ip)},
+      {EncodableValue("hasExpectedRoute"),
+       EncodableValue(adapter_probe_.has_expected_route)},
       {EncodableValue("virtualAdapterNames"), EncodableValue(adapter_names)},
+      {EncodableValue("matchedAdapterNames"),
+       EncodableValue(matched_adapter_names)},
       {EncodableValue("mountCandidateNames"),
        EncodableValue(mount_candidate_names)},
       {EncodableValue("detectedIpv4Addresses"), EncodableValue(detected_ips)},
@@ -2137,6 +2533,239 @@ std::string ZeroTierWindowsRuntime::ToHexNetworkId(uint64_t network_id) const {
   return stream.str();
 }
 
+bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
+    uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
+    const std::map<std::string, uint8_t>& managed_prefix_hints,
+    std::vector<MountedSystemIp>* created_ips) {
+  if (created_ips != nullptr) {
+    created_ips->clear();
+  }
+  if (record.assigned_addresses.empty() || adapter.if_index == 0) {
+    return false;
+  }
+
+  bool bound_any = false;
+  for (const auto& address : record.assigned_addresses) {
+    in_addr parsed = {};
+    if (!ParseIpv4(address, &parsed)) {
+      continue;
+    }
+    uint8_t prefix = 24;
+    const auto managed_prefix_it = managed_prefix_hints.find(address);
+    if (managed_prefix_it != managed_prefix_hints.end()) {
+      prefix = ClampIpv4PrefixLength(managed_prefix_it->second);
+    } else {
+      const auto adapter_prefix_it = adapter.ipv4_prefix_lengths.find(address);
+      if (adapter_prefix_it != adapter.ipv4_prefix_lengths.end()) {
+        prefix = ClampIpv4PrefixLength(adapter_prefix_it->second);
+      }
+    }
+
+    uint32_t created_context = 0;
+    const EnsureIpResult ip_result = EnsureIpv4AddressOnInterface(
+        adapter.if_index, parsed.S_un.S_addr, prefix, &created_context);
+    if (ip_result == EnsureIpResult::kFailed) {
+      std::clog << "[ZT/WIN] IpBind attempt failed"
+                << " network_id=" << ToHexNetworkId(network_id)
+                << " if_index=" << adapter.if_index
+                << " ip=" << address
+                << " prefix=" << static_cast<int>(prefix) << std::endl;
+      continue;
+    }
+    bound_any = true;
+    std::clog << "[ZT/WIN] IpBind attempt"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " if_index=" << adapter.if_index
+              << " ip=" << address
+              << " prefix=" << static_cast<int>(prefix)
+              << " result="
+              << (ip_result == EnsureIpResult::kCreated ? "created"
+                                                        : "already_exists")
+              << std::endl;
+    if (ip_result == EnsureIpResult::kCreated && created_ips != nullptr) {
+      created_ips->push_back(MountedSystemIp{
+          adapter.if_index, parsed.S_un.S_addr, prefix, created_context});
+    }
+  }
+  return bound_any;
+}
+
+bool ZeroTierWindowsRuntime::TryMountSystemRoutesForNetwork(
+    uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
+    const std::map<std::string, uint8_t>& managed_prefix_hints,
+    std::vector<MountedSystemRoute>* created_routes) {
+  if (created_routes != nullptr) {
+    created_routes->clear();
+  }
+  if (!record.route_expected || record.assigned_addresses.empty() ||
+      adapter.if_index == 0) {
+    return false;
+  }
+
+  bool mounted_any_route = false;
+  std::set<std::string> attempted_cidrs;
+
+  for (const auto& address : record.assigned_addresses) {
+    in_addr parsed = {};
+    if (!ParseIpv4(address, &parsed)) {
+      continue;
+    }
+    uint8_t prefix = 24;
+    const auto managed_prefix_it = managed_prefix_hints.find(address);
+    if (managed_prefix_it != managed_prefix_hints.end()) {
+      prefix = ClampIpv4PrefixLength(managed_prefix_it->second);
+    } else {
+      const auto adapter_prefix_it = adapter.ipv4_prefix_lengths.find(address);
+      if (adapter_prefix_it != adapter.ipv4_prefix_lengths.end()) {
+        prefix = ClampIpv4PrefixLength(adapter_prefix_it->second);
+      }
+    }
+
+    const uint32_t mask = PrefixMaskNetworkOrder(prefix);
+    const uint32_t destination = parsed.S_un.S_addr & mask;
+
+    char destination_text[INET_ADDRSTRLEN] = {0};
+    in_addr destination_addr = {};
+    destination_addr.S_un.S_addr = destination;
+    inet_ntop(AF_INET, &destination_addr, destination_text,
+              static_cast<DWORD>(sizeof(destination_text)));
+    std::ostringstream cidr_stream;
+    cidr_stream << destination_text << "/" << static_cast<int>(prefix);
+    const std::string cidr = cidr_stream.str();
+    if (!attempted_cidrs.insert(cidr).second) {
+      continue;
+    }
+
+    const EnsureRouteResult route_result =
+        EnsureOnLinkIpv4Route(adapter.if_index, destination, prefix);
+    if (route_result == EnsureRouteResult::kFailed) {
+      std::clog << "[ZT/WIN] RouteMount attempt failed"
+                << " network_id=" << ToHexNetworkId(network_id)
+                << " if_index=" << adapter.if_index
+                << " cidr=" << cidr << std::endl;
+      continue;
+    }
+
+    mounted_any_route = true;
+    std::clog << "[ZT/WIN] RouteMount attempt"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " if_index=" << adapter.if_index
+              << " cidr=" << cidr
+              << " result="
+              << (route_result == EnsureRouteResult::kCreated ? "created"
+                                                              : "already_exists")
+              << std::endl;
+    if (route_result == EnsureRouteResult::kCreated && created_routes != nullptr) {
+      created_routes->push_back(
+          MountedSystemRoute{adapter.if_index, destination, prefix});
+    }
+  }
+
+  return mounted_any_route;
+}
+
+void ZeroTierWindowsRuntime::RecordMountedSystemRoutesLocked(
+    uint64_t network_id, const std::vector<MountedSystemRoute>& created_routes) {
+  if (network_id == 0 || created_routes.empty()) {
+    return;
+  }
+  std::vector<MountedSystemRoute>& persisted = mounted_system_routes_[network_id];
+  for (const auto& route : created_routes) {
+    const bool already_tracked = std::any_of(
+        persisted.begin(), persisted.end(),
+        [&route](const MountedSystemRoute& existing) {
+          return existing.if_index == route.if_index &&
+                 existing.destination_ipv4 == route.destination_ipv4 &&
+                 existing.prefix_length == route.prefix_length;
+        });
+    if (!already_tracked) {
+      persisted.push_back(route);
+    }
+  }
+}
+
+void ZeroTierWindowsRuntime::RecordMountedSystemIpsLocked(
+    uint64_t network_id, const std::vector<MountedSystemIp>& created_ips) {
+  if (network_id == 0 || created_ips.empty()) {
+    return;
+  }
+  std::vector<MountedSystemIp>& persisted = mounted_system_ips_[network_id];
+  for (const auto& ip : created_ips) {
+    const bool already_tracked = std::any_of(
+        persisted.begin(), persisted.end(), [&ip](const MountedSystemIp& existing) {
+          return existing.if_index == ip.if_index &&
+                 existing.address_ipv4 == ip.address_ipv4 &&
+                 existing.prefix_length == ip.prefix_length;
+        });
+    if (!already_tracked) {
+      persisted.push_back(ip);
+    }
+  }
+}
+
+void ZeroTierWindowsRuntime::RemoveMountedSystemRoutesForNetwork(
+    uint64_t network_id, const std::string& source) {
+  std::vector<MountedSystemRoute> routes;
+  {
+    std::scoped_lock lock(mutex_);
+    const auto it = mounted_system_routes_.find(network_id);
+    if (it == mounted_system_routes_.end()) {
+      return;
+    }
+    routes = it->second;
+    mounted_system_routes_.erase(it);
+  }
+
+  for (const auto& route : routes) {
+    char destination_text[INET_ADDRSTRLEN] = {0};
+    in_addr destination_addr = {};
+    destination_addr.S_un.S_addr = route.destination_ipv4;
+    inet_ntop(AF_INET, &destination_addr, destination_text,
+              static_cast<DWORD>(sizeof(destination_text)));
+    const bool removed = RemoveOnLinkIpv4Route(
+        route.if_index, route.destination_ipv4, route.prefix_length);
+    std::clog << "[ZT/WIN] RouteMount cleanup"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " source=" << source
+              << " if_index=" << route.if_index
+              << " cidr=" << destination_text << "/"
+              << static_cast<int>(route.prefix_length)
+              << " removed=" << (removed ? "true" : "false") << std::endl;
+  }
+}
+
+void ZeroTierWindowsRuntime::RemoveMountedSystemIpsForNetwork(
+    uint64_t network_id, const std::string& source) {
+  std::vector<MountedSystemIp> ips;
+  {
+    std::scoped_lock lock(mutex_);
+    const auto it = mounted_system_ips_.find(network_id);
+    if (it == mounted_system_ips_.end()) {
+      return;
+    }
+    ips = it->second;
+    mounted_system_ips_.erase(it);
+  }
+
+  for (const auto& ip : ips) {
+    char ip_text[INET_ADDRSTRLEN] = {0};
+    in_addr ip_addr = {};
+    ip_addr.S_un.S_addr = ip.address_ipv4;
+    inet_ntop(AF_INET, &ip_addr, ip_text, static_cast<DWORD>(sizeof(ip_text)));
+    const bool removed = RemoveIpv4AddressOnInterface(ip.nte_context);
+    std::clog << "[ZT/WIN] IpBind cleanup"
+              << " network_id=" << ToHexNetworkId(network_id)
+              << " source=" << source
+              << " if_index=" << ip.if_index
+              << " context=" << ip.nte_context
+              << " ip=" << ip_text
+              << " prefix=" << static_cast<int>(ip.prefix_length)
+              << " removed=" << (removed ? "true" : "false") << std::endl;
+  }
+}
+
 void ZeroTierWindowsRuntime::RefreshSnapshot() {
   std::vector<uint64_t> known_network_ids;
   std::map<uint64_t, ZeroTierWindowsNetworkRecord> previous_networks;
@@ -2172,6 +2801,9 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     node_online = zts_node_is_online() == 1;
   }
   std::map<uint64_t, ZeroTierWindowsNetworkRecord> refreshed_networks;
+  std::map<uint64_t, std::map<std::string, uint8_t>> managed_ipv4_prefix_hints;
+  std::map<uint64_t, std::vector<MountedSystemIp>> created_ips_by_network;
+  std::map<uint64_t, std::vector<MountedSystemRoute>> created_routes_by_network;
   std::set<uint64_t> missing_network_ids;
   std::vector<std::string> expected_addresses;
 
@@ -2183,6 +2815,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     std::vector<std::string> assigned_addresses;
     int addr_result = ZTS_ERR_SERVICE;
     int network_type = 0;
+    int route_count = 0;
     int name_result = ZTS_ERR_SERVICE;
     char network_name_buffer[ZTS_MAX_NETWORK_SHORT_NAME_LENGTH + 1] = {0};
     {
@@ -2192,6 +2825,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
       addr_result =
           zts_addr_get_all(network_id, assigned_addrs, &assigned_addr_count);
       network_type = zts_net_get_type(network_id);
+      route_count = zts_core_query_route_count(network_id);
       name_result = zts_net_get_name(network_id, network_name_buffer,
                                      ZTS_MAX_NETWORK_SHORT_NAME_LENGTH);
     }
@@ -2200,6 +2834,11 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         const std::string address = ExtractAddress(assigned_addrs[i]);
         if (!address.empty()) {
           assigned_addresses.push_back(address);
+          const auto prefix = ExtractIpv4PrefixLength(assigned_addrs[i]);
+          if (prefix.has_value()) {
+            managed_ipv4_prefix_hints[network_id][address] =
+                ClampIpv4PrefixLength(*prefix);
+          }
         }
       }
     }
@@ -2226,6 +2865,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                 << " addr_result=" << addr_result
                 << " addr_result_name=" << ErrorCodeToString(addr_result)
                 << " addr_count=" << assigned_addr_count
+                << " route_count=" << route_count
                 << " network_type=" << network_type
                 << " name_result=" << name_result
                 << " has_transport=" << (has_transport ? "true" : "false")
@@ -2257,6 +2897,8 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         retained.last_probe_network_type = network_type;
         retained.last_probe_pending_join = pending_join_network_ids.find(network_id) !=
                                            pending_join_network_ids.end();
+        retained.expected_route_count = std::max(0, route_count);
+        retained.route_expected = retained.expected_route_count > 0;
         refreshed_networks[network_id] = std::move(retained);
         std::clog << "[ZT/WIN] RefreshSnapshot retained pending network"
                   << " network_id=" << ToHexNetworkId(network_id)
@@ -2283,6 +2925,8 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
       retained.last_probe_network_type = network_type;
       retained.last_probe_pending_join = pending_join_network_ids.find(network_id) !=
                                          pending_join_network_ids.end();
+      retained.expected_route_count = std::max(0, route_count);
+      retained.route_expected = retained.expected_route_count > 0;
       refreshed_networks[network_id] = std::move(retained);
       std::clog << "[ZT/WIN] RefreshSnapshot retained network"
                 << " network_id=" << ToHexNetworkId(network_id)
@@ -2324,6 +2968,8 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     record.last_probe_assigned_addr_count = static_cast<int>(assigned_addr_count);
     record.last_probe_network_type = network_type;
     record.last_probe_pending_join = pending_join;
+    record.expected_route_count = std::max(0, route_count);
+    record.route_expected = record.expected_route_count > 0;
     if (previous_it != previous_networks.end()) {
       record.last_event_code = previous_it->second.last_event_code;
       record.last_event_name = previous_it->second.last_event_name;
@@ -2367,17 +3013,55 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
   std::clog << "[ZT/WIN] AdapterBridge probe"
             << " summary=" << adapter_probe.summary
             << std::endl;
+  if (tap_backend_ != nullptr) {
+    std::string backend_action;
+    if (tap_backend_->EnsureAdapterPresent(adapter_probe, expected_addresses,
+                                           &backend_action)) {
+      std::clog << "[ZT/WIN] TapBackend ensure adapter"
+                << " backend=" << tap_backend_id_
+                << " action=" << (backend_action.empty() ? "-" : backend_action)
+                << std::endl;
+      adapter_probe = adapter_bridge_.Refresh(expected_addresses);
+      std::clog << "[ZT/WIN] AdapterBridge probe(after backend ensure)"
+                << " summary=" << adapter_probe.summary << std::endl;
+    } else if (!backend_action.empty()) {
+      std::clog << "[ZT/WIN] TapBackend ensure adapter skipped"
+                << " backend=" << tap_backend_id_
+                << " reason=" << backend_action << std::endl;
+    }
+  }
 
   for (auto& [network_id, record] : refreshed_networks) {
     record.local_interface_ready = false;
     record.matched_interface_name.clear();
+    record.matched_interface_if_index = 0;
     record.matched_interface_up = false;
+    record.mount_driver_kind = "unknown";
+    record.mount_candidate_names = adapter_probe.mount_candidate_names;
+    record.system_ip_bound = false;
+    record.system_route_bound = !record.route_expected;
+    record.tap_media_status = "unknown";
+    record.tap_device_instance_id.clear();
+    record.tap_netcfg_instance_id.clear();
+    const ZeroTierWindowsAdapterBridge::AdapterRecord* selected_adapter =
+        nullptr;
 
     if (!record.assigned_addresses.empty()) {
       const ZeroTierWindowsAdapterBridge::AdapterRecord* exact_match = nullptr;
+      int exact_match_score = std::numeric_limits<int>::min();
       const ZeroTierWindowsAdapterBridge::AdapterRecord* fallback_candidate =
           nullptr;
+      int fallback_score = std::numeric_limits<int>::min();
       for (const auto& adapter : adapter_probe.adapters) {
+        const bool backend_candidate =
+            tap_backend_ == nullptr
+                ? adapter.is_mount_candidate
+                : tap_backend_->IsUsableMountCandidate(adapter);
+        if (!backend_candidate) {
+          continue;
+        }
+        const int backend_score =
+            tap_backend_ == nullptr ? 0 : tap_backend_->FallbackScore(adapter);
         const bool matched = std::any_of(
             record.assigned_addresses.begin(), record.assigned_addresses.end(),
             [&adapter](const std::string& address) {
@@ -2386,20 +3070,25 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                                address) != adapter.ipv4_addresses.end();
             });
         if (matched) {
-          exact_match = &adapter;
-          break;
-        }
-        if (!adapter.is_mount_candidate) {
+          if (exact_match == nullptr ||
+              backend_score > exact_match_score ||
+              (backend_score == exact_match_score &&
+               !exact_match->is_up && adapter.is_up)) {
+            exact_match = &adapter;
+            exact_match_score = backend_score;
+          }
           continue;
         }
         if (fallback_candidate == nullptr ||
-            (!fallback_candidate->is_up && adapter.is_up)) {
+            backend_score > fallback_score ||
+            (backend_score == fallback_score &&
+             !fallback_candidate->is_up && adapter.is_up)) {
           fallback_candidate = &adapter;
+          fallback_score = backend_score;
         }
       }
 
-      const auto* selected_adapter =
-          exact_match != nullptr ? exact_match : fallback_candidate;
+      selected_adapter = exact_match != nullptr ? exact_match : fallback_candidate;
       if (selected_adapter != nullptr) {
         record.matched_interface_name =
             !selected_adapter->friendly_name.empty()
@@ -2408,8 +3097,53 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                        ? selected_adapter->description
                        : selected_adapter->adapter_name);
         record.matched_interface_up = selected_adapter->is_up;
+        record.matched_interface_if_index = selected_adapter->if_index;
+        record.mount_driver_kind = selected_adapter->driver_kind;
+        record.tap_media_status = selected_adapter->media_status;
+        record.tap_device_instance_id = selected_adapter->device_instance_id;
+        record.tap_netcfg_instance_id = selected_adapter->netcfg_instance_id;
+        record.system_ip_bound = exact_match != nullptr;
+        record.system_route_bound =
+            !record.route_expected ||
+            ((exact_match != nullptr) && selected_adapter->has_expected_route);
         record.local_interface_ready =
             exact_match != nullptr && selected_adapter->is_up;
+      }
+    }
+
+    if (!record.system_ip_bound && selected_adapter != nullptr &&
+        selected_adapter->if_index != 0 && selected_adapter->is_up) {
+      const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
+      const std::map<std::string, uint8_t> empty_prefix_hints;
+      std::vector<MountedSystemIp> created_ips;
+      const bool ip_bound = TryBindSystemIpForNetwork(
+          network_id, record, *selected_adapter,
+          hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
+                                                      : hints_it->second,
+          &created_ips);
+      if (!created_ips.empty()) {
+        created_ips_by_network[network_id] = std::move(created_ips);
+      }
+      if (ip_bound) {
+        record.system_ip_bound = true;
+      }
+    }
+    if (record.route_expected && !record.system_route_bound &&
+        record.system_ip_bound && selected_adapter != nullptr &&
+        selected_adapter->if_index != 0 && selected_adapter->is_up) {
+      const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
+      const std::map<std::string, uint8_t> empty_prefix_hints;
+      std::vector<MountedSystemRoute> created_routes;
+      const bool mount_ok = TryMountSystemRoutesForNetwork(
+          network_id, record, *selected_adapter,
+          hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
+                                                      : hints_it->second,
+          &created_routes);
+      if (!created_routes.empty()) {
+        created_routes_by_network[network_id] = std::move(created_routes);
+      }
+      if (mount_ok) {
+        record.system_route_bound = true;
       }
     }
 
@@ -2417,6 +3151,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         ResolveLocalMountState(record, adapter_probe.has_virtual_adapter);
     std::clog << "[ZT/WIN] RefreshSnapshot mount probe"
               << " network_id=" << ToHexNetworkId(network_id)
+              << " mount_backend=" << tap_backend_id_
               << " local_mount_state=" << record.local_mount_state
               << " local_interface_ready="
               << (record.local_interface_ready ? "true" : "false")
@@ -2426,7 +3161,25 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                       : record.matched_interface_name)
               << " matched_interface_up="
               << (record.matched_interface_up ? "true" : "false")
+              << " mount_driver_kind=" << record.mount_driver_kind
+              << " system_ip_bound="
+              << (record.system_ip_bound ? "true" : "false")
+              << " route_expected="
+              << (record.route_expected ? "true" : "false")
+              << " expected_route_count=" << record.expected_route_count
+              << " system_route_bound="
+              << (record.system_route_bound ? "true" : "false")
+              << " tap_media_status=" << record.tap_media_status
+              << " tap_device_instance_id="
+              << (record.tap_device_instance_id.empty() ? "-" : record.tap_device_instance_id)
+              << " tap_netcfg_instance_id="
+              << (record.tap_netcfg_instance_id.empty() ? "-" : record.tap_netcfg_instance_id)
               << std::endl;
+  }
+
+  for (const uint64_t network_id : missing_network_ids) {
+    RemoveMountedSystemIpsForNetwork(network_id, "snapshotMissing");
+    RemoveMountedSystemRoutesForNetwork(network_id, "snapshotMissing");
   }
 
   std::scoped_lock lock(mutex_);
@@ -2459,6 +3212,12 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     networks_.erase(network_id);
     leave_request_sources_.erase(network_id);
     pending_leave_generations_.erase(network_id);
+  }
+  for (const auto& [network_id, created_ips] : created_ips_by_network) {
+    RecordMountedSystemIpsLocked(network_id, created_ips);
+  }
+  for (const auto& [network_id, created_routes] : created_routes_by_network) {
+    RecordMountedSystemRoutesLocked(network_id, created_routes);
   }
   for (auto& [network_id, record] : refreshed_networks) {
     networks_[network_id] = std::move(record);

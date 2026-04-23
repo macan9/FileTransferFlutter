@@ -18,6 +18,7 @@
  */
 
 #include <stdlib.h>
+#include <exception>
 
 #include "NodeService.hpp"
 
@@ -27,6 +28,10 @@
 #include "Node.hpp"
 #include "Utilities.hpp"
 #include "VirtualTap.hpp"
+
+#if defined(__WINDOWS__) && defined(ZTS_ENABLE_WINDOWS_OS_TAP)
+#include "../ext/ZeroTierOne/osdep/WindowsEthernetTap.hpp"
+#endif
 
 #if defined(__WINDOWS__)
 #include <iphlpapi.h>
@@ -569,6 +574,14 @@ void NodeService::terminate()
 void NodeService::syncManagedStuff(NetworkState& n)
 {
     char ipbuf[64] = { 0 };
+    const auto hasFamily = [](const std::vector<InetAddress>& ips, bool ipv4) {
+        for (std::vector<InetAddress>::const_iterator it = ips.begin(); it != ips.end(); ++it) {
+            if (ipv4 ? it->isV4() : it->isV6()) {
+                return true;
+            }
+        }
+        return false;
+    };
     // assumes _nets_m is locked
     std::vector<InetAddress> newManagedIps;
     newManagedIps.reserve(n.config.assignedAddressCount);
@@ -578,16 +591,15 @@ void NodeService::syncManagedStuff(NetworkState& n)
     }
     std::sort(newManagedIps.begin(), newManagedIps.end());
     newManagedIps.erase(std::unique(newManagedIps.begin(), newManagedIps.end()), newManagedIps.end());
+    const std::vector<InetAddress> tapIpsBefore = n.tap ? n.tap->ips() : std::vector<InetAddress>();
     fprintf(
         stderr,
-        "[libzt] syncManagedStuff net=%llx assignedAddressCount=%u managedIpsBefore=%u tapHasIpv4=%d tapHasIpv6=%d netif4=%p netif6=%p\n",
+        "[libzt] syncManagedStuff net=%llx assignedAddressCount=%u managedIpsBefore=%u tapHasIpv4=%d tapHasIpv6=%d\n",
         (unsigned long long)n.config.nwid,
         n.config.assignedAddressCount,
         (unsigned int)n.managedIps.size(),
-        n.tap ? (n.tap->hasIpv4Addr() ? 1 : 0) : 0,
-        n.tap ? (n.tap->hasIpv6Addr() ? 1 : 0) : 0,
-        n.tap ? n.tap->netif4 : NULL,
-        n.tap ? n.tap->netif6 : NULL);
+        hasFamily(tapIpsBefore, true) ? 1 : 0,
+        hasFamily(tapIpsBefore, false) ? 1 : 0);
     for (std::vector<InetAddress>::iterator ip(n.managedIps.begin()); ip != n.managedIps.end(); ++ip) {
         if (std::find(newManagedIps.begin(), newManagedIps.end(), *ip) == newManagedIps.end()) {
             if (! n.tap->removeIp(*ip)) {
@@ -595,7 +607,7 @@ void NodeService::syncManagedStuff(NetworkState& n)
             }
             else {
                 zts_addr_info_t* ad = new zts_addr_info_t();
-                ad->net_id = n.tap->_net_id;
+                ad->net_id = n.config.nwid;
                 if ((*ip).isV4()) {
                     struct sockaddr_in* in4 = (struct sockaddr_in*)&(ad->addr);
                     memcpy(&(in4->sin_addr.s_addr), (*ip).rawIpData(), 4);
@@ -624,7 +636,7 @@ void NodeService::syncManagedStuff(NetworkState& n)
             }
             else {
                 zts_addr_info_t* ad = new zts_addr_info_t();
-                ad->net_id = n.tap->_net_id;
+                ad->net_id = n.config.nwid;
                 if ((*ip).isV4()) {
                     struct sockaddr_in* in4 = (struct sockaddr_in*)&(ad->addr);
                     memcpy(&(in4->sin_addr.s_addr), (*ip).rawIpData(), 4);
@@ -641,15 +653,154 @@ void NodeService::syncManagedStuff(NetworkState& n)
         }
     }
     n.managedIps.swap(newManagedIps);
+    const std::vector<InetAddress> tapIpsAfter = n.tap ? n.tap->ips() : std::vector<InetAddress>();
     fprintf(
         stderr,
-        "[libzt] syncManagedStuff complete net=%llx managedIpsAfter=%u tapHasIpv4=%d tapHasIpv6=%d netif4=%p netif6=%p\n",
+        "[libzt] syncManagedStuff complete net=%llx managedIpsAfter=%u tapHasIpv4=%d tapHasIpv6=%d\n",
         (unsigned long long)n.config.nwid,
         (unsigned int)n.managedIps.size(),
-        n.tap ? (n.tap->hasIpv4Addr() ? 1 : 0) : 0,
-        n.tap ? (n.tap->hasIpv6Addr() ? 1 : 0) : 0,
-        n.tap ? n.tap->netif4 : NULL,
-        n.tap ? n.tap->netif6 : NULL);
+        hasFamily(tapIpsAfter, true) ? 1 : 0,
+        hasFamily(tapIpsAfter, false) ? 1 : 0);
+}
+
+void NodeService::syncManagedRoutes(NetworkState& n, const ZT_VirtualNetworkConfig& cfg, bool install)
+{
+#if defined(__WINDOWS__) && defined(ZTS_ENABLE_WINDOWS_OS_TAP)
+    WindowsEthernetTap* winTap = dynamic_cast<WindowsEthernetTap*>(n.tap);
+    if (!winTap) {
+        return;
+    }
+    const NET_IFINDEX ifIndex = winTap->interfaceIndex();
+    if (ifIndex == (NET_IFINDEX)-1 || ifIndex == 0) {
+        fprintf(stderr,
+            "[libzt] syncManagedRoutes skip net=%llx reason=invalid_ifindex install=%d ifIndex=%u\n",
+            (unsigned long long)cfg.nwid,
+            install ? 1 : 0,
+            (unsigned int)ifIndex);
+        return;
+    }
+
+    MIB_IPFORWARD_TABLE2* routeTable = nullptr;
+    if (GetIpForwardTable2(AF_UNSPEC, &routeTable) != NO_ERROR) {
+        routeTable = nullptr;
+    }
+
+    const auto removeMatchingRoutes = [&](const InetAddress& target) {
+        if (!routeTable) {
+            return;
+        }
+        for (ULONG index = 0; index < routeTable->NumEntries; ++index) {
+            MIB_IPFORWARD_ROW2 entry = routeTable->Table[index];
+            if (entry.InterfaceIndex != ifIndex) {
+                continue;
+            }
+            if (target.isV4()) {
+                if (entry.DestinationPrefix.Prefix.si_family != AF_INET) {
+                    continue;
+                }
+                if (entry.DestinationPrefix.PrefixLength != target.netmaskBits()) {
+                    continue;
+                }
+                const uint32_t targetIp = *((const uint32_t*)target.rawIpData());
+                const uint32_t routeIp = entry.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr;
+                if (targetIp != routeIp) {
+                    continue;
+                }
+            }
+            else if (target.isV6()) {
+                if (entry.DestinationPrefix.Prefix.si_family != AF_INET6) {
+                    continue;
+                }
+                if (entry.DestinationPrefix.PrefixLength != target.netmaskBits()) {
+                    continue;
+                }
+                if (memcmp(
+                        entry.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte,
+                        target.rawIpData(),
+                        16)
+                    != 0) {
+                    continue;
+                }
+            }
+            else {
+                continue;
+            }
+            DeleteIpForwardEntry2(&entry);
+        }
+    };
+
+    for (unsigned int i = 0; i < cfg.routeCount; ++i) {
+        const InetAddress target(reinterpret_cast<const struct sockaddr_storage&>(cfg.routes[i].target));
+        if (!target.isV4() && !target.isV6()) {
+            continue;
+        }
+        removeMatchingRoutes(target);
+    }
+    if (routeTable) {
+        FreeMibTable(routeTable);
+    }
+
+    if (!install) {
+        return;
+    }
+
+    for (unsigned int i = 0; i < cfg.routeCount; ++i) {
+        const InetAddress target(reinterpret_cast<const struct sockaddr_storage&>(cfg.routes[i].target));
+        const InetAddress via(reinterpret_cast<const struct sockaddr_storage&>(cfg.routes[i].via));
+        if (!target.isV4() && !target.isV6()) {
+            continue;
+        }
+
+        MIB_IPFORWARD_ROW2 routeRow;
+        InitializeIpForwardEntry(&routeRow);
+        routeRow.InterfaceLuid = winTap->luid();
+        routeRow.InterfaceIndex = ifIndex;
+        routeRow.Metric = (cfg.routes[i].metric == 0) ? 1 : cfg.routes[i].metric;
+        routeRow.Protocol = MIB_IPPROTO_NETMGMT;
+        routeRow.SitePrefixLength = target.netmaskBits();
+        routeRow.DestinationPrefix.PrefixLength = target.netmaskBits();
+
+        if (target.isV4()) {
+            routeRow.DestinationPrefix.Prefix.si_family = AF_INET;
+            routeRow.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr = *((const uint32_t*)target.rawIpData());
+            routeRow.NextHop.si_family = AF_INET;
+            routeRow.NextHop.Ipv4.sin_addr.S_un.S_addr =
+                via.isV4() ? *((const uint32_t*)via.rawIpData()) : 0;
+        }
+        else {
+            routeRow.DestinationPrefix.Prefix.si_family = AF_INET6;
+            memcpy(
+                routeRow.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte,
+                target.rawIpData(),
+                16);
+            routeRow.NextHop.si_family = AF_INET6;
+            if (via.isV6()) {
+                memcpy(routeRow.NextHop.Ipv6.sin6_addr.u.Byte, via.rawIpData(), 16);
+            }
+            else {
+                memset(routeRow.NextHop.Ipv6.sin6_addr.u.Byte, 0, 16);
+            }
+        }
+
+        const DWORD rc = CreateIpForwardEntry2(&routeRow);
+        if (rc != NO_ERROR && rc != ERROR_OBJECT_ALREADY_EXISTS) {
+            char tbuf[80] = { 0 };
+            char vbuf[80] = { 0 };
+            fprintf(
+                stderr,
+                "[libzt] syncManagedRoutes add failed net=%llx target=%s via=%s metric=%u rc=%lu\n",
+                (unsigned long long)cfg.nwid,
+                target.toString(tbuf),
+                via.toString(vbuf),
+                (unsigned int)routeRow.Metric,
+                (unsigned long)rc);
+        }
+    }
+#else
+    ZTS_UNUSED_ARG(n);
+    ZTS_UNUSED_ARG(cfg);
+    ZTS_UNUSED_ARG(install);
+#endif
 }
 
 void NodeService::phyOnDatagram(
@@ -869,6 +1020,54 @@ void NodeService::phyOnTcpWritable(PhySocket* sock, void** uptr)
     }
 }
 
+EthernetTap* NodeService::createNetworkTap(uint64_t net_id, const ZT_VirtualNetworkConfig* nwc)
+{
+    if (!nwc) {
+        fprintf(stderr,
+            "[libzt] tapFactory error=missing_network_config net=%llx\n",
+            (unsigned long long)net_id);
+        return (EthernetTap*)0;
+    }
+#if defined(__WINDOWS__)
+#if defined(ZTS_ENABLE_WINDOWS_OS_TAP)
+    fprintf(stderr,
+        "[libzt] tapFactory platform=windows mode=windows_ethernet_tap net=%llx\n",
+        (unsigned long long)net_id);
+    try {
+        return new WindowsEthernetTap(
+            _homePath.c_str(),
+            MAC(nwc->mac),
+            nwc->mtu,
+            (unsigned int)ZT_IF_METRIC,
+            net_id,
+            nwc->name,
+            StapFrameHandler,
+            (void*)this);
+    }
+    catch (const std::exception& e) {
+        fprintf(
+            stderr,
+            "[libzt] tapFactory platform=windows mode=windows_ethernet_tap error=%s net=%llx\n",
+            e.what(),
+            (unsigned long long)net_id);
+        return (EthernetTap*)0;
+    }
+#else
+    fprintf(stderr,
+        "[libzt] tapFactory platform=windows mode=virtualtap_compat net=%llx\n",
+        (unsigned long long)net_id);
+#endif
+#endif
+    return new VirtualTap(
+        _homePath.c_str(),
+        MAC(nwc->mac),
+        nwc->mtu,
+        (unsigned int)ZT_IF_METRIC,
+        net_id,
+        StapFrameHandler,
+        (void*)this);
+}
+
 int NodeService::nodeVirtualNetworkConfigFunction(
     uint64_t net_id,
     void** nuptr,
@@ -880,31 +1079,47 @@ int NodeService::nodeVirtualNetworkConfigFunction(
 
     switch (op) {
         case ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_UP:
-            if (! n.tap) {
-                n.tap = new VirtualTap(
-                    _homePath.c_str(),
-                    MAC(nwc->mac),
-                    nwc->mtu,
-                    (unsigned int)ZT_IF_METRIC,
-                    net_id,
-                    StapFrameHandler,
-                    (void*)this);
-                *nuptr = (void*)&n;
-                n.tap->setUserEventSystem(_events);
+        case ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE: {
+            if (!nwc) {
+                fprintf(
+                    stderr,
+                    "[libzt] networkConfig error=missing_network_config net=%llx op=%d\n",
+                    (unsigned long long)net_id,
+                    (int)op);
+                _nets.erase(net_id);
+                return -998;
             }
-            fprintf(
-                stderr,
-                "[libzt] networkConfig op=UP net=%llx status=%d rev=%lu assigned=%u routes=%u mtu=%u tap=%p\n",
-                (unsigned long long)net_id,
-                (int)nwc->status,
-                (unsigned long)nwc->netconfRevision,
-                nwc->assignedAddressCount,
-                nwc->routeCount,
-                nwc->mtu,
-                n.tap);
-            // After setting up tap, fall through to CONFIG_UPDATE since we
-            // also want to do this...
-        case ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE:
+            if ((op == ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_UP) && (!nuptr)) {
+                fprintf(
+                    stderr,
+                    "[libzt] networkConfig error=missing_nuptr net=%llx op=%d\n",
+                    (unsigned long long)net_id,
+                    (int)op);
+                _nets.erase(net_id);
+                return -997;
+            }
+            if (op == ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_UP) {
+                if (! n.tap) {
+                    n.tap = createNetworkTap(net_id, nwc);
+                    *nuptr = (void*)&n;
+                    if (n.tap) {
+                        VirtualTap* vtap = dynamic_cast<VirtualTap*>(n.tap);
+                        if (vtap) {
+                            vtap->setUserEventSystem(_events);
+                        }
+                    }
+                }
+                fprintf(
+                    stderr,
+                    "[libzt] networkConfig op=UP net=%llx status=%d rev=%lu assigned=%u routes=%u mtu=%u tap=%p\n",
+                    (unsigned long long)net_id,
+                    (int)nwc->status,
+                    (unsigned long)nwc->netconfRevision,
+                    nwc->assignedAddressCount,
+                    nwc->routeCount,
+                    nwc->mtu,
+                    n.tap);
+            }
             if (op == ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE) {
                 fprintf(
                     stderr,
@@ -917,9 +1132,12 @@ int NodeService::nodeVirtualNetworkConfigFunction(
                     nwc->mtu,
                     n.tap);
             }
+            const ZT_VirtualNetworkConfig previousConfig = n.config;
             memcpy(&(n.config), nwc, sizeof(ZT_VirtualNetworkConfig));
             if (n.tap) {   // sanity check
+                syncManagedRoutes(n, previousConfig, false);
                 syncManagedStuff(n);
+                syncManagedRoutes(n, n.config, true);
                 n.tap->setMtu(nwc->mtu);
             }
             else {
@@ -930,10 +1148,12 @@ int NodeService::nodeVirtualNetworkConfigFunction(
                 sendEventToUser(ZTS_EVENT_NETWORK_UPDATE, (void*)&n);
             }
             break;
+        }
         case ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_DOWN:
         case ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_DESTROY:
             sendEventToUser(ZTS_EVENT_NETWORK_DOWN, (void*)&n);
             if (n.tap) {   // sanity check
+                syncManagedRoutes(n, n.config, false);
                 *nuptr = (void*)0;
                 delete n.tap;
                 _nets.erase(net_id);
@@ -1188,11 +1408,13 @@ void NodeService::generateSyntheticEvents()
     // Generate messages to be dequeued by the callback message thread
     Mutex::Lock _l(_nets_m);
     for (std::map<uint64_t, NetworkState>::iterator n(_nets.begin()); n != _nets.end(); ++n) {
-        auto netState = n->second;
+        NetworkState& netState = n->second;
         int mostRecentStatus = netState.config.status;
-        VirtualTap* tap = netState.tap;
-        // uint64_t net_id = n->first;
-        if (netState.tap->_networkStatus == mostRecentStatus) {
+        EthernetTap* tap = netState.tap;
+        if (!tap) {
+            continue;
+        }
+        if (netState.lastNetworkStatus == mostRecentStatus) {
             continue;   // No state change
         }
         switch (mostRecentStatus) {
@@ -1206,32 +1428,67 @@ void NodeService::generateSyntheticEvents()
                 sendEventToUser(ZTS_EVENT_NETWORK_REQ_CONFIG, (void*)&netState);
                 break;
             case ZT_NETWORK_STATUS_OK:
+            {
+                const std::vector<InetAddress> tapIps = tap->ips();
+                bool tapHasIpv4 = false;
+                bool tapHasIpv6 = false;
+                for (std::vector<InetAddress>::const_iterator ip = tapIps.begin(); ip != tapIps.end(); ++ip) {
+                    tapHasIpv4 = tapHasIpv4 || ip->isV4();
+                    tapHasIpv6 = tapHasIpv6 || ip->isV6();
+                }
+
+                bool managedHasIpv4 = false;
+                bool managedHasIpv6 = false;
+                for (std::vector<InetAddress>::const_iterator ip = netState.managedIps.begin();
+                     ip != netState.managedIps.end();
+                     ++ip) {
+                    managedHasIpv4 = managedHasIpv4 || ip->isV4();
+                    managedHasIpv6 = managedHasIpv6 || ip->isV6();
+                }
+
+                bool readyIpv4 = false;
+                bool readyIpv6 = false;
+                VirtualTap* vtap = dynamic_cast<VirtualTap*>(tap);
+                if (vtap) {
+                    readyIpv4 = vtap->hasIpv4Addr() && vtap->netif4 && zts_lwip_is_netif_up(vtap->netif4);
+                    readyIpv6 = vtap->hasIpv6Addr() && vtap->netif6 && zts_lwip_is_netif_up(vtap->netif6);
+                }
+                else {
+                    // OS-level tap path: interface has the managed address in host stack.
+                    readyIpv4 = managedHasIpv4 && tapHasIpv4;
+                    readyIpv6 = managedHasIpv6 && tapHasIpv6;
+                }
+
                 fprintf(
                     stderr,
-                    "[libzt] syntheticEvent net=%llx status=OK assigned=%u routeCount=%u tapHasIpv4=%d tapHasIpv6=%d netif4Up=%d netif6Up=%d\n",
+                    "[libzt] syntheticEvent net=%llx status=OK assigned=%u routeCount=%u managedHasIpv4=%d managedHasIpv6=%d tapHasIpv4=%d tapHasIpv6=%d readyIpv4=%d readyIpv6=%d path=%s\n",
                     (unsigned long long)netState.config.nwid,
                     netState.config.assignedAddressCount,
                     netState.config.routeCount,
-                    tap ? (tap->hasIpv4Addr() ? 1 : 0) : 0,
-                    tap ? (tap->hasIpv6Addr() ? 1 : 0) : 0,
-                    (tap && tap->netif4) ? (zts_lwip_is_netif_up(tap->netif4) ? 1 : 0) : 0,
-                    (tap && tap->netif6) ? (zts_lwip_is_netif_up(tap->netif6) ? 1 : 0) : 0);
-                if (tap->hasIpv4Addr() && zts_lwip_is_netif_up(tap->netif4)) {
+                    managedHasIpv4 ? 1 : 0,
+                    managedHasIpv6 ? 1 : 0,
+                    tapHasIpv4 ? 1 : 0,
+                    tapHasIpv6 ? 1 : 0,
+                    readyIpv4 ? 1 : 0,
+                    readyIpv6 ? 1 : 0,
+                    vtap ? "virtualtap_lwip" : "ethernettap_host");
+                if (readyIpv4) {
                     sendEventToUser(ZTS_EVENT_NETWORK_READY_IP4, (void*)&netState);
                 }
-                if (tap->hasIpv6Addr() && zts_lwip_is_netif_up(tap->netif6)) {
+                if (readyIpv6) {
                     sendEventToUser(ZTS_EVENT_NETWORK_READY_IP6, (void*)&netState);
                 }
                 // In addition to the READY messages, send one OK message
                 sendEventToUser(ZTS_EVENT_NETWORK_OK, (void*)&netState);
                 break;
+            }
             case ZT_NETWORK_STATUS_ACCESS_DENIED:
                 sendEventToUser(ZTS_EVENT_NETWORK_ACCESS_DENIED, (void*)&netState);
                 break;
             default:
                 break;
         }
-        netState.tap->_networkStatus = mostRecentStatus;
+        netState.lastNetworkStatus = mostRecentStatus;
     }
     ZT_PeerList* pl = _node->peers();
     if (pl) {

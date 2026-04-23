@@ -99,7 +99,11 @@ void PrintStatus(const EncodableMap& status, const std::string& tag) {
 
 int main() {
   int join_timeout_ms = 45000;
+  int leave_timeout_ms = 30000;
   std::string probe_network_id;
+  std::string join_network_id;
+  bool require_route_bound = false;
+  bool allow_mount_degraded = false;
   for (int index = 1; index < __argc; ++index) {
     const char* argument = __argv[index];
     if (argument == nullptr) {
@@ -113,6 +117,24 @@ int main() {
     if (std::strcmp(argument, "--probe-network") == 0 &&
         index + 1 < __argc) {
       probe_network_id = __argv[++index];
+      continue;
+    }
+    if (std::strcmp(argument, "--join-network") == 0 &&
+        index + 1 < __argc) {
+      join_network_id = __argv[++index];
+      continue;
+    }
+    if (std::strcmp(argument, "--leave-timeout-ms") == 0 &&
+        index + 1 < __argc) {
+      leave_timeout_ms = std::max(1000, std::atoi(__argv[++index]));
+      continue;
+    }
+    if (std::strcmp(argument, "--require-route-bound") == 0) {
+      require_route_bound = true;
+      continue;
+    }
+    if (std::strcmp(argument, "--allow-mount-degraded") == 0) {
+      allow_mount_degraded = true;
     }
   }
 
@@ -138,6 +160,91 @@ int main() {
   }
   PrintStatus(status, "detect");
 
+  if (!join_network_id.empty()) {
+    std::cout << "[smoke] target network=" << join_network_id << std::endl;
+    std::cout << "[smoke] joinTimeoutMs=" << join_timeout_ms << std::endl;
+
+    std::string join_error;
+    const bool join_ok = runtime.JoinNetworkAndWaitForIp(
+        std::stoull(join_network_id, nullptr, 16), join_timeout_ms, &join_error);
+    status = runtime.DetectStatus();
+    PrintStatus(status, "post-join-target");
+    std::cout << "[smoke] join ok=" << (join_ok ? "true" : "false")
+              << " error=" << join_error << std::endl;
+    if (!join_ok) {
+      return 9;
+    }
+
+    const EncodableMap probe = runtime.ProbeNetworkStateNow(
+        std::stoull(join_network_id, nullptr, 16));
+    const auto runtime_record_it = probe.find(EncodableValue("runtimeRecord"));
+    if (runtime_record_it == probe.end()) {
+      std::cerr << "[smoke] missing runtimeRecord after join" << std::endl;
+      return 10;
+    }
+    const std::optional<EncodableMap> runtime_record = ReadMap(runtime_record_it->second);
+    if (!runtime_record.has_value()) {
+      std::cerr << "[smoke] runtimeRecord decode failed" << std::endl;
+      return 11;
+    }
+    const bool system_ip_bound = ReadBool(*runtime_record, "systemIpBound");
+    const bool system_route_bound = ReadBool(*runtime_record, "systemRouteBound");
+    const std::string local_mount_state = ReadPrintable(*runtime_record, "localMountState");
+    std::cout << "[smoke] systemIpBound=" << (system_ip_bound ? "true" : "false")
+              << " systemRouteBound=" << (system_route_bound ? "true" : "false")
+              << " localMountState=" << local_mount_state
+              << " matchedInterfaceIfIndex="
+              << ReadPrintable(*runtime_record, "matchedInterfaceIfIndex")
+              << " mountDriverKind=" << ReadPrintable(*runtime_record, "mountDriverKind")
+              << " routeExpected="
+              << ReadPrintable(*runtime_record, "routeExpected")
+              << " expectedRouteCount="
+              << ReadPrintable(*runtime_record, "expectedRouteCount")
+              << " tapMediaStatus=" << ReadPrintable(*runtime_record, "tapMediaStatus")
+              << std::endl;
+    const bool mount_degraded =
+        (local_mount_state == "missing_adapter" ||
+         local_mount_state == "awaiting_address" ||
+         local_mount_state == "ip_not_bound" ||
+         local_mount_state == "route_not_bound");
+    if (!system_ip_bound && !(allow_mount_degraded && mount_degraded)) {
+      std::cerr << "[smoke] managed IP not bound on system adapter" << std::endl;
+      return 12;
+    }
+    if (require_route_bound && !system_route_bound &&
+        !(allow_mount_degraded && mount_degraded)) {
+      std::cerr << "[smoke] managed route not bound on system adapter" << std::endl;
+      return 13;
+    }
+
+    std::string leave_error;
+    const bool leave_ok = runtime.LeaveNetwork(
+        std::stoull(join_network_id, nullptr, 16), "zt_runtime_smoke_target", &leave_error);
+    std::cout << "[smoke] leave ok=" << (leave_ok ? "true" : "false")
+              << " error=" << leave_error << std::endl;
+    if (!leave_ok) {
+      return 14;
+    }
+
+    bool left = false;
+    const int attempts = std::max(1, leave_timeout_ms / 500);
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      status = runtime.DetectStatus();
+      if (!FindNetworkById(status, join_network_id).has_value()) {
+        left = true;
+        break;
+      }
+    }
+    PrintStatus(status, "post-leave-target");
+    if (!left) {
+      std::cerr << "[smoke] network still present after leave timeout" << std::endl;
+      return 15;
+    }
+    std::cout << "[smoke] target join/probe/leave flow passed" << std::endl;
+    return 0;
+  }
+
   if (!probe_network_id.empty()) {
     const EncodableMap probe =
         runtime.ProbeNetworkStateNow(std::stoull(probe_network_id, nullptr, 16));
@@ -158,6 +265,22 @@ int main() {
                   << ReadPrintable(*runtime_record, "localMountState")
                   << " localInterfaceReady="
                   << ReadPrintable(*runtime_record, "localInterfaceReady")
+                  << " mountDriverKind="
+                  << ReadPrintable(*runtime_record, "mountDriverKind")
+                  << " routeExpected="
+                  << ReadPrintable(*runtime_record, "routeExpected")
+                  << " expectedRouteCount="
+                  << ReadPrintable(*runtime_record, "expectedRouteCount")
+                  << " systemIpBound="
+                  << ReadPrintable(*runtime_record, "systemIpBound")
+                  << " systemRouteBound="
+                  << ReadPrintable(*runtime_record, "systemRouteBound")
+                  << " tapMediaStatus="
+                  << ReadPrintable(*runtime_record, "tapMediaStatus")
+                  << " tapDeviceInstanceId="
+                  << ReadPrintable(*runtime_record, "tapDeviceInstanceId")
+                  << " tapNetCfgInstanceId="
+                  << ReadPrintable(*runtime_record, "tapNetCfgInstanceId")
                   << " lastEvent=" << ReadPrintable(*runtime_record, "lastEventName")
                   << " lastEventAddrCount="
                   << ReadPrintable(*runtime_record, "lastEventAssignedAddrCount")

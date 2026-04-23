@@ -236,6 +236,27 @@ void VirtualTap::setMtu(unsigned int mtu)
     _mtu = mtu;
 }
 
+std::string VirtualTap::deviceName() const
+{
+    return std::string(vtap_full_name);
+}
+
+void VirtualTap::setFriendlyName(const char* friendlyName)
+{
+    _friendlyName = friendlyName == nullptr ? std::string() : std::string(friendlyName);
+}
+
+std::string VirtualTap::friendlyName() const
+{
+    return _friendlyName.empty() ? std::string(vtap_full_name) : _friendlyName;
+}
+
+void VirtualTap::setDns(const char* domain, const std::vector<InetAddress>& servers)
+{
+    ZTS_UNUSED_ARG(domain);
+    ZTS_UNUSED_ARG(servers);
+}
+
 void VirtualTap::threadMain() throw()
 {
     fd_set readfds, nullfds;

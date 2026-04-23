@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "native/zerotier/zerotier_windows_adapter_bridge.h"
+#include "native/zerotier/zerotier_windows_tap_backend.h"
 
 struct ZeroTierWindowsNetworkRecord {
   uint64_t network_id = 0;
@@ -24,7 +26,17 @@ struct ZeroTierWindowsNetworkRecord {
   bool is_connected = false;
   bool local_interface_ready = false;
   std::string matched_interface_name;
+  uint32_t matched_interface_if_index = 0;
   bool matched_interface_up = false;
+  std::string mount_driver_kind = "unknown";
+  std::vector<std::string> mount_candidate_names;
+  int expected_route_count = 0;
+  bool route_expected = false;
+  bool system_ip_bound = false;
+  bool system_route_bound = false;
+  std::string tap_media_status = "unknown";
+  std::string tap_device_instance_id;
+  std::string tap_netcfg_instance_id;
   std::string local_mount_state = "unknown";
   int last_event_code = 0;
   std::string last_event_name;
@@ -79,6 +91,18 @@ class ZeroTierWindowsRuntime {
   flutter::EncodableMap ProbeNetworkStateNow(uint64_t network_id);
 
  private:
+  struct MountedSystemRoute {
+    uint32_t if_index = 0;
+    uint32_t destination_ipv4 = 0;  // network order
+    uint8_t prefix_length = 0;
+  };
+  struct MountedSystemIp {
+    uint32_t if_index = 0;
+    uint32_t address_ipv4 = 0;  // network order
+    uint8_t prefix_length = 0;
+    uint32_t nte_context = 0;
+  };
+
   static void HandleLibztEvent(void* message_ptr);
 
   flutter::EncodableMap BuildStatus() const;
@@ -118,6 +142,24 @@ class ZeroTierWindowsRuntime {
   std::string LogsPath() const;
   std::string KnownNetworksPath() const;
   std::string ToHexNetworkId(uint64_t network_id) const;
+  bool TryMountSystemRoutesForNetwork(
+      uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
+      const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
+      const std::map<std::string, uint8_t>& managed_prefix_hints,
+      std::vector<MountedSystemRoute>* created_routes);
+  bool TryBindSystemIpForNetwork(
+      uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
+      const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
+      const std::map<std::string, uint8_t>& managed_prefix_hints,
+      std::vector<MountedSystemIp>* created_ips);
+  void RecordMountedSystemRoutesLocked(
+      uint64_t network_id, const std::vector<MountedSystemRoute>& created_routes);
+  void RecordMountedSystemIpsLocked(
+      uint64_t network_id, const std::vector<MountedSystemIp>& created_ips);
+  void RemoveMountedSystemRoutesForNetwork(uint64_t network_id,
+                                           const std::string& source);
+  void RemoveMountedSystemIpsForNetwork(uint64_t network_id,
+                                        const std::string& source);
 
   mutable std::mutex mutex_;
   mutable std::recursive_mutex api_mutex_;
@@ -127,6 +169,8 @@ class ZeroTierWindowsRuntime {
   std::set<uint64_t> leaving_networks_;
   std::set<uint64_t> known_network_ids_;
   std::map<uint64_t, std::string> leave_request_sources_;
+  std::map<uint64_t, std::vector<MountedSystemIp>> mounted_system_ips_;
+  std::map<uint64_t, std::vector<MountedSystemRoute>> mounted_system_routes_;
   std::map<uint64_t, uint64_t> network_generations_;
   std::map<uint64_t, uint64_t> pending_leave_generations_;
   EventCallback event_callback_;
@@ -147,6 +191,8 @@ class ZeroTierWindowsRuntime {
   int minor_version_ = 0;
   ZeroTierWindowsAdapterBridge adapter_bridge_;
   ZeroTierWindowsAdapterBridge::ProbeResult adapter_probe_;
+  std::unique_ptr<ZeroTierWindowsTapBackend> tap_backend_;
+  std::string tap_backend_id_ = "wintun";
 };
 
 #endif  // FLUTTER_RUNNER_ZEROTIER_WINDOWS_RUNTIME_H_

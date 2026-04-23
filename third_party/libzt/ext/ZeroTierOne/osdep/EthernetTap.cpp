@@ -19,9 +19,10 @@
 
 #ifdef ZT_SDK
 
-#include "../controller/EmbeddedNetworkController.hpp"
-#include "../node/Node.hpp"
-#include "../include/VirtualTap.hpp"
+#include "../../../src/VirtualTap.hpp"
+#if defined(__WINDOWS__) && defined(ZTS_ENABLE_WINDOWS_OS_TAP)
+#include "WindowsEthernetTap.hpp"
+#endif
 
 #else
 
@@ -69,7 +70,42 @@ std::shared_ptr<EthernetTap> EthernetTap::newInstance(
 
 #ifdef ZT_SDK
 
-	return std::shared_ptr<EthernetTap>(new VirtualTap(homePath,mac,mtu,metric,nwid,friendlyName,handler,arg));
+#if defined(__WINDOWS__) && defined(ZTS_ENABLE_WINDOWS_OS_TAP)
+	HRESULT hres = CoInitializeEx(0, COINIT_MULTITHREADED);
+	if (FAILED(hres)) {
+		throw std::runtime_error("WinEthernetTap: COM initialization failed");
+	}
+
+	static bool _comInit = false;
+	static Mutex _comInit_m;
+
+	{
+		Mutex::Lock l(_comInit_m);
+		if (!_comInit) {
+			hres = CoInitializeSecurity(
+				NULL,
+				-1,
+				NULL,
+				NULL,
+				RPC_C_AUTHN_LEVEL_PKT,
+				RPC_C_IMP_LEVEL_IMPERSONATE,
+				NULL,
+				EOAC_NONE,
+				NULL
+			);
+			if (FAILED(hres)) {
+				CoUninitialize();
+				fprintf(stderr, "WinEthernetTap: Failed to initialize security");
+				throw std::runtime_error("WinEthernetTap: Failed to initialize security");
+			}
+			_comInit = true;
+		}
+	}
+	return std::shared_ptr<EthernetTap>(new WindowsEthernetTap(homePath,mac,mtu,metric,nwid,friendlyName,handler,arg));
+#else
+	(void)friendlyName;
+	return std::shared_ptr<EthernetTap>(new VirtualTap(homePath,mac,mtu,metric,nwid,handler,arg));
+#endif
 
 #else // not ZT_SDK
 

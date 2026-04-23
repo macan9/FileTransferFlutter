@@ -30,6 +30,7 @@
 #include "ZeroTierSockets.h"
 #include "version.h"
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,7 @@ namespace ZeroTier {
 class NodeService;
 struct InetAddress;
 class VirtualTap;
+class EthernetTap;
 class MAC;
 class Events;
 
@@ -216,16 +218,18 @@ class NodeService {
 
     // Configured networks
     struct NetworkState {
-        NetworkState() : tap((VirtualTap*)0)
+        NetworkState() : tap((EthernetTap*)0), lastNetworkStatus(-1)
         {
             // Real defaults are in network 'up' code in network event
             // handler
             settings.allowManaged = true;
             settings.allowGlobal = false;
             settings.allowDefault = false;
+            memset(&config, 0, sizeof(config));
         }
 
-        VirtualTap* tap;
+        EthernetTap* tap;
+        int lastNetworkStatus;
         ZT_VirtualNetworkConfig config;   // memcpy() of raw config from core
         std::vector<InetAddress> managedIps;
         NetworkSettings settings;
@@ -293,6 +297,15 @@ class NodeService {
 
     /** Apply or update managed IPs for a configured network */
     void syncManagedStuff(NetworkState& n);
+    /** Apply or remove managed routes for Windows OS-level tap */
+    void syncManagedRoutes(NetworkState& n, const ZT_VirtualNetworkConfig& cfg, bool install);
+
+    /**
+     * Create a network tap instance through a single platform-aware entrypoint.
+     * This keeps tap selection logic centralized for future Windows OS-level tap
+     * integration.
+     */
+    EthernetTap* createNetworkTap(uint64_t net_id, const ZT_VirtualNetworkConfig* nwc);
 
     void phyOnDatagram(
         PhySocket* sock,

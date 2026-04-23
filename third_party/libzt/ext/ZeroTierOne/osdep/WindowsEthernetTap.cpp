@@ -26,7 +26,6 @@
 #include <IPHlpApi.h>
 #include <nldef.h>
 #include <netioapi.h>
-#include <atlbase.h>
 #include <netlistmgr.h>
 #include <nldef.h>
 #include <SetupAPI.h>

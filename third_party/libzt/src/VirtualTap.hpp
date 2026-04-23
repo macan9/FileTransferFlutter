@@ -29,6 +29,7 @@
 #include "MAC.hpp"
 #include "Phy.hpp"
 #include "Thread.hpp"
+#include "../ext/ZeroTierOne/osdep/EthernetTap.hpp"
 
 namespace ZeroTier {
 
@@ -43,7 +44,7 @@ struct InetAddress;
  * Virtual tap device. ZeroTier will create one per joined network. It will
  * then be destroyed upon leaving the network.
  */
-class VirtualTap {
+class VirtualTap : public EthernetTap {
     friend class Phy<VirtualTap*>;
 
   public:
@@ -67,8 +68,8 @@ class VirtualTap {
 
     ~VirtualTap();
 
-    void setEnabled(bool en);
-    bool enabled() const;
+    void setEnabled(bool en) override;
+    bool enabled() const override;
 
     /**
      * System to ingest events from this class and emit them to the user
@@ -98,28 +99,33 @@ class VirtualTap {
      * this VirtualTap
      * - Starts VirtualTap main thread ONLY if successful
      */
-    bool addIp(const InetAddress& ip);
+    bool addIp(const InetAddress& ip) override;
 
     /**
      * Removes an address from the user-space stack interface associated
      * with this VirtualTap
      */
-    bool removeIp(const InetAddress& ip);
+    bool removeIp(const InetAddress& ip) override;
 
     /**
      * Presents data to the user-space stack
      */
-    void put(const MAC& from, const MAC& to, unsigned int etherType, const void* data, unsigned int len);
+    void put(const MAC& from, const MAC& to, unsigned int etherType, const void* data, unsigned int len) override;
 
     /**
      * Scan multicast groups
      */
-    void scanMulticastGroups(std::vector<MulticastGroup>& added, std::vector<MulticastGroup>& removed);
+    void scanMulticastGroups(std::vector<MulticastGroup>& added, std::vector<MulticastGroup>& removed) override;
 
     /**
      * Set MTU
      */
-    void setMtu(unsigned int mtu);
+    void setMtu(unsigned int mtu) override;
+
+    std::string deviceName() const override;
+    void setFriendlyName(const char* friendlyName) override;
+    std::string friendlyName() const override;
+    void setDns(const char* domain, const std::vector<InetAddress>& servers) override;
 
     /**
      * Calls main network stack loops
@@ -153,8 +159,9 @@ class VirtualTap {
 
     char vtap_full_name[VTAP_NAME_LEN] = { 0 };
 
-    std::vector<InetAddress> ips() const;
+    std::vector<InetAddress> ips() const override;
     std::vector<InetAddress> _ips;
+    std::string _friendlyName;
 
     std::string _homePath;
     void* _arg;

@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -90,7 +91,7 @@ bool LooksLikeMountCandidateAdapter(const std::string& text) {
   return ContainsSubstring(
       lowered, {"zerotier", "libzt", "tap-windows", "tap windows",
                 "tap-windows adapter", "tap adapter", "wintun",
-                "wireguard", "openvpn"});
+                "wireguard", "openvpn", "filetransferflutter"});
 }
 
 bool LooksLikeVirtualAdapter(const std::string& text) {
@@ -133,10 +134,152 @@ std::string Join(const std::vector<std::string>& values) {
   return stream.str();
 }
 
+std::string NormalizeGuidToken(const std::string& token) {
+  if (token.empty()) {
+    return "";
+  }
+  std::string result;
+  result.reserve(token.size());
+  for (char ch : token) {
+    if (ch == '{' || ch == '}') {
+      continue;
+    }
+    result.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+  }
+  return result;
+}
+
+std::string BracedGuid(const std::string& guid) {
+  if (guid.empty()) {
+    return "";
+  }
+  return "{" + guid + "}";
+}
+
+std::string ReadRegistryStringValue(HKEY root_key, const std::string& sub_key,
+                                    const char* value_name) {
+  if (value_name == nullptr || sub_key.empty()) {
+    return "";
+  }
+  char buffer[1024] = {0};
+  DWORD type = 0;
+  DWORD data_size = static_cast<DWORD>(sizeof(buffer) - 1);
+  const LONG result = RegGetValueA(root_key, sub_key.c_str(), value_name,
+                                   RRF_RT_REG_SZ, &type, buffer, &data_size);
+  if (result != ERROR_SUCCESS) {
+    return "";
+  }
+  buffer[sizeof(buffer) - 1] = '\0';
+  return Trim(buffer);
+}
+
+std::string ClassifyDriverKind(const std::string& friendly_name,
+                               const std::string& description,
+                               const std::string& adapter_name,
+                               const std::string& device_instance_id) {
+  const std::string merged =
+      ToLower(friendly_name + " " + description + " " + adapter_name + " " +
+              device_instance_id);
+  if (ContainsSubstring(merged, {"zerotier"})) {
+    return "zerotier";
+  }
+  if (ContainsSubstring(merged, {"tap-windows", "tap windows", "tap adapter"})) {
+    return "tap-windows";
+  }
+  if (ContainsSubstring(merged, {"wintun"})) {
+    return "wintun";
+  }
+  if (ContainsSubstring(merged, {"filetransferflutter"})) {
+    return "wintun";
+  }
+  if (ContainsSubstring(merged, {"wireguard"})) {
+    return "wireguard";
+  }
+  if (ContainsSubstring(merged, {"openvpn"})) {
+    return "openvpn";
+  }
+  if (ContainsSubstring(merged, {"hyper-v", "vethernet", "vmware", "virtualbox"})) {
+    return "hypervisor-virtual";
+  }
+  if (ContainsSubstring(merged, {"ethernet"})) {
+    return "ethernet";
+  }
+  return "unknown";
+}
+
+void LoadAdapterRegistryMetadata(ZeroTierWindowsAdapterBridge::AdapterRecord* record) {
+  if (record == nullptr) {
+    return;
+  }
+  const std::string guid = NormalizeGuidToken(record->adapter_name);
+  if (guid.empty()) {
+    return;
+  }
+  record->netcfg_instance_id = BracedGuid(guid);
+  const std::string connection_key =
+      "SYSTEM\\CurrentControlSet\\Control\\Network\\{4D36E972-E325-11CE-BFC1-08002BE10318}\\" +
+      record->netcfg_instance_id + "\\Connection";
+  const std::string pnp_instance_id =
+      ReadRegistryStringValue(HKEY_LOCAL_MACHINE, connection_key, "PnpInstanceID");
+  if (!pnp_instance_id.empty()) {
+    record->device_instance_id = pnp_instance_id;
+  }
+}
+
+bool AdapterHasExpectedRoute(uint32_t if_index,
+                             const std::set<std::string>& expected_ipv4_set) {
+  if (if_index == 0 || expected_ipv4_set.empty()) {
+    return false;
+  }
+  std::vector<uint32_t> expected_ips_network_order;
+  expected_ips_network_order.reserve(expected_ipv4_set.size());
+  for (const auto& expected : expected_ipv4_set) {
+    in_addr address = {};
+    if (inet_pton(AF_INET, expected.c_str(), &address) == 1) {
+      expected_ips_network_order.push_back(address.S_un.S_addr);
+    }
+  }
+  if (expected_ips_network_order.empty()) {
+    return false;
+  }
+
+  ULONG route_table_size = 0;
+  if (GetIpForwardTable(nullptr, &route_table_size, FALSE) != ERROR_INSUFFICIENT_BUFFER) {
+    return false;
+  }
+  std::vector<unsigned char> route_table_buffer(route_table_size);
+  MIB_IPFORWARDTABLE* route_table =
+      reinterpret_cast<MIB_IPFORWARDTABLE*>(route_table_buffer.data());
+  if (GetIpForwardTable(route_table, &route_table_size, FALSE) != NO_ERROR) {
+    return false;
+  }
+
+  bool found = false;
+  for (DWORD index = 0; index < route_table->dwNumEntries && !found; ++index) {
+    const MIB_IPFORWARDROW& route = route_table->table[index];
+    if (route.dwForwardIfIndex != if_index) {
+      continue;
+    }
+    // Skip default route; it is too broad for "managed route bound" probing.
+    if (route.dwForwardMask == 0) {
+      continue;
+    }
+    for (const uint32_t ip_network_order : expected_ips_network_order) {
+      if ((ip_network_order & route.dwForwardMask) ==
+          (route.dwForwardDest & route.dwForwardMask)) {
+        found = true;
+        break;
+      }
+    }
+  }
+  return found;
+}
+
 bool AppendIpv4Address(const IP_ADAPTER_UNICAST_ADDRESS* address,
-                       std::vector<std::string>* output) {
+                       std::vector<std::string>* output,
+                       std::map<std::string, uint8_t>* prefix_lengths) {
   if (address == nullptr || address->Address.lpSockaddr == nullptr ||
-      output == nullptr) {
+      output == nullptr || prefix_lengths == nullptr) {
     return false;
   }
   if (address->Address.lpSockaddr->sa_family != AF_INET) {
@@ -151,6 +294,11 @@ bool AppendIpv4Address(const IP_ADAPTER_UNICAST_ADDRESS* address,
     return false;
   }
   output->push_back(buffer);
+  uint8_t prefix_length = address->OnLinkPrefixLength;
+  if (prefix_length > 32) {
+    prefix_length = 32;
+  }
+  (*prefix_lengths)[buffer] = prefix_length;
   return true;
 }
 
@@ -230,11 +378,17 @@ ZeroTierWindowsAdapterBridge::ProbeResult ZeroTierWindowsAdapterBridge::Probe(
     record.if_index = adapter->IfIndex;
     record.luid = adapter->Luid.Value;
     record.oper_status = OperStatusToString(adapter->OperStatus);
+    record.media_status = record.oper_status;
     record.is_up = adapter->OperStatus == IfOperStatusUp;
+    LoadAdapterRegistryMetadata(&record);
+    record.driver_kind =
+        ClassifyDriverKind(record.friendly_name, record.description,
+                           record.adapter_name, record.device_instance_id);
     record.is_mount_candidate =
         LooksLikeMountCandidateAdapter(record.friendly_name) ||
         LooksLikeMountCandidateAdapter(record.description) ||
-        LooksLikeMountCandidateAdapter(record.adapter_name);
+        LooksLikeMountCandidateAdapter(record.adapter_name) ||
+        LooksLikeMountCandidateAdapter(record.device_instance_id);
     record.is_virtual =
         LooksLikeVirtualAdapter(record.friendly_name) ||
         LooksLikeVirtualAdapter(record.description) ||
@@ -242,7 +396,8 @@ ZeroTierWindowsAdapterBridge::ProbeResult ZeroTierWindowsAdapterBridge::Probe(
 
     for (IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress;
          unicast != nullptr; unicast = unicast->Next) {
-      AppendIpv4Address(unicast, &record.ipv4_addresses);
+      AppendIpv4Address(unicast, &record.ipv4_addresses,
+                        &record.ipv4_prefix_lengths);
     }
     for (const auto& address : record.ipv4_addresses) {
       detected_ip_set.insert(address);
@@ -267,6 +422,8 @@ ZeroTierWindowsAdapterBridge::ProbeResult ZeroTierWindowsAdapterBridge::Probe(
     }
     if (record.matches_expected_ip) {
       result.has_expected_network_ip = true;
+      record.has_expected_route = AdapterHasExpectedRoute(record.if_index, expected_set);
+      result.has_expected_route = result.has_expected_route || record.has_expected_route;
       matched_adapters.push_back(AdapterDisplayName(record));
     }
 
@@ -292,6 +449,12 @@ ZeroTierWindowsAdapterBridge::ProbeResult ZeroTierWindowsAdapterBridge::Probe(
       std::unique(result.mount_candidate_names.begin(),
                   result.mount_candidate_names.end()),
       result.mount_candidate_names.end());
+  result.matched_adapter_names = matched_adapters;
+  std::sort(result.matched_adapter_names.begin(), result.matched_adapter_names.end());
+  result.matched_adapter_names.erase(
+      std::unique(result.matched_adapter_names.begin(),
+                  result.matched_adapter_names.end()),
+      result.matched_adapter_names.end());
 
   std::ostringstream summary;
   summary << "virtual_adapter=" << (result.has_virtual_adapter ? "true" : "false")
@@ -299,8 +462,10 @@ ZeroTierWindowsAdapterBridge::ProbeResult ZeroTierWindowsAdapterBridge::Probe(
           << (result.has_mount_candidate ? "true" : "false")
           << " expected_ip_bound="
           << (result.has_expected_network_ip ? "true" : "false")
+          << " expected_route_bound="
+          << (result.has_expected_route ? "true" : "false")
           << " expected_ips=" << Join(result.expected_ipv4_addresses)
-          << " matched_adapters=" << Join(matched_adapters)
+          << " matched_adapters=" << Join(result.matched_adapter_names)
           << " mount_candidates=" << Join(result.mount_candidate_names)
           << " virtual_names=" << Join(result.virtual_adapter_names)
           << " detected_ips=" << Join(result.detected_ipv4_addresses)

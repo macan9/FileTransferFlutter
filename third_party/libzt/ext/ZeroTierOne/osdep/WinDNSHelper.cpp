@@ -14,24 +14,24 @@
 namespace ZeroTier
 {
 
-BOOL RegDelnodeRecurse(HKEY hKeyRoot, LPTSTR lpSubKey)
+BOOL RegDelnodeRecurse(HKEY hKeyRoot, char* lpSubKey)
 {
-	LPTSTR lpEnd;
+	char* lpEnd;
 	LONG lResult;
 	DWORD dwSize;
-	TCHAR szName[MAX_PATH];
+	char szName[MAX_PATH];
 	HKEY hKey;
 	FILETIME ftWrite;
 
 	// First, see if we can delete the key without having
 	// to recurse.
 
-	lResult = RegDeleteKey(hKeyRoot, lpSubKey);
+	lResult = RegDeleteKeyA(hKeyRoot, lpSubKey);
 
 	if (lResult == ERROR_SUCCESS)
 		return TRUE;
 
-	lResult = RegOpenKeyEx(hKeyRoot, lpSubKey, 0, KEY_READ, &hKey);
+	lResult = RegOpenKeyExA(hKeyRoot, lpSubKey, 0, KEY_READ, &hKey);
 
 	if (lResult != ERROR_SUCCESS)
 	{
@@ -45,27 +45,27 @@ BOOL RegDelnodeRecurse(HKEY hKeyRoot, LPTSTR lpSubKey)
 
 	// Check for an ending slash and add one if it is missing.
 
-	lpEnd = lpSubKey + lstrlen(lpSubKey);
+	lpEnd = lpSubKey + strlen(lpSubKey);
 
-	if (*(lpEnd - 1) != TEXT('\\'))
+	if (*(lpEnd - 1) != '\\')
 	{
-		*lpEnd = TEXT('\\');
+		*lpEnd = '\\';
 		lpEnd++;
-		*lpEnd = TEXT('\0');
+		*lpEnd = '\0';
 	}
 
 	// Enumerate the keys
 
 	dwSize = MAX_PATH;
-	lResult = RegEnumKeyEx(hKey, 0, szName, &dwSize, NULL,
+	lResult = RegEnumKeyExA(hKey, 0, szName, &dwSize, NULL,
 		NULL, NULL, &ftWrite);
 
 	if (lResult == ERROR_SUCCESS)
 	{
 		do {
 
-			*lpEnd = TEXT('\0');
-			StringCchCat(lpSubKey, MAX_PATH * 2, szName);
+			*lpEnd = '\0';
+			StringCchCatA(lpSubKey, MAX_PATH * 2, szName);
 
 			if (!RegDelnodeRecurse(hKeyRoot, lpSubKey)) {
 				break;
@@ -73,20 +73,20 @@ BOOL RegDelnodeRecurse(HKEY hKeyRoot, LPTSTR lpSubKey)
 
 			dwSize = MAX_PATH;
 
-			lResult = RegEnumKeyEx(hKey, 0, szName, &dwSize, NULL,
+			lResult = RegEnumKeyExA(hKey, 0, szName, &dwSize, NULL,
 				NULL, NULL, &ftWrite);
 
 		} while (lResult == ERROR_SUCCESS);
 	}
 
 	lpEnd--;
-	*lpEnd = TEXT('\0');
+	*lpEnd = '\0';
 
 	RegCloseKey(hKey);
 
 	// Try again to delete the key.
 
-	lResult = RegDeleteKey(hKeyRoot, lpSubKey);
+	lResult = RegDeleteKeyA(hKeyRoot, lpSubKey);
 
 	if (lResult == ERROR_SUCCESS)
 		return TRUE;
@@ -108,11 +108,11 @@ BOOL RegDelnodeRecurse(HKEY hKeyRoot, LPTSTR lpSubKey)
 //
 //*************************************************************
 
-BOOL RegDelnode(HKEY hKeyRoot, LPCTSTR lpSubKey)
+BOOL RegDelnode(HKEY hKeyRoot, const char* lpSubKey)
 {
-	TCHAR szDelKey[MAX_PATH * 2];
+	char szDelKey[MAX_PATH * 2];
 
-	StringCchCopy(szDelKey, MAX_PATH * 2, lpSubKey);
+	StringCchCopyA(szDelKey, MAX_PATH * 2, lpSubKey);
 	return RegDelnodeRecurse(hKeyRoot, szDelKey);
 
 }
@@ -126,9 +126,9 @@ std::vector<std::string> getSubKeys(const char* key)
 		KEY_READ,
 		&hKey) == ERROR_SUCCESS) {
 
-		TCHAR    achKey[MAX_KEY_LENGTH];   // buffer for subkey name
+		char    achKey[MAX_KEY_LENGTH];   // buffer for subkey name
 		DWORD    cbName;                   // size of name string 
-		TCHAR    achClass[MAX_PATH] = TEXT("");  // buffer for class name 
+		char    achClass[MAX_PATH] = {0};  // buffer for class name 
 		DWORD    cchClassName = MAX_PATH;  // size of class string 
 		DWORD    cSubKeys = 0;               // number of subkeys 
 		DWORD    cbMaxSubKey;              // longest subkey size 
@@ -141,10 +141,10 @@ std::vector<std::string> getSubKeys(const char* key)
 
 		DWORD i, retCode;
 
-		TCHAR  achValue[MAX_VALUE_NAME];
+		char  achValue[MAX_VALUE_NAME];
 		DWORD cchValue = MAX_VALUE_NAME;
 
-		retCode = RegQueryInfoKey(
+		retCode = RegQueryInfoKeyA(
 			hKey,                    // key handle 
 			achClass,                // buffer for class name 
 			&cchClassName,           // size of class string 
@@ -160,7 +160,7 @@ std::vector<std::string> getSubKeys(const char* key)
 
 		for (i = 0; i < cSubKeys; ++i) {
 			cbName = MAX_KEY_LENGTH;
-			retCode = RegEnumKeyEx(
+			retCode = RegEnumKeyExA(
 				hKey,
 				i,
 				achKey,
@@ -187,9 +187,9 @@ std::vector<std::string> getValueList(const char* key) {
 		KEY_READ,
 		&hKey) == ERROR_SUCCESS) {
 
-		TCHAR    achKey[MAX_KEY_LENGTH];   // buffer for subkey name
+		char    achKey[MAX_KEY_LENGTH];   // buffer for subkey name
 		DWORD    cbName;                   // size of name string 
-		TCHAR    achClass[MAX_PATH] = TEXT("");  // buffer for class name 
+		char    achClass[MAX_PATH] = {0};  // buffer for class name 
 		DWORD    cchClassName = MAX_PATH;  // size of class string 
 		DWORD    cSubKeys = 0;               // number of subkeys 
 		DWORD    cbMaxSubKey;              // longest subkey size 
@@ -202,10 +202,10 @@ std::vector<std::string> getValueList(const char* key) {
 
 		DWORD i, retCode;
 
-		TCHAR  achValue[MAX_VALUE_NAME];
+		char  achValue[MAX_VALUE_NAME];
 		DWORD cchValue = MAX_VALUE_NAME;
 
-		retCode = RegQueryInfoKey(
+		retCode = RegQueryInfoKeyA(
 			hKey,                    // key handle 
 			achClass,                // buffer for class name 
 			&cchClassName,           // size of class string 
@@ -222,7 +222,7 @@ std::vector<std::string> getValueList(const char* key) {
 		for (i = 0, retCode = ERROR_SUCCESS; i < cValues; ++i) {
 			cchValue = MAX_VALUE_NAME;
 			achValue[0] = '\0';
-			retCode = RegEnumValue(
+			retCode = RegEnumValueA(
 				hKey,
 				i,
 				achValue,

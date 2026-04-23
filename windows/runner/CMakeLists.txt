@@ -16,6 +16,7 @@ add_executable(${BINARY_NAME} WIN32
   "../native/zerotier/zerotier_windows_network_manager.cpp"
   "../native/zerotier/zerotier_windows_plugin.cpp"
   "../native/zerotier/zerotier_windows_runtime.cpp"
+  "../native/zerotier/zerotier_windows_tap_backend.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
   "runner.exe.manifest"
@@ -25,6 +26,7 @@ add_executable(zt_runtime_smoke
   "../native/zerotier/zerotier_windows_adapter_bridge.cpp"
   "../native/zerotier/zerotier_windows_network_manager.cpp"
   "../native/zerotier/zerotier_windows_runtime.cpp"
+  "../native/zerotier/zerotier_windows_tap_backend.cpp"
   "../native/zerotier/zt_runtime_smoke.cpp"
 )
 
