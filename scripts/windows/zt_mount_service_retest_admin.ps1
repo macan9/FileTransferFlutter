@@ -40,7 +40,10 @@ try {
     $env:Path = $cmakeBin + ";" + $env:Path
   }
 
-  $serviceExe = Join-Path $repoRoot ($BuildDir + "\runner\Debug\zt_mount_service.exe")
+  $serviceExe = Join-Path $repoRoot ($BuildDir + "\runner\Debug\zt_mount_helper.exe")
+  if (-not (Test-Path -LiteralPath $serviceExe)) {
+    $serviceExe = Join-Path $repoRoot ($BuildDir + "\runner\Debug\zt_mount_service.exe")
+  }
   if (-not (Test-Path $serviceExe)) {
     throw "Service executable missing: $serviceExe"
   }

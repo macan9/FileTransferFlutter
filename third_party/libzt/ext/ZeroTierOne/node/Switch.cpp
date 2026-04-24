@@ -82,6 +82,18 @@ void Switch::onRemotePacket(void *tPtr,const int64_t localSocket,const InetAddre
 
 		const SharedPtr<Path> path(RR->topology->getPath(localSocket,fromAddr));
 		path->received(now);
+#if defined(_WIN32) || defined(_WIN64)
+		if (fromAddr.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+			char frombuf[64];
+			fprintf(stderr,
+				"[ZT/CORE] switch_remote_packet from=%s len=%u local_socket=%lld path_local_socket=%lld path_trust=%d\n",
+				fromAddr.toString(frombuf),
+				len,
+				(long long)localSocket,
+				(long long)path->localSocket(),
+				path->trustEstablished(now) ? 1 : 0);
+		}
+#endif
 
 		if (len == 13) {
 			/* LEGACY: before VERB_PUSH_DIRECT_PATHS, peers used broadcast
@@ -186,6 +198,21 @@ void Switch::onRemotePacket(void *tPtr,const int64_t localSocket,const InetAddre
 
 				const Address destination(reinterpret_cast<const uint8_t *>(data) + 8,ZT_ADDRESS_LENGTH);
 				const Address source(reinterpret_cast<const uint8_t *>(data) + 13,ZT_ADDRESS_LENGTH);
+#if defined(_WIN32) || defined(_WIN64)
+				if (fromAddr.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+					char frombuf[64];
+					char dstbuf[64];
+					char srcbuf[64];
+					fprintf(stderr,
+						"[ZT/CORE] switch_packet_head from=%s source=%s destination=%s len=%u fragmented=%d trust=%d\n",
+						fromAddr.toString(frombuf),
+						source.toString(srcbuf),
+						destination.toString(dstbuf),
+						len,
+						((reinterpret_cast<const uint8_t *>(data)[ZT_PACKET_IDX_FLAGS] & ZT_PROTO_FLAG_FRAGMENTED) != 0) ? 1 : 0,
+						path->trustEstablished(now) ? 1 : 0);
+				}
+#endif
 
 				if (source == RR->identity.address()) {
 					return;
@@ -270,7 +297,20 @@ void Switch::onRemotePacket(void *tPtr,const int64_t localSocket,const InetAddre
 				} else {
 					// Packet is unfragmented, so just process it
 					IncomingPacket packet(data,len,path,now);
-					if (!packet.tryDecode(RR,tPtr,flowId)) {
+					const bool decoded = packet.tryDecode(RR,tPtr,flowId);
+#if defined(_WIN32) || defined(_WIN64)
+					if (fromAddr.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+						char frombuf[64];
+						fprintf(stderr,
+							"[ZT/CORE] switch_packet_decode from=%s packet_id=%llu len=%u decoded=%d flow_id=%d\n",
+							fromAddr.toString(frombuf),
+							(unsigned long long)packet.packetId(),
+							len,
+							decoded ? 1 : 0,
+							(int)flowId);
+					}
+#endif
+					if (!decoded) {
 						RXQueueEntry *const rq = _nextRXQueueEntry();
 						Mutex::Lock rql(rq->lock);
 						rq->flowId = flowId;

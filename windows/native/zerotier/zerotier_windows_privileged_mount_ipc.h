@@ -17,6 +17,8 @@ enum class Command : uint32_t {
   kEnsureRouteV4 = 3,
   kRemoveIpV4 = 4,
   kRemoveRouteV4 = 5,
+  kEnsureWintunAdapter = 6,
+  kEnsureFirewallHostExe = 7,
 };
 
 enum class Result : uint32_t {
@@ -38,7 +40,7 @@ struct Request {
   uint32_t if_index = 0;
   uint8_t prefix_length = 0;
   uint8_t reserved[3] = {0, 0, 0};
-  char value[64] = {0};  // IPv4 or CIDR (e.g. 172.29.99.23 / 172.29.99.0/24)
+  char value[260] = {0};  // IPv4, CIDR, or host exe path
 };
 
 struct Response {
@@ -46,13 +48,16 @@ struct Response {
   uint32_t result = 0;
   uint32_t native_error = 0;
   uint32_t service_error = 0;
+  uint32_t adapter_if_index = 0;
+  uint32_t reserved = 0;
+  uint64_t adapter_luid = 0;
   uint64_t request_id = 0;
   char message[192] = {0};
 };
 #pragma pack(pop)
 
-static_assert(sizeof(Request) == 96, "Unexpected privileged mount request size");
-static_assert(sizeof(Response) == 216, "Unexpected privileged mount response size");
+static_assert(sizeof(Request) == 292, "Unexpected privileged mount request size");
+static_assert(sizeof(Response) == 232, "Unexpected privileged mount response size");
 
 bool SendRequest(const Request& request, Response* response, DWORD timeout_ms,
                  DWORD* transport_error);
@@ -60,4 +65,3 @@ bool SendRequest(const Request& request, Response* response, DWORD timeout_ms,
 std::string ResultToString(Result result);
 
 }  // namespace ztwin::privileged_mount
-

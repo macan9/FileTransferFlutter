@@ -24,8 +24,13 @@
 #if defined(_WIN32) || defined(_WIN64)
 
 #include <winsock2.h>
+#include <mstcpip.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 
 #define ZT_PHY_SOCKFD_TYPE SOCKET
 #define ZT_PHY_SOCKFD_NULL (INVALID_SOCKET)
@@ -148,6 +153,70 @@ private:
 		void *uptr; // user-settable pointer
 		ZT_PHY_SOCKADDR_STORAGE_TYPE saddr; // remote for TCP_OUT and TCP_IN, local for TCP_LISTEN, RAW, and UDP
 	};
+
+	static inline const char *ztPhyAddrToString(const struct sockaddr *addr,char buf[64])
+	{
+		if (!addr) {
+			Utils::scopy(buf,64,"null");
+			return buf;
+		}
+		InetAddress tmp(addr);
+		return tmp.toString(buf);
+	}
+
+#if defined(_WIN32) || defined(_WIN64)
+	static inline void ztPhyLogSocketDiagnostics(const char *stage,ZT_PHY_SOCKFD_TYPE sock,const struct sockaddr *requestedLocalAddress,int family)
+	{
+		char requestedBuf[64];
+		char actualBuf[64];
+		ZT_PHY_SOCKADDR_STORAGE_TYPE actualAddr;
+		memset(&actualAddr,0,sizeof(actualAddr));
+		int actualAddrLen = (int)sizeof(actualAddr);
+
+		BOOL reuseAddr = FALSE;
+		int reuseAddrLen = (int)sizeof(reuseAddr);
+		BOOL broadcast = FALSE;
+		int broadcastLen = (int)sizeof(broadcast);
+		BOOL exclusiveAddrUse = FALSE;
+		int exclusiveAddrUseLen = (int)sizeof(exclusiveAddrUse);
+		BOOL ipv6Only = FALSE;
+		int ipv6OnlyLen = (int)sizeof(ipv6Only);
+		DWORD recvBuffer = 0;
+		int recvBufferLen = (int)sizeof(recvBuffer);
+		DWORD sendBuffer = 0;
+		int sendBufferLen = (int)sizeof(sendBuffer);
+		const int getsocknameRc = ::getsockname(sock,(struct sockaddr *)&actualAddr,&actualAddrLen);
+		const int getsockoptReuseRc = ::getsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char *)&reuseAddr,&reuseAddrLen);
+		const int getsockoptBroadcastRc = ::getsockopt(sock,SOL_SOCKET,SO_BROADCAST,(char *)&broadcast,&broadcastLen);
+		const int getsockoptExclusiveRc = ::getsockopt(sock,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,(char *)&exclusiveAddrUse,&exclusiveAddrUseLen);
+		const int getsockoptRcvBufRc = ::getsockopt(sock,SOL_SOCKET,SO_RCVBUF,(char *)&recvBuffer,&recvBufferLen);
+		const int getsockoptSndBufRc = ::getsockopt(sock,SOL_SOCKET,SO_SNDBUF,(char *)&sendBuffer,&sendBufferLen);
+		int getsockoptIpv6OnlyRc = -1;
+		if (family == AF_INET6) {
+			getsockoptIpv6OnlyRc = ::getsockopt(sock,IPPROTO_IPV6,IPV6_V6ONLY,(char *)&ipv6Only,&ipv6OnlyLen);
+		}
+
+		fprintf(stderr,
+			"[ZT/PHY] socket_diagnostics stage=%s sock=%llu requested_local=%s actual_local=%s getsockname_rc=%d reuseaddr=%d reuseaddr_rc=%d exclusiveaddruse=%d exclusiveaddruse_rc=%d broadcast=%d broadcast_rc=%d ipv6only=%d ipv6only_rc=%d rcvbuf=%lu rcvbuf_rc=%d sndbuf=%lu sndbuf_rc=%d\n",
+			stage,
+			(unsigned long long)sock,
+			ztPhyAddrToString(requestedLocalAddress,requestedBuf),
+			(getsocknameRc == 0) ? ztPhyAddrToString((const struct sockaddr *)&actualAddr,actualBuf) : "getsockname_failed",
+			getsocknameRc,
+			(int)reuseAddr,
+			getsockoptReuseRc,
+			(int)exclusiveAddrUse,
+			getsockoptExclusiveRc,
+			(int)broadcast,
+			getsockoptBroadcastRc,
+			(int)ipv6Only,
+			getsockoptIpv6OnlyRc,
+			(unsigned long)recvBuffer,
+			getsockoptRcvBufRc,
+			(unsigned long)sendBuffer,
+			getsockoptSndBufRc);
+	}
+#endif
 
 	std::list<PhySocketImpl> _socks;
 	fd_set _readfds;
@@ -331,8 +400,13 @@ public:
 			return (PhySocket *)0;
 
 		ZT_PHY_SOCKFD_TYPE s = ::socket(localAddress->sa_family,SOCK_DGRAM,0);
-		if (!ZT_PHY_SOCKFD_VALID(s))
+		if (!ZT_PHY_SOCKFD_VALID(s)) {
+#if defined(_WIN32) || defined(_WIN64)
+			char addrbuf[64];
+			fprintf(stderr,"[ZT/PHY] udp_bind_result stage=socket local=%s family=%d success=0 wsa_error=%d\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(int)WSAGetLastError());
+#endif
 			return (PhySocket *)0;
+		}
 
 		if (bufferSize > 0) {
 			int bs = bufferSize;
@@ -360,6 +434,28 @@ public:
 			}
 			f = FALSE; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,(const char *)&f,sizeof(f));
 			f = TRUE; setsockopt(s,SOL_SOCKET,SO_BROADCAST,(const char *)&f,sizeof(f));
+			DWORD bytesReturned = 0;
+			BOOL disableUdpConnReset = FALSE;
+			const int udpConnResetRc = (int)::WSAIoctl(
+				s,
+				SIO_UDP_CONNRESET,
+				&disableUdpConnReset,
+				sizeof(disableUdpConnReset),
+				nullptr,
+				0,
+				&bytesReturned,
+				nullptr,
+				nullptr);
+			char addrbuf[64];
+			fprintf(
+				stderr,
+				"[ZT/PHY] udp_connreset_result local=%s family=%d success=%d rc=%d wsa_error=%d sock=%llu\n",
+				ztPhyAddrToString(localAddress,addrbuf),
+				(int)localAddress->sa_family,
+				(udpConnResetRc == 0) ? 1 : 0,
+				udpConnResetRc,
+				(udpConnResetRc == 0) ? 0 : (int)WSAGetLastError(),
+				(unsigned long long)s);
 		}
 #else // not Windows
 		{
@@ -393,6 +489,10 @@ public:
 #endif // Windows or not
 
 		if (::bind(s,localAddress,(localAddress->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in))) {
+#if defined(_WIN32) || defined(_WIN64)
+			char addrbuf[64];
+			fprintf(stderr,"[ZT/PHY] udp_bind_result stage=bind local=%s family=%d success=0 wsa_error=%d sock=%llu\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(int)WSAGetLastError(),(unsigned long long)s);
+#endif
 			ZT_PHY_CLOSE_SOCKET(s);
 			return (PhySocket *)0;
 		}
@@ -419,6 +519,14 @@ public:
 		sws.uptr = uptr;
 		memset(&(sws.saddr),0,sizeof(struct sockaddr_storage));
 		memcpy(&(sws.saddr),localAddress,(localAddress->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in));
+
+#if defined(_WIN32) || defined(_WIN64)
+		{
+			char addrbuf[64];
+			fprintf(stderr,"[ZT/PHY] udp_bind_result stage=bind local=%s family=%d success=1 sock=%llu phy_socket=%lld\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(unsigned long long)s,(long long)reinterpret_cast<int64_t>((PhySocket *)&sws));
+			ztPhyLogSocketDiagnostics("udp_bind",s,localAddress,(int)localAddress->sa_family);
+		}
+#endif
 
 		return (PhySocket *)&sws;
 	}
@@ -553,8 +661,13 @@ public:
 			return (PhySocket *)0;
 
 		ZT_PHY_SOCKFD_TYPE s = ::socket(localAddress->sa_family,SOCK_STREAM,0);
-		if (!ZT_PHY_SOCKFD_VALID(s))
+		if (!ZT_PHY_SOCKFD_VALID(s)) {
+#if defined(_WIN32) || defined(_WIN64)
+			char addrbuf[64];
+			fprintf(stderr,"[ZT/PHY] tcp_listen_result stage=socket local=%s family=%d success=0 wsa_error=%d\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(int)WSAGetLastError());
+#endif
 			return (PhySocket *)0;
+		}
 
 #if defined(_WIN32) || defined(_WIN64)
 		{
@@ -576,11 +689,19 @@ public:
 #endif
 
 		if (::bind(s,localAddress,(localAddress->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in))) {
+#if defined(_WIN32) || defined(_WIN64)
+			char addrbuf[64];
+			fprintf(stderr,"[ZT/PHY] tcp_listen_result stage=bind local=%s family=%d success=0 wsa_error=%d sock=%llu\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(int)WSAGetLastError(),(unsigned long long)s);
+#endif
 			ZT_PHY_CLOSE_SOCKET(s);
 			return (PhySocket *)0;
 		}
 
 		if (::listen(s,1024)) {
+#if defined(_WIN32) || defined(_WIN64)
+			char addrbuf[64];
+			fprintf(stderr,"[ZT/PHY] tcp_listen_result stage=listen local=%s family=%d success=0 wsa_error=%d sock=%llu\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(int)WSAGetLastError(),(unsigned long long)s);
+#endif
 			ZT_PHY_CLOSE_SOCKET(s);
 			return (PhySocket *)0;
 		}
@@ -601,6 +722,13 @@ public:
 		sws.uptr = uptr;
 		memset(&(sws.saddr),0,sizeof(struct sockaddr_storage));
 		memcpy(&(sws.saddr),localAddress,(localAddress->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in));
+
+#if defined(_WIN32) || defined(_WIN64)
+		{
+			char addrbuf[64];
+			fprintf(stderr,"[ZT/PHY] tcp_listen_result stage=listen local=%s family=%d success=1 sock=%llu phy_socket=%lld\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(unsigned long long)s,(long long)reinterpret_cast<int64_t>((PhySocket *)&sws));
+		}
+#endif
 
 		return (PhySocket *)&sws;
 	}
@@ -989,6 +1117,25 @@ public:
 
 				case ZT_PHY_SOCKET_UDP:
 					if (FD_ISSET(s->sock, &rfds)) {
+#if defined(_WIN32) || defined(_WIN64)
+						{
+							u_long pendingBytes = 0;
+							const int fionreadRc = ::ioctlsocket(s->sock,FIONREAD,&pendingBytes);
+							int soError = 0;
+							int soErrorLen = (int)sizeof(soError);
+							const int soErrorRc = ::getsockopt(s->sock,SOL_SOCKET,SO_ERROR,(char *)&soError,&soErrorLen);
+							char localbuf[64];
+							fprintf(stderr,
+								"[ZT/PHY] udp_socket_ready fd=%llu phy_socket=%lld local=%s fionread_rc=%d pending_bytes=%lu so_error=%d so_error_rc=%d\n",
+								(unsigned long long)s->sock,
+								(long long)reinterpret_cast<int64_t>((PhySocket *)&(*s)),
+								ztPhyAddrToString((const struct sockaddr *)&(s->saddr),localbuf),
+								fionreadRc,
+								(unsigned long)pendingBytes,
+								soError,
+								soErrorRc);
+						}
+#endif
 #if (defined(__linux__) || defined(linux) || defined(__linux)) && defined(MSG_WAITFORONE)
 #define RECVMMSG_WINDOW_SIZE 128
 #define RECVMMSG_BUF_SIZE	 1500
@@ -1033,14 +1180,44 @@ public:
 							socklen_t slen = sizeof(ss);
 							long n = (long)::recvfrom(s->sock, buf, sizeof(buf), 0, (struct sockaddr*)&ss, &slen);
 							if (n > 0) {
+#if defined(_WIN32) || defined(_WIN64)
+								{
+									InetAddress fromAddr(reinterpret_cast<const struct sockaddr *>(&ss));
+									if (fromAddr.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+										char localbuf[64];
+										char frombuf[64];
+										fprintf(stderr,
+											"[ZT/PHY] recvfrom_result success=1 fd=%llu phy_socket=%lld local=%s from=%s len=%ld slen=%u\n",
+											(unsigned long long)s->sock,
+											(long long)reinterpret_cast<int64_t>((PhySocket *)&(*s)),
+											ztPhyAddrToString((const struct sockaddr *)&(s->saddr),localbuf),
+											ztPhyAddrToString((const struct sockaddr *)&ss,frombuf),
+											n,
+											(unsigned int)slen);
+									}
+								}
+#endif
 								try {
 									_handler->phyOnDatagram((PhySocket*)&(*s), &(s->uptr), (const struct sockaddr*)&(s->saddr), (const struct sockaddr*)&ss, (void*)buf, (unsigned long)n);
 								}
 								catch (...) {
 								}
 							}
-							else if (n < 0)
+							else if (n < 0) {
+#if defined(_WIN32) || defined(_WIN64)
+								const int wsaError = (int)WSAGetLastError();
+								if ((wsaError != WSAEWOULDBLOCK) && (wsaError != WSAECONNRESET)) {
+									char localbuf[64];
+									fprintf(stderr,
+										"[ZT/PHY] recvfrom_result success=0 fd=%llu phy_socket=%lld local=%s wsa_error=%d\n",
+										(unsigned long long)s->sock,
+										(long long)reinterpret_cast<int64_t>((PhySocket *)&(*s)),
+										ztPhyAddrToString((const struct sockaddr *)&(s->saddr),localbuf),
+										wsaError);
+								}
+#endif
 								break;
+							}
 						}
 #endif
 					}
@@ -1129,6 +1306,20 @@ public:
 		PhySocketImpl &sws = *(reinterpret_cast<PhySocketImpl *>(sock));
 		if (sws.type == ZT_PHY_SOCKET_CLOSED)
 			return;
+
+#if defined(_WIN32) || defined(_WIN64)
+		if (sws.type == ZT_PHY_SOCKET_UDP || sws.type == ZT_PHY_SOCKET_TCP_LISTEN ||
+			sws.type == ZT_PHY_SOCKET_TCP_OUT_PENDING || sws.type == ZT_PHY_SOCKET_TCP_OUT_CONNECTED ||
+			sws.type == ZT_PHY_SOCKET_TCP_IN) {
+			char addrbuf[64];
+			fprintf(stderr,
+				"[ZT/PHY] socket_close type=%d sock=%llu local=%s call_handlers=%d\n",
+				(int)sws.type,
+				(unsigned long long)sws.sock,
+				ztPhyAddrToString((const struct sockaddr *)&(sws.saddr),addrbuf),
+				callHandlers ? 1 : 0);
+		}
+#endif
 
 		FD_CLR(sws.sock,&_readfds);
 		FD_CLR(sws.sock,&_writefds);

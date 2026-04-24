@@ -21,6 +21,7 @@
 #include <ws2tcpip.h>
 
 #include "native/zerotier/zerotier_windows_tap_backend.h"
+#include "native/zerotier/zerotier_windows_privileged_mount_ipc.h"
 
 #include <algorithm>
 #include <cctype>
@@ -83,6 +84,125 @@ std::string WideToUtf8(const std::wstring& text) {
                       nullptr, nullptr);
   utf8.pop_back();
   return utf8;
+}
+
+std::string WideToUtf8(const wchar_t* text) {
+  if (text == nullptr || *text == L'\0') {
+    return "";
+  }
+  return WideToUtf8(std::wstring(text));
+}
+
+std::string Trim(std::string text) {
+  while (!text.empty() &&
+         std::isspace(static_cast<unsigned char>(text.front())) != 0) {
+    text.erase(text.begin());
+  }
+  while (!text.empty() &&
+         std::isspace(static_cast<unsigned char>(text.back())) != 0) {
+    text.pop_back();
+  }
+  return text;
+}
+
+std::string ReadRegistryStringValue(HKEY root_key, const std::string& sub_key,
+                                    const char* value_name) {
+  if (value_name == nullptr || sub_key.empty()) {
+    return "";
+  }
+  char buffer[1024] = {0};
+  DWORD type = 0;
+  DWORD data_size = static_cast<DWORD>(sizeof(buffer) - 1);
+  const LONG result = RegGetValueA(root_key, sub_key.c_str(), value_name,
+                                   RRF_RT_REG_SZ, &type, buffer, &data_size);
+  if (result != ERROR_SUCCESS) {
+    return "";
+  }
+  buffer[sizeof(buffer) - 1] = '\0';
+  return Trim(buffer);
+}
+
+struct WintunRegistryProbe {
+  bool found = false;
+  std::string class_key;
+  std::string connection_name;
+  std::string pnp_instance_id;
+  std::string service_name;
+  std::string component_id;
+};
+
+bool ContainsToken(const std::string& haystack, const std::string& needle) {
+  return Normalize(haystack).find(Normalize(needle)) != std::string::npos;
+}
+
+bool ProbeWintunRegistryState(const std::string& desired_name,
+                              WintunRegistryProbe* probe) {
+  if (probe == nullptr) {
+    return false;
+  }
+  *probe = WintunRegistryProbe{};
+  HKEY network_root = nullptr;
+  const std::string root_path =
+      "SYSTEM\\CurrentControlSet\\Control\\Network\\"
+      "{4D36E972-E325-11CE-BFC1-08002BE10318}";
+  if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, root_path.c_str(), 0, KEY_READ,
+                    &network_root) != ERROR_SUCCESS) {
+    return false;
+  }
+
+  DWORD index = 0;
+  char subkey_name[256] = {0};
+  DWORD subkey_name_len = 0;
+  while (true) {
+    subkey_name_len = static_cast<DWORD>(std::size(subkey_name));
+    const LONG enum_result =
+        RegEnumKeyExA(network_root, index++, subkey_name, &subkey_name_len,
+                      nullptr, nullptr, nullptr, nullptr);
+    if (enum_result == ERROR_NO_MORE_ITEMS) {
+      break;
+    }
+    if (enum_result != ERROR_SUCCESS) {
+      continue;
+    }
+    const std::string class_key = root_path + "\\" + subkey_name + "\\Connection";
+    const std::string connection_name =
+        ReadRegistryStringValue(HKEY_LOCAL_MACHINE, class_key, "Name");
+    const std::string pnp_instance_id =
+        ReadRegistryStringValue(HKEY_LOCAL_MACHINE, class_key, "PnpInstanceID");
+    if (!ContainsToken(connection_name, desired_name) &&
+        !ContainsToken(pnp_instance_id, desired_name) &&
+        !ContainsToken(pnp_instance_id, "wintun")) {
+      continue;
+    }
+    probe->found = true;
+    probe->class_key = class_key;
+    probe->connection_name = connection_name;
+    probe->pnp_instance_id = pnp_instance_id;
+    if (!pnp_instance_id.empty()) {
+      const std::string enum_key =
+          "SYSTEM\\CurrentControlSet\\Enum\\" + pnp_instance_id;
+      probe->service_name =
+          ReadRegistryStringValue(HKEY_LOCAL_MACHINE, enum_key, "Service");
+      probe->component_id =
+          ReadRegistryStringValue(HKEY_LOCAL_MACHINE, enum_key, "ComponentId");
+    }
+    break;
+  }
+  RegCloseKey(network_root);
+  return probe->found;
+}
+
+std::string DescribeWintunRegistryProbe(const WintunRegistryProbe& probe) {
+  if (!probe.found) {
+    return "registry=not_found";
+  }
+  std::ostringstream stream;
+  stream << "registry=found"
+         << " name=" << (probe.connection_name.empty() ? "-" : probe.connection_name)
+         << " pnp=" << (probe.pnp_instance_id.empty() ? "-" : probe.pnp_instance_id)
+         << " service=" << (probe.service_name.empty() ? "-" : probe.service_name)
+         << " component=" << (probe.component_id.empty() ? "-" : probe.component_id);
+  return stream.str();
 }
 
 bool IsProcessElevated() {
@@ -348,9 +468,13 @@ bool RunPowerShellScriptHidden(const std::wstring& script, DWORD* exit_code) {
 bool TryBootstrapWintunAdapterViaElevatedPowerShell(
     const std::wstring& wintun_dll_path, const std::wstring& adapter_name,
     const std::wstring& tunnel_type, const GUID& adapter_guid,
-    DWORD* exit_code) {
+    DWORD* exit_code, std::string* debug_output) {
+  constexpr DWORD kTransientCreateExitCode = 102;
   if (exit_code != nullptr) {
     *exit_code = ERROR_GEN_FAILURE;
+  }
+  if (debug_output != nullptr) {
+    debug_output->clear();
   }
   if (wintun_dll_path.empty() || adapter_name.empty() || tunnel_type.empty()) {
     if (exit_code != nullptr) {
@@ -381,11 +505,26 @@ bool TryBootstrapWintunAdapterViaElevatedPowerShell(
   const std::wstring ps_adapter = EscapePowerShellSingleQuotedLiteral(adapter_name);
   const std::wstring ps_tunnel = EscapePowerShellSingleQuotedLiteral(tunnel_type);
   const std::wstring ps_guid = EscapePowerShellSingleQuotedLiteral(guid_text);
+  std::wstring helper_log_path;
+  DWORD helper_log_error = NO_ERROR;
+  if (!CreateTempPowerShellScriptPath(L"ztwl", &helper_log_path,
+                                      &helper_log_error)) {
+    helper_log_path.clear();
+  }
+  const std::wstring ps_log_path =
+      EscapePowerShellSingleQuotedLiteral(helper_log_path);
 
   std::wostringstream script;
   script << LR"(
 $ErrorActionPreference = 'Stop';
 $env:Path = ')" << ps_dll_dir << LR"(' + ';' + $env:Path;
+$logPath = ')" << ps_log_path << LR"(';
+function Write-DebugLine {
+  param([string]$Message)
+  if ($logPath) {
+    Add-Content -LiteralPath $logPath -Value $Message -Encoding UTF8
+  }
+}
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -402,19 +541,50 @@ $name = ')" << ps_adapter << LR"(';
 $type = ')" << ps_tunnel << LR"(';
 $guid = [Guid]::Parse(')" << ps_guid << LR"(');
 $handle = [ZTWintunNative]::OpenAdapter($name);
+Write-DebugLine ("open_handle=" + $handle + " open_error=" +
+  [Runtime.InteropServices.Marshal]::GetLastWin32Error());
 if ($handle -ne [IntPtr]::Zero) {
   [ZTWintunNative]::CloseAdapter($handle);
+  Write-DebugLine "open_result=success";
   exit 0
 }
 $handle = [ZTWintunNative]::CreateAdapter($name, $type, [ref]$guid);
+Write-DebugLine ("create_handle=" + $handle + " create_error=" +
+  [Runtime.InteropServices.Marshal]::GetLastWin32Error());
 if ($handle -eq [IntPtr]::Zero) {
+  Write-DebugLine "create_result=failed";
   exit 101
 }
+Write-DebugLine "create_result=created_but_transient";
+Write-DebugLine "create_note=helper_process_created_adapter;closing_created_handle_removes_adapter";
 [ZTWintunNative]::CloseAdapter($handle);
-exit 0
+Write-DebugLine "create_cleanup=closed_created_handle";
+exit )" << kTransientCreateExitCode << LR"(
 )";
 
-  return RunPowerShellScriptElevated(script.str(), exit_code);
+  const bool ok = RunPowerShellScriptElevated(script.str(), exit_code);
+  if (!helper_log_path.empty()) {
+    std::ifstream stream(std::filesystem::path(helper_log_path),
+                         std::ios::binary);
+    if (stream.is_open()) {
+      std::ostringstream buffer;
+      buffer << stream.rdbuf();
+      if (debug_output != nullptr) {
+        *debug_output = buffer.str();
+        while (!debug_output->empty() &&
+               (debug_output->back() == '\r' || debug_output->back() == '\n')) {
+          debug_output->pop_back();
+        }
+      }
+    } else if (debug_output != nullptr) {
+      *debug_output = "helper_log_unavailable";
+    }
+    DeleteFileW(helper_log_path.c_str());
+  }
+  if (ok || (exit_code != nullptr && *exit_code == kTransientCreateExitCode)) {
+    return ok;
+  }
+  return false;
 }
 
 std::wstring CurrentModuleDirectory() {
@@ -523,6 +693,209 @@ bool IsInterfaceEnumerableByIfIndex(NET_IFINDEX if_index) {
   row.dwIndex = if_index;
   return GetIfEntry(&row) == NO_ERROR;
 }
+
+std::string OperStatusToString(IF_OPER_STATUS status) {
+  switch (status) {
+    case IfOperStatusUp:
+      return "up";
+    case IfOperStatusDown:
+      return "down";
+    case IfOperStatusTesting:
+      return "testing";
+    case IfOperStatusUnknown:
+      return "unknown";
+    case IfOperStatusDormant:
+      return "dormant";
+    case IfOperStatusNotPresent:
+      return "not_present";
+    case IfOperStatusLowerLayerDown:
+      return "lower_layer_down";
+    default:
+      return "unknown";
+  }
+}
+
+std::filesystem::path StandaloneMountHelperPath() {
+  const std::filesystem::path current(CurrentModuleDirectory());
+  if (current.empty()) {
+    return {};
+  }
+  const std::filesystem::path preferred = current / L"zt_mount_helper.exe";
+  if (std::filesystem::exists(preferred)) {
+    return preferred;
+  }
+  return current / L"zt_mount_service.exe";
+}
+
+bool WaitForPrivilegedMountPipeReady(DWORD timeout_ms, DWORD* error_code) {
+  if (error_code != nullptr) {
+    *error_code = ERROR_GEN_FAILURE;
+  }
+  const DWORD start = GetTickCount();
+  while (GetTickCount() - start < timeout_ms) {
+    if (WaitNamedPipeW(ztwin::privileged_mount::kPipeName, 250)) {
+      if (error_code != nullptr) {
+        *error_code = NO_ERROR;
+      }
+      return true;
+    }
+    const DWORD wait_error = GetLastError();
+    if (wait_error != ERROR_FILE_NOT_FOUND && wait_error != ERROR_SEM_TIMEOUT &&
+        wait_error != ERROR_PIPE_BUSY) {
+      if (error_code != nullptr) {
+        *error_code = wait_error;
+      }
+      return false;
+    }
+    Sleep(100);
+  }
+  if (error_code != nullptr) {
+    *error_code = ERROR_SEM_TIMEOUT;
+  }
+  return false;
+}
+
+bool EnsurePrivilegedMountConsoleRunning(DWORD* launch_error,
+                                         std::string* launch_detail) {
+  if (launch_error != nullptr) {
+    *launch_error = ERROR_GEN_FAILURE;
+  }
+  if (launch_detail != nullptr) {
+    launch_detail->clear();
+  }
+  const std::filesystem::path helper_path = StandaloneMountHelperPath();
+  if (helper_path.empty() || !std::filesystem::exists(helper_path)) {
+    if (launch_error != nullptr) {
+      *launch_error = ERROR_FILE_NOT_FOUND;
+    }
+    if (launch_detail != nullptr) {
+      *launch_detail = "mount_console_helper_missing";
+    }
+    return false;
+  }
+
+  SHELLEXECUTEINFOW info = {};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  info.lpVerb = L"runas";
+  info.lpFile = helper_path.c_str();
+  info.lpParameters = L"--console";
+  const std::wstring helper_dir = helper_path.parent_path().wstring();
+  info.lpDirectory = helper_dir.c_str();
+  info.nShow = SW_HIDE;
+
+  if (!ShellExecuteExW(&info)) {
+    const DWORD error = GetLastError();
+    if (launch_error != nullptr) {
+      *launch_error = error;
+    }
+    if (launch_detail != nullptr) {
+      std::ostringstream stream;
+      stream << "mount_console_launch_failed error=" << error;
+      *launch_detail = stream.str();
+    }
+    return false;
+  }
+
+  CloseHandle(info.hProcess);
+  DWORD ready_error = NO_ERROR;
+  const bool ready = WaitForPrivilegedMountPipeReady(5000, &ready_error);
+  if (launch_error != nullptr) {
+    *launch_error = ready ? NO_ERROR : ready_error;
+  }
+  if (launch_detail != nullptr) {
+    std::ostringstream stream;
+    stream << "mount_console_started helper=" << helper_path.u8string()
+           << " pipe_ready=" << (ready ? "true" : "false")
+           << " pipe_error=" << ready_error;
+    *launch_detail = stream.str();
+  }
+  return ready;
+}
+
+bool EnsureWintunAdapterViaPrivilegedService(uint32_t* if_index,
+                                             uint64_t* luid,
+                                             DWORD* service_error,
+                                             DWORD* native_error,
+                                             std::string* detail) {
+  if (if_index != nullptr) {
+    *if_index = 0;
+  }
+  if (luid != nullptr) {
+    *luid = 0;
+  }
+  if (service_error != nullptr) {
+    *service_error = ERROR_GEN_FAILURE;
+  }
+  if (native_error != nullptr) {
+    *native_error = NO_ERROR;
+  }
+  if (detail != nullptr) {
+    detail->clear();
+  }
+
+  ztwin::privileged_mount::Request request = {};
+  request.command =
+      static_cast<uint32_t>(ztwin::privileged_mount::Command::kEnsureWintunAdapter);
+  request.request_id =
+      (static_cast<uint64_t>(GetTickCount64()) << 16) ^ 0x57544EULL;
+
+  ztwin::privileged_mount::Response response = {};
+  DWORD transport_error = NO_ERROR;
+  if (!ztwin::privileged_mount::SendRequest(request, &response, 2000,
+                                            &transport_error)) {
+    std::string launch_detail;
+    DWORD launch_error = NO_ERROR;
+    if (!EnsurePrivilegedMountConsoleRunning(&launch_error, &launch_detail) ||
+        !ztwin::privileged_mount::SendRequest(request, &response, 5000,
+                                              &transport_error)) {
+      if (service_error != nullptr) {
+        *service_error = transport_error != NO_ERROR ? transport_error : launch_error;
+      }
+      if (detail != nullptr) {
+        std::ostringstream stream;
+        stream << "service_pipe_unavailable transport_error=" << transport_error;
+        if (!launch_detail.empty()) {
+          stream << " " << launch_detail;
+        }
+        *detail = stream.str();
+      }
+      return false;
+    }
+    if (detail != nullptr && !launch_detail.empty()) {
+      *detail = launch_detail;
+    }
+  }
+
+  if (service_error != nullptr) {
+    *service_error = response.service_error;
+  }
+  if (native_error != nullptr) {
+    *native_error = response.native_error;
+  }
+  if (if_index != nullptr) {
+    *if_index = response.adapter_if_index;
+  }
+  if (luid != nullptr) {
+    *luid = response.adapter_luid;
+  }
+  if (detail != nullptr) {
+    const std::string message(
+        response.message, strnlen_s(response.message, sizeof(response.message)));
+    if (!detail->empty() && !message.empty()) {
+      detail->append(" ");
+    }
+    detail->append(message);
+  }
+
+  const auto result =
+      static_cast<ztwin::privileged_mount::Result>(response.result);
+  return result == ztwin::privileged_mount::Result::kSuccess ||
+         result == ztwin::privileged_mount::Result::kAlreadyExists;
+}
+
+bool IsIpv4InterfaceConfigurable(const NET_LUID& luid, NET_IFINDEX if_index,
+                                 DWORD* native_error);
 
 using WintunAdapterHandle = void*;
 using WintunCreateAdapterFn =
@@ -771,6 +1144,151 @@ bool ZeroTierWindowsWintunTapBackend::IsUsableMountCandidate(
          adapter.driver_kind == "unknown";
 }
 
+struct WintunAdapterResolution {
+  bool found = false;
+  std::string adapter_name;
+  std::string friendly_name;
+  std::string description;
+  NET_IFINDEX if_index = 0;
+  NET_LUID luid = {};
+  std::string oper_status = "unknown";
+  bool is_up = false;
+  bool ipv4_configurable = false;
+  DWORD configurable_error = NO_ERROR;
+};
+
+std::string NormalizeAdapterLabel(std::string value) {
+  value = Normalize(value);
+  value.erase(std::remove_if(value.begin(), value.end(),
+                             [](unsigned char ch) { return std::isspace(ch) != 0; }),
+              value.end());
+  return value;
+}
+
+bool LooksLikeNamedWintunAdapter(const std::string& desired_name,
+                                 const std::string& friendly_name,
+                                 const std::string& description,
+                                 const std::string& adapter_name) {
+  const std::string desired = NormalizeAdapterLabel(desired_name);
+  if (desired.empty()) {
+    return false;
+  }
+  const std::string friendly = NormalizeAdapterLabel(friendly_name);
+  const std::string desc = NormalizeAdapterLabel(description);
+  const std::string adapter = NormalizeAdapterLabel(adapter_name);
+  return friendly == desired || desc.find(desired) != std::string::npos ||
+         adapter.find(desired) != std::string::npos;
+}
+
+bool ResolveWintunAdapterByName(const std::string& desired_name,
+                                WintunAdapterResolution* resolution) {
+  if (resolution == nullptr) {
+    return false;
+  }
+  *resolution = WintunAdapterResolution{};
+
+  ULONG size = 0;
+  if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr,
+                           nullptr, &size) != ERROR_BUFFER_OVERFLOW) {
+    return false;
+  }
+  std::vector<unsigned char> buffer(size);
+  IP_ADAPTER_ADDRESSES* adapters =
+      reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+  if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr,
+                           adapters, &size) != NO_ERROR) {
+    return false;
+  }
+
+  for (const IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr;
+       adapter = adapter->Next) {
+    const std::string friendly_name = WideToUtf8(adapter->FriendlyName);
+    const std::string description = WideToUtf8(adapter->Description);
+    const std::string adapter_name =
+        adapter->AdapterName == nullptr ? "" : adapter->AdapterName;
+    if (!LooksLikeNamedWintunAdapter(desired_name, friendly_name, description,
+                                     adapter_name)) {
+      continue;
+    }
+    resolution->found = true;
+    resolution->adapter_name = adapter_name;
+    resolution->friendly_name = friendly_name;
+    resolution->description = description;
+    resolution->if_index = adapter->IfIndex;
+    resolution->luid = adapter->Luid;
+    resolution->oper_status = OperStatusToString(adapter->OperStatus);
+    resolution->is_up = adapter->OperStatus == IfOperStatusUp;
+    return true;
+  }
+  return false;
+}
+
+bool WaitForStableWintunAdapterByName(const std::string& desired_name,
+                                      int attempts, DWORD sleep_ms,
+                                      WintunAdapterResolution* resolution,
+                                      std::string* detail) {
+  WintunAdapterResolution current;
+  DWORD last_error = ERROR_NOT_FOUND;
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    if (ResolveWintunAdapterByName(desired_name, &current) && current.if_index != 0) {
+      current.ipv4_configurable =
+          IsIpv4InterfaceConfigurable(current.luid, current.if_index, &last_error);
+      current.configurable_error = last_error;
+      if (current.ipv4_configurable && IsInterfaceEnumerableByIfIndex(current.if_index)) {
+        if (resolution != nullptr) {
+          *resolution = current;
+        }
+        if (detail != nullptr) {
+          std::ostringstream stream;
+          stream << "attempt=" << (attempt + 1)
+                 << " if_index=" << current.if_index
+                 << " luid=" << current.luid.Value
+                 << " oper=" << current.oper_status
+                 << " up=" << (current.is_up ? "true" : "false")
+                 << " alias="
+                 << (current.friendly_name.empty() ? "-" : current.friendly_name);
+          *detail = stream.str();
+        }
+        return true;
+      }
+      if (detail != nullptr) {
+        std::ostringstream stream;
+        stream << "attempt=" << (attempt + 1)
+               << " found=true"
+               << " if_index=" << current.if_index
+               << " luid=" << current.luid.Value
+               << " oper=" << current.oper_status
+               << " up=" << (current.is_up ? "true" : "false")
+               << " configurable=" << (current.ipv4_configurable ? "true" : "false")
+               << " cfg_error=" << last_error;
+        *detail = stream.str();
+      }
+    } else if (detail != nullptr) {
+      std::ostringstream stream;
+      stream << "attempt=" << (attempt + 1) << " found=false";
+      *detail = stream.str();
+    }
+    Sleep(sleep_ms);
+  }
+  if (resolution != nullptr) {
+    *resolution = current;
+  }
+  return false;
+}
+
+std::string ZeroTierWindowsWintunTapBackend::DescribeMountCandidateDecision(
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const {
+  if (!adapter.is_mount_candidate) {
+    return "reject:not_mount_candidate";
+  }
+  if (adapter.driver_kind == "wintun" || adapter.driver_kind == "wireguard" ||
+      adapter.driver_kind == "unknown") {
+    return "accept:driver_kind=" + adapter.driver_kind;
+  }
+  return "reject:driver_kind=" + adapter.driver_kind +
+         ";expected=wintun|wireguard|unknown";
+}
+
 int ZeroTierWindowsWintunTapBackend::FallbackScore(
     const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const {
   int score = 0;
@@ -858,23 +1376,88 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
   DWORD helper_exit_code = NO_ERROR;
   bool helper_attempted = false;
   bool helper_succeeded = false;
+  std::string helper_debug_output;
+  uint32_t helper_if_index = 0;
+  uint64_t helper_luid = 0;
+  DWORD helper_native_error = NO_ERROR;
 
   if (handle == nullptr &&
       (open_error == ERROR_ACCESS_DENIED || create_error == ERROR_ACCESS_DENIED) &&
       !IsProcessElevated() && IsPrivilegedWintunBootstrapEnabled()) {
     helper_attempted = true;
-    helper_succeeded = TryBootstrapWintunAdapterViaElevatedPowerShell(
-        api->loaded_from.empty() ? L"wintun.dll" : api->loaded_from, kAdapterName,
-        kTunnelType, kAdapterGuid, &helper_exit_code);
+    helper_succeeded = EnsureWintunAdapterViaPrivilegedService(
+        &helper_if_index, &helper_luid, &helper_exit_code, &helper_native_error,
+        &helper_debug_output);
     if (helper_succeeded) {
-      handle = api->open_adapter(kAdapterName);
-      open_error = handle == nullptr ? GetLastError() : NO_ERROR;
-      if (handle == nullptr) {
-        handle = api->create_adapter(kAdapterName, kTunnelType, &kAdapterGuid);
-        created = handle != nullptr;
-        create_error = created || handle != nullptr ? NO_ERROR : GetLastError();
+      WintunAdapterResolution resolved;
+      std::string resolve_detail;
+      bool stable = false;
+      if (helper_if_index != 0 && helper_luid != 0) {
+        resolved.if_index = helper_if_index;
+        resolved.luid.Value = helper_luid;
+        stable = IsInterfaceEnumerableByIfIndex(helper_if_index);
+        std::ostringstream helper_detail;
+        helper_detail << "service_if_index=" << helper_if_index
+                      << " service_luid=" << helper_luid
+                      << " enumerable=" << (stable ? "true" : "false");
+        resolve_detail = helper_detail.str();
+      }
+      if (!stable) {
+        stable = WaitForStableWintunAdapterByName("FileTransferFlutter", 24, 250,
+                                                  &resolved, &resolve_detail);
+      }
+      WintunRegistryProbe registry_probe;
+      ProbeWintunRegistryState("FileTransferFlutter", &registry_probe);
+      install_state_ = stable ? InstallState::kInstalled : InstallState::kInstalling;
+      consecutive_failures_ = stable ? 0 : consecutive_failures_;
+      next_bootstrap_tick_ms_ = stable ? 0 : (now + 2000);
+      if (action_summary != nullptr) {
+        std::ostringstream stream;
+        stream << "wintun bootstrap service created_or_opened adapter;"
+               << " awaiting_enumeration=" << (stable ? "false" : "true")
+               << " helper_exit_code=" << helper_exit_code
+               << " helper_native_error=" << helper_native_error;
+        if (stable) {
+          stream << " resolved_if_index=" << resolved.if_index
+                 << " resolved_luid=" << resolved.luid.Value
+                 << " resolved_oper=" << resolved.oper_status;
+        }
+        if (!resolve_detail.empty()) {
+          stream << " resolve_detail=" << resolve_detail;
+        }
+        stream << " " << DescribeWintunRegistryProbe(registry_probe);
+        if (!helper_debug_output.empty()) {
+          stream << " helper_debug=" << helper_debug_output;
+        }
+        *action_summary = stream.str();
+      }
+      return stable;
+    }
+  }
+
+  if (action_summary != nullptr && action_summary->empty()) {
+    std::ostringstream stream;
+    stream << "wintun bootstrap probe"
+           << " load_from="
+           << (api->loaded_from.empty() ? "wintun.dll"
+                                        : WideToUtf8(api->loaded_from))
+           << " open_error=" << open_error
+           << " create_error=" << create_error
+           << " process_elevated=" << (IsProcessElevated() ? "true" : "false")
+           << " helper_enabled="
+           << (IsPrivilegedWintunBootstrapEnabled() ? "true" : "false")
+           << " helper_attempted=" << (helper_attempted ? "true" : "false")
+           << " helper_succeeded=" << (helper_succeeded ? "true" : "false");
+    if (helper_attempted) {
+      stream << " helper_exit_code=" << helper_exit_code;
+      if (helper_exit_code == 102) {
+        stream << " helper_reason=transient_create_process_cannot_persist_wintun";
+      }
+      if (!helper_debug_output.empty()) {
+        stream << " helper_debug=" << helper_debug_output;
       }
     }
+    *action_summary = stream.str();
   }
 
   if (handle == nullptr) {
@@ -898,6 +1481,12 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
              << " helper_succeeded=" << (helper_succeeded ? "true" : "false");
       if (helper_attempted) {
         stream << " helper_exit_code=" << helper_exit_code;
+        if (helper_exit_code == 102) {
+          stream << " helper_reason=transient_create_process_cannot_persist_wintun";
+        }
+        if (!helper_debug_output.empty()) {
+          stream << " helper_debug=" << helper_debug_output;
+        }
       }
       stream << " last_error=" << GetLastError()
              << " state=" << InstallStateLabel();
@@ -933,6 +1522,17 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
   DWORD configurable_error = ERROR_NOT_FOUND;
   const bool configurable = WaitForIpv4InterfaceConfigurable(
       luid, if_index, 30, 250, &configurable_error);
+  WintunAdapterResolution resolved;
+  std::string resolve_detail;
+  const bool resolved_stable = WaitForStableWintunAdapterByName(
+      "FileTransferFlutter", 12, 250, &resolved, &resolve_detail);
+  WintunRegistryProbe registry_probe;
+  ProbeWintunRegistryState("FileTransferFlutter", &registry_probe);
+  if (resolved_stable) {
+    if_index = resolved.if_index;
+    luid = resolved.luid;
+    enumerated = true;
+  }
   if (!enumerated) {
     ++consecutive_failures_;
     install_state_ = InstallState::kRepairNeeded;
@@ -941,6 +1541,8 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
       std::ostringstream stream;
       stream << "wintun adapter created but not enumerable"
              << " if_index=" << if_index
+             << " resolve_detail=" << (resolve_detail.empty() ? "-" : resolve_detail)
+             << " " << DescribeWintunRegistryProbe(registry_probe)
              << " state=" << InstallStateLabel();
       *action_summary = stream.str();
     }
@@ -956,6 +1558,8 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
              << " if_index=" << if_index
              << " luid=" << luid.Value
              << " native_error=" << configurable_error
+             << " resolve_detail=" << (resolve_detail.empty() ? "-" : resolve_detail)
+             << " " << DescribeWintunRegistryProbe(registry_probe)
              << " state=" << InstallStateLabel();
       *action_summary = stream.str();
     }
@@ -974,8 +1578,16 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
     *action_summary = (created ? "wintun adapter created" : "wintun adapter opened");
     action_summary->append(" if_index=");
     action_summary->append(std::to_string(if_index));
+    action_summary->append(" luid=");
+    action_summary->append(std::to_string(luid.Value));
     action_summary->append(" via ");
     action_summary->append(loaded_from);
+    if (!resolve_detail.empty()) {
+      action_summary->append(" resolve_detail=");
+      action_summary->append(resolve_detail);
+    }
+    action_summary->push_back(' ');
+    action_summary->append(DescribeWintunRegistryProbe(registry_probe));
     action_summary->append(" state=");
     action_summary->append(InstallStateLabel());
   }
@@ -996,6 +1608,22 @@ bool ZeroTierWindowsZtTapBackend::IsUsableMountCandidate(
          adapter.driver_kind == "wintun" ||
          adapter.driver_kind == "wireguard" ||
          adapter.driver_kind == "unknown";
+}
+
+std::string ZeroTierWindowsZtTapBackend::DescribeMountCandidateDecision(
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const {
+  if (!adapter.is_mount_candidate) {
+    return "reject:not_mount_candidate";
+  }
+  if (adapter.driver_kind == "zerotier" ||
+      adapter.driver_kind == "tap-windows" ||
+      adapter.driver_kind == "wintun" ||
+      adapter.driver_kind == "wireguard" ||
+      adapter.driver_kind == "unknown") {
+    return "accept:driver_kind=" + adapter.driver_kind;
+  }
+  return "reject:driver_kind=" + adapter.driver_kind +
+         ";expected=zerotier|tap-windows|wintun|wireguard|unknown";
 }
 
 int ZeroTierWindowsZtTapBackend::FallbackScore(
@@ -1039,6 +1667,14 @@ std::string ZeroTierWindowsAutoTapBackend::BackendId() const {
 bool ZeroTierWindowsAutoTapBackend::IsUsableMountCandidate(
     const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const {
   return adapter.is_mount_candidate;
+}
+
+std::string ZeroTierWindowsAutoTapBackend::DescribeMountCandidateDecision(
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const {
+  if (!adapter.is_mount_candidate) {
+    return "reject:not_mount_candidate";
+  }
+  return "accept:auto_backend_mount_candidate";
 }
 
 int ZeroTierWindowsAutoTapBackend::FallbackScore(

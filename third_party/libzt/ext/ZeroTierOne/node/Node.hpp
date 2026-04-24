@@ -232,6 +232,25 @@ public:
 		return false;
 	}
 
+#ifdef __WINDOWS__
+	inline void expectingReplyDebug(const uint64_t packetId,uint32_t &pid2,unsigned long &bucket,uint8_t &bucketPtr,unsigned int &nonZeroEntries,unsigned int &matchingEntries) const
+	{
+		pid2 = (uint32_t)(packetId >> 32);
+		bucket = (unsigned long)(pid2 & ZT_EXPECTING_REPLIES_BUCKET_MASK1);
+		bucketPtr = _expectingRepliesToBucketPtr[bucket];
+		nonZeroEntries = 0;
+		matchingEntries = 0;
+		for(unsigned long i=0;i<=ZT_EXPECTING_REPLIES_BUCKET_MASK2;++i) {
+			if (_expectingRepliesTo[bucket][i] != 0) {
+				++nonZeroEntries;
+			}
+			if (_expectingRepliesTo[bucket][i] == pid2) {
+				++matchingEntries;
+			}
+		}
+	}
+#endif
+
 	/**
 	 * Check whether we should do potentially expensive identity verification (rate limit)
 	 *

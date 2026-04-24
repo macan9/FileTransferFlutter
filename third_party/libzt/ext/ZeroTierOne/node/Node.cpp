@@ -204,6 +204,20 @@ ZT_ResultCode Node::processWirePacket(
 	volatile int64_t *nextBackgroundTaskDeadline)
 {
 	_now = now;
+#if defined(_WIN32) || defined(_WIN64)
+	{
+		const InetAddress remote(*reinterpret_cast<const InetAddress *>(remoteAddress));
+		if (remote.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+			char frombuf[64];
+			fprintf(stderr,
+				"[ZT/CORE] process_wire_packet local_socket=%lld from=%s len=%u now=%lld\n",
+				(long long)localSocket,
+				remote.toString(frombuf),
+				packetLength,
+				(long long)now);
+		}
+	}
+#endif
 	RR->sw->onRemotePacket(tptr,localSocket,*(reinterpret_cast<const InetAddress *>(remoteAddress)),packetData,packetLength);
 	return ZT_RESULT_OK;
 }
@@ -256,15 +270,13 @@ public:
 			// Unless we don't any have paths to the roots, then we shouldn't wait a long time to contact them
 			bool hasPaths = p->paths(RR->node->now()).size() > 0;
 			roleBasedTimerScale = (role != ZT_PEER_ROLE_LEAF && !hasPaths) ? 0 : roleBasedTimerScale;
-
-			if ((RR->node->now() - p->lastSentFullHello()) <= (ZT_PATH_HEARTBEAT_PERIOD * roleBasedTimerScale)) {
-				return;
-			}
+			const bool allowDirectHello =
+				((RR->node->now() - p->lastSentFullHello()) > (ZT_PATH_HEARTBEAT_PERIOD * roleBasedTimerScale));
 
 			const unsigned int sent = p->doPingAndKeepalive(_tPtr,_now);
 			bool contacted = (sent != 0);
 
-			if ((sent & 0x1) == 0) { // bit 0x1 == IPv4 sent
+			if (allowDirectHello && ((sent & 0x1) == 0)) { // bit 0x1 == IPv4 sent
 				for(unsigned long k=0,ptr=(unsigned long)RR->node->prng();k<(unsigned long)alwaysContactEndpoints->size();++k) {
 					const InetAddress &addr = (*alwaysContactEndpoints)[ptr++ % alwaysContactEndpoints->size()];
 					if (addr.ss_family == AF_INET) {
@@ -275,7 +287,7 @@ public:
 				}
 			}
 
-			if ((sent & 0x2) == 0) { // bit 0x2 == IPv6 sent
+			if (allowDirectHello && ((sent & 0x2) == 0)) { // bit 0x2 == IPv6 sent
 				for(unsigned long k=0,ptr=(unsigned long)RR->node->prng();k<(unsigned long)alwaysContactEndpoints->size();++k) {
 					const InetAddress &addr = (*alwaysContactEndpoints)[ptr++ % alwaysContactEndpoints->size()];
 					if (addr.ss_family == AF_INET6) {
@@ -286,7 +298,7 @@ public:
 				}
 			}
 
-			if ((!contacted)&&(_bestCurrentUpstream)) {
+			if (allowDirectHello && (!contacted) && (_bestCurrentUpstream)) {
 				const SharedPtr<Path> up(_bestCurrentUpstream->getAppropriatePath(_now,true));
 				if (up) {
 					p->sendHELLO(_tPtr,up->localSocket(),up->address(),_now);
@@ -354,6 +366,43 @@ ZT_ResultCode Node::processBackgroundTasks(void *tptr,int64_t now,volatile int64
 					}
 				}
 			}
+			fprintf(stderr,
+				"[ZT/CORE] upstream_health now=%lld last_received_from_upstream=%lld upstream_rx_age=%lld timeout=%d am_upstream=%d upstream_count=%u\n",
+				(long long)now,
+				(long long)lastReceivedFromUpstream,
+				(long long)(now - lastReceivedFromUpstream),
+				(int)ZT_PEER_ACTIVITY_TIMEOUT,
+				RR->topology->amUpstream() ? 1 : 0,
+				(unsigned int)alwaysContact.size());
+			{
+				Hashtable< Address,std::vector<InetAddress> >::Iterator i(alwaysContact);
+				Address *upstreamAddress = (Address *)0;
+				std::vector<InetAddress> *upstreamStableEndpoints = (std::vector<InetAddress> *)0;
+				char peer_addr_buf[64];
+				while (i.next(upstreamAddress,upstreamStableEndpoints)) {
+					const SharedPtr<Peer> p(RR->topology->getPeerNoCache(*upstreamAddress));
+					fprintf(stderr,
+						"[ZT/CORE] upstream_peer peer=%s has_peer=%d last_receive=%lld last_receive_age=%lld stable_endpoint_count=%u\n",
+						upstreamAddress->toString(peer_addr_buf),
+						p ? 1 : 0,
+						(long long)(p ? p->lastReceive() : 0),
+						(long long)(p ? (now - p->lastReceive()) : -1),
+						(unsigned int)(upstreamStableEndpoints ? upstreamStableEndpoints->size() : 0));
+					if (upstreamStableEndpoints) {
+						for (std::vector<InetAddress>::const_iterator se(upstreamStableEndpoints->begin());
+							 se != upstreamStableEndpoints->end();
+							 ++se) {
+							char endpoint_ip_buf[64];
+							fprintf(stderr,
+								"[ZT/CORE] upstream_peer_endpoint peer=%s endpoint=%s port=%u\n",
+								upstreamAddress->toString(peer_addr_buf),
+								se->toIpString(endpoint_ip_buf),
+								(unsigned int)se->port());
+						}
+					}
+				}
+			}
+			fflush(stderr);
 
 			// Clean up any old local controller auth memorizations.
 			{
@@ -412,6 +461,34 @@ ZT_ResultCode Node::processBackgroundTasks(void *tptr,int64_t now,volatile int64
 			const bool oldOnline = _online;
 			_online = (((now - lastReceivedFromUpstream) < ZT_PEER_ACTIVITY_TIMEOUT)||(RR->topology->amUpstream()));
 			if (oldOnline != _online) {
+				fprintf(stderr,
+					"[ZT/CORE] online_state_change now=%lld old_online=%d new_online=%d last_received_from_upstream=%lld upstream_rx_age=%lld timeout=%d am_upstream=%d upstream_count=%u\n",
+					(long long)now,
+					oldOnline ? 1 : 0,
+					_online ? 1 : 0,
+					(long long)lastReceivedFromUpstream,
+					(long long)(now - lastReceivedFromUpstream),
+					(int)ZT_PEER_ACTIVITY_TIMEOUT,
+					RR->topology->amUpstream() ? 1 : 0,
+					(unsigned int)alwaysContact.size());
+				{
+					Hashtable< Address,std::vector<InetAddress> >::Iterator i(alwaysContact);
+					Address *upstreamAddress = (Address *)0;
+					std::vector<InetAddress> *upstreamStableEndpoints = (std::vector<InetAddress> *)0;
+					char peer_addr_buf[64];
+					while (i.next(upstreamAddress,upstreamStableEndpoints)) {
+						peer_addr_buf[0] = '\0';
+						const SharedPtr<Peer> p(RR->topology->getPeerNoCache(*upstreamAddress));
+						fprintf(stderr,
+							"[ZT/CORE] upstream_peer peer=%s has_peer=%d last_receive=%lld last_receive_age=%lld stable_endpoint_count=%u\n",
+							upstreamAddress->toString(peer_addr_buf),
+							p ? 1 : 0,
+							(long long)(p ? p->lastReceive() : 0),
+							(long long)(p ? (now - p->lastReceive()) : -1),
+							(unsigned int)(upstreamStableEndpoints ? upstreamStableEndpoints->size() : 0));
+					}
+				}
+				fflush(stderr);
 				postEvent(tptr,_online ? ZT_EVENT_ONLINE : ZT_EVENT_OFFLINE);
 			}
 		} catch ( ... ) {

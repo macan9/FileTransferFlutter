@@ -44,6 +44,8 @@ namespace ZeroTier {
 bool IncomingPacket::tryDecode(const RuntimeEnvironment *RR,void *tPtr,int32_t flowId)
 {
 	const Address sourceAddress(source());
+	char sourceAddrBuf[11];
+	char remotePathBuf[64];
 
 	try {
 		// Check for trusted paths or unencrypted HELLOs (HELLO is the only packet sent in the clear)
@@ -68,6 +70,20 @@ bool IncomingPacket::tryDecode(const RuntimeEnvironment *RR,void *tPtr,int32_t f
 		if (peer) {
 			if (!_authenticated) {
 				if (!dearmor(peer->key(), peer->aesKeys())) {
+#ifdef __WINDOWS__
+					if (_path->address().ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+						fprintf(stderr,
+							"[ZT/CORE] incoming_decode_drop reason=invalid_mac source=%s remote=%s local_socket=%lld packet_id=%llu verb=%u size=%u hops=%u\n",
+							sourceAddress.toString(sourceAddrBuf),
+							_path->address().toString(remotePathBuf),
+							(long long)_path->localSocket(),
+							(unsigned long long)packetId(),
+							(unsigned int)verb(),
+							(unsigned int)size(),
+							(unsigned int)hops());
+						fflush(stderr);
+					}
+#endif
 					RR->t->incomingPacketMessageAuthenticationFailure(tPtr,_path,packetId(),sourceAddress,hops(),"invalid MAC");
 					peer->recordIncomingInvalidPacket(_path);
 					return true;
@@ -81,81 +97,163 @@ bool IncomingPacket::tryDecode(const RuntimeEnvironment *RR,void *tPtr,int32_t f
 
 			_authenticated = true;
 			const Packet::Verb v = verb();
+			const bool upstreamPeer = RR->topology->isUpstream(peer->identity());
+#ifdef __WINDOWS__
+			const bool globalScope = (_path->address().ipScope() == InetAddress::IP_SCOPE_GLOBAL);
+			char peerAddrBuf[11];
+#define ZT_LOG_INCOMING_BRANCH(_handlerName,_willRefreshLastReceive) \
+			do { \
+				if (globalScope) { \
+					fprintf(stderr, \
+						"[ZT/CORE] incoming_decode_branch source=%s peer=%s remote=%s local_socket=%lld packet_id=%llu verb=%u handler=%s upstream=%d will_refresh_last_receive=%d flow_id=%d hops=%u size=%u payload_len=%u authenticated=%d trust_path=%d\n", \
+						sourceAddress.toString(sourceAddrBuf), \
+						peer->address().toString(peerAddrBuf), \
+						_path->address().toString(remotePathBuf), \
+						(long long)_path->localSocket(), \
+						(unsigned long long)packetId(), \
+						(unsigned int)v, \
+						_handlerName, \
+						upstreamPeer ? 1 : 0, \
+						(_willRefreshLastReceive) ? 1 : 0, \
+						(int)flowId, \
+						(unsigned int)hops(), \
+						(unsigned int)size(), \
+						(unsigned int)payloadLength(), \
+						_authenticated ? 1 : 0, \
+						_path->trustEstablished(RR->node->now()) ? 1 : 0); \
+					fflush(stderr); \
+				} \
+			} while (0)
+#else
+#define ZT_LOG_INCOMING_BRANCH(_handlerName,_willRefreshLastReceive) do {} while (0)
+#endif
 
 			bool r = true;
 			switch(v) {
 				//case Packet::VERB_NOP:
 				default: // ignore unknown verbs, but if they pass auth check they are "received"
+					ZT_LOG_INCOMING_BRANCH("default",true);
 					Metrics::pkt_nop_in++;
 					peer->received(tPtr,_path,hops(),packetId(),payloadLength(),v,0,Packet::VERB_NOP,false,0,ZT_QOS_NO_FLOW);
 					break;
 				case Packet::VERB_HELLO:
+					ZT_LOG_INCOMING_BRANCH("HELLO",true);
 					r = _doHELLO(RR, tPtr, true);
 					break;
 				case Packet::VERB_ACK:
+					ZT_LOG_INCOMING_BRANCH("ACK",false);
 					r = _doACK(RR, tPtr, peer);
 					break;
 				case Packet::VERB_QOS_MEASUREMENT:
+					ZT_LOG_INCOMING_BRANCH("QOS_MEASUREMENT",false);
 					r = _doQOS_MEASUREMENT(RR, tPtr, peer);
 					break;
 				case Packet::VERB_ERROR:
+					ZT_LOG_INCOMING_BRANCH("ERROR",true);
 					r = _doERROR(RR, tPtr, peer);
 					break;
 				case Packet::VERB_OK:
+					ZT_LOG_INCOMING_BRANCH("OK",true);
 					r = _doOK(RR, tPtr, peer);
 					break;
 				case Packet::VERB_WHOIS:
+					ZT_LOG_INCOMING_BRANCH("WHOIS",true);
 					r = _doWHOIS(RR, tPtr, peer);
 					break;
 				case Packet::VERB_RENDEZVOUS:
+					ZT_LOG_INCOMING_BRANCH("RENDEZVOUS",true);
 					r = _doRENDEZVOUS(RR, tPtr, peer);
 					break;
 				case Packet::VERB_FRAME:
+					ZT_LOG_INCOMING_BRANCH("FRAME",true);
 					r = _doFRAME(RR, tPtr, peer, flowId);
 					break;
 				case Packet::VERB_EXT_FRAME:
+					ZT_LOG_INCOMING_BRANCH("EXT_FRAME",true);
 					r = _doEXT_FRAME(RR, tPtr, peer, flowId);
 					break;
 				case Packet::VERB_ECHO:
+					ZT_LOG_INCOMING_BRANCH("ECHO",true);
 					r = _doECHO(RR, tPtr, peer);
 					break;
 				case Packet::VERB_MULTICAST_LIKE:
+					ZT_LOG_INCOMING_BRANCH("MULTICAST_LIKE",true);
 					r = _doMULTICAST_LIKE(RR, tPtr, peer);
 					break;
 				case Packet::VERB_NETWORK_CREDENTIALS:
+					ZT_LOG_INCOMING_BRANCH("NETWORK_CREDENTIALS",true);
 					r = _doNETWORK_CREDENTIALS(RR, tPtr, peer);
 					break;
 				case Packet::VERB_NETWORK_CONFIG_REQUEST:
+					ZT_LOG_INCOMING_BRANCH("NETWORK_CONFIG_REQUEST",true);
 					r = _doNETWORK_CONFIG_REQUEST(RR, tPtr, peer);
 					break;
 				case Packet::VERB_NETWORK_CONFIG:
+					ZT_LOG_INCOMING_BRANCH("NETWORK_CONFIG",true);
 					r = _doNETWORK_CONFIG(RR, tPtr, peer);
 					break;
 				case Packet::VERB_MULTICAST_GATHER:
+					ZT_LOG_INCOMING_BRANCH("MULTICAST_GATHER",true);
 					r = _doMULTICAST_GATHER(RR, tPtr, peer);
 					break;
 				case Packet::VERB_MULTICAST_FRAME:
+					ZT_LOG_INCOMING_BRANCH("MULTICAST_FRAME",true);
 					r = _doMULTICAST_FRAME(RR, tPtr, peer);
 					break;
 				case Packet::VERB_PUSH_DIRECT_PATHS:
+					ZT_LOG_INCOMING_BRANCH("PUSH_DIRECT_PATHS",true);
 					r = _doPUSH_DIRECT_PATHS(RR, tPtr, peer);
 					break;
 				case Packet::VERB_USER_MESSAGE:
+					ZT_LOG_INCOMING_BRANCH("USER_MESSAGE",true);
 					r = _doUSER_MESSAGE(RR, tPtr, peer);
 					break;
 				case Packet::VERB_REMOTE_TRACE:
+					ZT_LOG_INCOMING_BRANCH("REMOTE_TRACE",true);
 					r = _doREMOTE_TRACE(RR, tPtr, peer);
 					break;
 				case Packet::VERB_PATH_NEGOTIATION_REQUEST:
+					ZT_LOG_INCOMING_BRANCH("PATH_NEGOTIATION_REQUEST",false);
 					r = _doPATH_NEGOTIATION_REQUEST(RR, tPtr, peer);
 					break;
 			}
 			if (r) {
 				RR->node->statsLogVerb((unsigned int)v,(unsigned int)size());
+#undef ZT_LOG_INCOMING_BRANCH
 				return true;
 			}
+#ifdef __WINDOWS__
+			if (_path->address().ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+				fprintf(stderr,
+					"[ZT/CORE] incoming_decode_rejected reason=handler_false source=%s remote=%s local_socket=%lld packet_id=%llu verb=%u size=%u hops=%u peer=%s\n",
+					sourceAddress.toString(sourceAddrBuf),
+					_path->address().toString(remotePathBuf),
+					(long long)_path->localSocket(),
+					(unsigned long long)packetId(),
+					(unsigned int)v,
+					(unsigned int)size(),
+					(unsigned int)hops(),
+					peer->address().toString(peerAddrBuf));
+				fflush(stderr);
+			}
+#endif
+#undef ZT_LOG_INCOMING_BRANCH
 			return false;
 		} else {
+#ifdef __WINDOWS__
+			if (_path->address().ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+				fprintf(stderr,
+					"[ZT/CORE] incoming_decode_drop reason=peer_not_found source=%s remote=%s local_socket=%lld packet_id=%llu verb=%u size=%u hops=%u\n",
+					sourceAddress.toString(sourceAddrBuf),
+					_path->address().toString(remotePathBuf),
+					(long long)_path->localSocket(),
+					(unsigned long long)packetId(),
+					(unsigned int)verb(),
+					(unsigned int)size(),
+					(unsigned int)hops());
+				fflush(stderr);
+			}
+#endif
 			RR->sw->requestWhois(tPtr,RR->node->now(),sourceAddress);
 			return false;
 		}
@@ -581,6 +679,36 @@ bool IncomingPacket::_doOK(const RuntimeEnvironment *RR,void *tPtr,const SharedP
 	uint64_t networkId = 0;
 
 	if (!RR->node->expectingReplyTo(inRePacketId)) {
+#ifdef __WINDOWS__
+		if (_path->address().ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+			uint32_t pid2 = 0;
+			unsigned long bucket = 0;
+			uint8_t bucketPtr = 0;
+			unsigned int nonZeroEntries = 0;
+			unsigned int matchingEntries = 0;
+			RR->node->expectingReplyDebug(inRePacketId,pid2,bucket,bucketPtr,nonZeroEntries,matchingEntries);
+			char sourceAddrBuf[11];
+			char remotePathBuf[64];
+			fprintf(stderr,
+				"[ZT/CORE] incoming_ok_drop reason=unexpected_reply source=%s remote=%s local_socket=%lld packet_id=%llu in_re_packet_id=%llu in_re_pid2=0x%08x in_re_bucket=%lu in_re_bucket_ptr=%u in_re_bucket_nonzero=%u in_re_bucket_matches=%u verb=%u in_re_verb=%u size=%u hops=%u peer=%s\n",
+				source().toString(sourceAddrBuf),
+				_path->address().toString(remotePathBuf),
+				(long long)_path->localSocket(),
+				(unsigned long long)packetId(),
+				(unsigned long long)inRePacketId,
+				(unsigned int)pid2,
+				bucket,
+				(unsigned int)bucketPtr,
+				nonZeroEntries,
+				matchingEntries,
+				(unsigned int)verb(),
+				(unsigned int)inReVerb,
+				(unsigned int)size(),
+				(unsigned int)hops(),
+				peer->address().toString(sourceAddrBuf));
+			fflush(stderr);
+		}
+#endif
 		return true;
 	}
 

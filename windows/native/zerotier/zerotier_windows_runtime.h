@@ -129,6 +129,8 @@ class ZeroTierWindowsRuntime {
   void SetLastNodeControlHintLocked(const std::string& hint);
   std::string DescribeNodeTriggerLocked(const std::string& event_name) const;
   std::string SummarizeTrackedNetworksLocked() const;
+  std::string BuildTransportDiagnosticsSummaryLocked() const;
+  std::string BuildRecentPeerDiagnosticsLocked() const;
   std::string BuildLiveNetworkProbeSummary(uint64_t network_id) const;
   std::string BuildServiceState() const;
   void SetLastErrorLocked(const std::string& message);
@@ -184,6 +186,7 @@ class ZeroTierWindowsRuntime {
   std::map<uint64_t, std::vector<MountedSystemRoute>> confirmed_system_routes_;
   std::map<uint64_t, uint64_t> network_generations_;
   std::map<uint64_t, uint64_t> pending_leave_generations_;
+  std::set<uint64_t> observed_peer_ids_;
   EventCallback event_callback_;
   std::string last_error_;
   std::string storage_path_;

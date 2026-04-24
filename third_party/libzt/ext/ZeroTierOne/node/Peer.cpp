@@ -86,6 +86,8 @@ void Peer::received(
 	const int32_t flowId)
 {
 	const int64_t now = RR->node->now();
+	const bool upstreamPeer = RR->topology->isUpstream(identity());
+	const int64_t previousLastReceive = _lastReceive;
 
 	_lastReceive = now;
 	switch (verb) {
@@ -103,6 +105,28 @@ void Peer::received(
 	_incoming_packet++;
 #endif
 	recordIncomingPacket(path, packetId, payloadLength, verb, flowId, now);
+
+#ifdef __WINDOWS__
+	if (upstreamPeer) {
+		char peerBuf[11];
+		char pathBuf[64];
+		fprintf(stderr,
+			"[ZT/CORE] upstream_peer_received peer=%s verb=%u hops=%u trust=%d network=%llu flow=%d local_socket=%lld remote=%s packet_id=%llu payload_len=%u last_receive_before=%lld last_receive_after=%lld\n",
+			address().toString(peerBuf),
+			(unsigned int)verb,
+			hops,
+			(int)trustEstablished,
+			(unsigned long long)networkId,
+			(int)flowId,
+			(long long)path->localSocket(),
+			path->address().toString(pathBuf),
+			(unsigned long long)packetId,
+			payloadLength,
+			(long long)previousLastReceive,
+			(long long)_lastReceive);
+		fflush(stderr);
+	}
+#endif
 
 	if (trustEstablished) {
 		_lastTrustEstablishedPacketReceived = now;

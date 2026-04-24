@@ -2661,6 +2661,16 @@ public:
 	// Handlers for Node and Phy<> callbacks
 	// =========================================================================
 
+	inline const char *diagSockaddrToString(const struct sockaddr *addr,char buf[64])
+	{
+		if (!addr) {
+			Utils::scopy(buf,64,"null");
+			return buf;
+		}
+		InetAddress tmp(addr);
+		return tmp.toString(buf);
+	}
+
 	inline void phyOnDatagram(PhySocket *sock,void **uptr,const struct sockaddr *localAddr,const struct sockaddr *from,void *data,unsigned long len)
 	{
 		if (_forceTcpRelay) {
@@ -2670,7 +2680,21 @@ public:
 		const uint64_t now = OSUtils::now();
 		if ((len >= 16)&&(reinterpret_cast<const InetAddress *>(from)->ipScope() == InetAddress::IP_SCOPE_GLOBAL)) {
 			_lastDirectReceiveFromGlobal = now;
-        }
+		}
+#ifdef __WINDOWS__
+		if (reinterpret_cast<const InetAddress *>(from)->ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
+			char local_buf[64];
+			char from_buf[64];
+			fprintf(stderr,
+				"[ZT/PHY] udp_recv_hit local=%s from=%s len=%lu phy_socket=%lld force_tcp_relay=%d direct_global=%d\n",
+				diagSockaddrToString(localAddr,local_buf),
+				diagSockaddrToString(from,from_buf),
+				len,
+				(long long)reinterpret_cast<int64_t>(sock),
+				(int)_forceTcpRelay,
+				1);
+		}
+#endif
 		const ZT_ResultCode rc = _node->processWirePacket(nullptr,now,reinterpret_cast<int64_t>(sock),reinterpret_cast<const struct sockaddr_storage *>(from),data,len,&_nextBackgroundTaskDeadline);
 		if (ZT_ResultCode_isFatal(rc)) {
 			char tmp[256];

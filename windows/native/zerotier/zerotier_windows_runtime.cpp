@@ -69,6 +69,28 @@ std::string Iso8601NowUtc() {
   return stream.str();
 }
 
+std::string FormatNetworkIdHex(uint64_t network_id) {
+  std::ostringstream stream;
+  stream << std::hex << std::nouppercase << network_id;
+  return stream.str();
+}
+
+std::filesystem::path CurrentExecutablePath() {
+  std::wstring buffer(MAX_PATH, L'\0');
+  while (true) {
+    const DWORD length =
+        GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0) {
+      return {};
+    }
+    if (length < buffer.size() - 1) {
+      buffer.resize(length);
+      return std::filesystem::path(buffer);
+    }
+    buffer.resize(buffer.size() * 2);
+  }
+}
+
 std::string NetworkStatusToString(int status) {
   switch (status) {
     case ZTS_NETWORK_STATUS_REQUESTING_CONFIGURATION:
@@ -88,6 +110,8 @@ std::string NetworkStatusToString(int status) {
   }
 }
 
+std::string BoolLabel(bool value);
+
 std::string ExtractAddress(const zts_sockaddr_storage& address) {
   char buffer[ZTS_IP_MAX_STR_LEN] = {0};
   const zts_sockaddr* sockaddr =
@@ -106,6 +130,36 @@ std::string ExtractAddress(const zts_sockaddr_storage& address) {
     return buffer;
   }
   return "";
+}
+
+std::string PeerRoleToString(zts_peer_role_t role) {
+  switch (role) {
+    case ZTS_PEER_ROLE_LEAF:
+      return "leaf";
+    case ZTS_PEER_ROLE_MOON:
+      return "moon";
+    case ZTS_PEER_ROLE_PLANET:
+      return "planet";
+    default:
+      return "unknown";
+  }
+}
+
+std::string PeerSummary(const zts_peer_info_t* peer) {
+  if (peer == nullptr) {
+    return "peer=null";
+  }
+  std::ostringstream stream;
+  stream << "peer_id=" << FormatNetworkIdHex(peer->peer_id)
+         << " role=" << PeerRoleToString(peer->role)
+         << " latency_ms=" << peer->latency
+         << " version=" << peer->ver_major << "."
+         << peer->ver_minor << "." << peer->ver_rev
+         << " path_count=" << peer->path_count;
+  if (peer->path_count > 0) {
+    stream << " paths=omitted_live_event";
+  }
+  return stream.str();
 }
 
 bool ShouldSuppressNetworkDownError(
@@ -282,6 +336,61 @@ std::string JoinAddresses(const std::vector<std::string>& addresses) {
 
 std::string BoolLabel(bool value) {
   return value ? "true" : "false";
+}
+
+std::string SummarizeUdpEndpointsForPid(DWORD pid, int expected_port) {
+  ULONG table_size = 0;
+  DWORD result = GetExtendedUdpTable(nullptr, &table_size, TRUE, AF_INET,
+                                     UDP_TABLE_OWNER_PID, 0);
+  if (result != ERROR_INSUFFICIENT_BUFFER || table_size == 0) {
+    std::ostringstream stream;
+    stream << "udp_table_error=" << result;
+    return stream.str();
+  }
+
+  std::vector<unsigned char> buffer(table_size);
+  auto* table =
+      reinterpret_cast<MIB_UDPTABLE_OWNER_PID*>(buffer.data());
+  result = GetExtendedUdpTable(table, &table_size, TRUE, AF_INET,
+                               UDP_TABLE_OWNER_PID, 0);
+  if (result != NO_ERROR) {
+    std::ostringstream stream;
+    stream << "udp_table_error=" << result;
+    return stream.str();
+  }
+
+  std::vector<std::string> entries;
+  bool matched_expected_port = false;
+  for (DWORD index = 0; index < table->dwNumEntries; ++index) {
+    const auto& row = table->table[index];
+    if (row.dwOwningPid != pid) {
+      continue;
+    }
+    IN_ADDR address = {};
+    address.S_un.S_addr = row.dwLocalAddr;
+    char addr_text[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &address, addr_text, sizeof(addr_text));
+    const int local_port = ntohs(static_cast<u_short>(row.dwLocalPort));
+    matched_expected_port = matched_expected_port || (expected_port > 0 && local_port == expected_port);
+    std::ostringstream entry;
+    entry << addr_text << ":" << local_port;
+    entries.push_back(entry.str());
+  }
+
+  if (entries.empty()) {
+    return "udp_endpoints=-";
+  }
+  std::ostringstream stream;
+  stream << "udp_endpoints=";
+  for (size_t index = 0; index < entries.size(); ++index) {
+    if (index > 0) {
+      stream << "|";
+    }
+    stream << entries[index];
+  }
+  stream << " expected_port=" << expected_port
+         << " expected_match=" << BoolLabel(matched_expected_port);
+  return stream.str();
 }
 
 void LogNodeTrace(const std::string& message) {
@@ -527,6 +636,222 @@ bool IsPrivilegedMountServiceEnabled() {
   return enabled;
 }
 
+std::filesystem::path StandaloneMountHelperPath() {
+  const std::filesystem::path current = CurrentExecutablePath();
+  if (current.empty()) {
+    return {};
+  }
+  const std::filesystem::path helper_dir = current.parent_path();
+  const std::filesystem::path preferred = helper_dir / L"zt_mount_helper.exe";
+  if (std::filesystem::exists(preferred)) {
+    return preferred;
+  }
+  return helper_dir / L"zt_mount_service.exe";
+}
+
+bool IsStandaloneMountHelperEnabled() {
+  char* raw = nullptr;
+  size_t raw_size = 0;
+  if (_dupenv_s(&raw, &raw_size, "ZT_WIN_ENABLE_STANDALONE_MOUNT_HELPER") != 0 ||
+      raw == nullptr) {
+    return true;
+  }
+  const bool enabled = ParseTruthyEnvValue(raw);
+  free(raw);
+  return enabled;
+}
+
+bool CreateTempBinaryFilePath(const wchar_t* prefix,
+                              std::wstring* file_path,
+                              DWORD* error_code) {
+  if (file_path == nullptr) {
+    if (error_code != nullptr) {
+      *error_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  file_path->clear();
+  if (error_code != nullptr) {
+    *error_code = ERROR_GEN_FAILURE;
+  }
+  wchar_t temp_path[MAX_PATH] = {0};
+  const DWORD temp_path_len = GetTempPathW(MAX_PATH, temp_path);
+  if (temp_path_len == 0 || temp_path_len >= MAX_PATH) {
+    if (error_code != nullptr) {
+      *error_code = GetLastError();
+    }
+    return false;
+  }
+  wchar_t temp_file[MAX_PATH] = {0};
+  if (GetTempFileNameW(temp_path, prefix, 0, temp_file) == 0) {
+    if (error_code != nullptr) {
+      *error_code = GetLastError();
+    }
+    return false;
+  }
+  *file_path = temp_file;
+  if (error_code != nullptr) {
+    *error_code = NO_ERROR;
+  }
+  return true;
+}
+
+bool WriteBinaryFile(const std::wstring& path, const void* bytes, size_t size) {
+  if (path.empty() || bytes == nullptr || size == 0) {
+    return false;
+  }
+  std::ofstream output(std::filesystem::path(path),
+                       std::ios::binary | std::ios::trunc);
+  if (!output.is_open()) {
+    return false;
+  }
+  output.write(reinterpret_cast<const char*>(bytes),
+               static_cast<std::streamsize>(size));
+  output.close();
+  return output.good();
+}
+
+bool ReadBinaryFile(const std::wstring& path, void* bytes, size_t size) {
+  if (path.empty() || bytes == nullptr || size == 0) {
+    return false;
+  }
+  std::ifstream input(std::filesystem::path(path), std::ios::binary);
+  if (!input.is_open()) {
+    return false;
+  }
+  input.read(reinterpret_cast<char*>(bytes), static_cast<std::streamsize>(size));
+  if (!input.good() && !input.eof()) {
+    return false;
+  }
+  return input.gcount() == static_cast<std::streamsize>(size);
+}
+
+bool RunStandaloneMountHelperRequest(
+    const ztwin::privileged_mount::Request& request,
+    ztwin::privileged_mount::Response* response, DWORD* launch_error_code,
+    std::string* helper_debug) {
+  if (launch_error_code != nullptr) {
+    *launch_error_code = ERROR_GEN_FAILURE;
+  }
+  if (helper_debug != nullptr) {
+    helper_debug->clear();
+  }
+  if (response == nullptr) {
+    if (launch_error_code != nullptr) {
+      *launch_error_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  if (IsProcessElevated() || !IsPrivilegedMountExecutorEnabled() ||
+      !IsStandaloneMountHelperEnabled()) {
+    if (launch_error_code != nullptr) {
+      *launch_error_code = ERROR_SERVICE_DISABLED;
+    }
+    return false;
+  }
+
+  const std::filesystem::path helper_path = StandaloneMountHelperPath();
+  if (helper_path.empty() || !std::filesystem::exists(helper_path)) {
+    if (launch_error_code != nullptr) {
+      *launch_error_code = ERROR_FILE_NOT_FOUND;
+    }
+    if (helper_debug != nullptr) {
+      *helper_debug = "helper_path_missing";
+    }
+    return false;
+  }
+
+  std::wstring request_path;
+  DWORD request_path_error = NO_ERROR;
+  if (!CreateTempBinaryFilePath(L"ztr", &request_path, &request_path_error)) {
+    if (launch_error_code != nullptr) {
+      *launch_error_code = request_path_error;
+    }
+    return false;
+  }
+  std::wstring response_path;
+  DWORD response_path_error = NO_ERROR;
+  if (!CreateTempBinaryFilePath(L"zts", &response_path, &response_path_error)) {
+    DeleteFileW(request_path.c_str());
+    if (launch_error_code != nullptr) {
+      *launch_error_code = response_path_error;
+    }
+    return false;
+  }
+  if (!WriteBinaryFile(request_path, &request, sizeof(request))) {
+    DeleteFileW(request_path.c_str());
+    DeleteFileW(response_path.c_str());
+    if (launch_error_code != nullptr) {
+      *launch_error_code = ERROR_WRITE_FAULT;
+    }
+    return false;
+  }
+
+  const std::wstring parameters =
+      L"--single-request --request-file \"" + request_path +
+      L"\" --response-file \"" + response_path + L"\"";
+  const std::wstring helper_dir = helper_path.parent_path().wstring();
+  const std::wstring helper_file = helper_path.wstring();
+
+  SHELLEXECUTEINFOW info = {};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  info.hwnd = nullptr;
+  info.lpVerb = L"runas";
+  info.lpFile = helper_file.c_str();
+  info.lpParameters = parameters.c_str();
+  info.lpDirectory = helper_dir.c_str();
+  info.nShow = SW_HIDE;
+
+  const BOOL launched = ShellExecuteExW(&info);
+  if (!launched) {
+    const DWORD launch_error = GetLastError();
+    DeleteFileW(request_path.c_str());
+    DeleteFileW(response_path.c_str());
+    if (launch_error_code != nullptr) {
+      *launch_error_code = launch_error;
+    }
+    if (helper_debug != nullptr) {
+      std::ostringstream stream;
+      stream << "helper_launch_failed error=" << launch_error;
+      *helper_debug = stream.str();
+    }
+    return false;
+  }
+
+  DWORD process_exit_code = ERROR_GEN_FAILURE;
+  const DWORD wait_result = WaitForSingleObject(info.hProcess, 30000);
+  if (wait_result == WAIT_OBJECT_0) {
+    GetExitCodeProcess(info.hProcess, &process_exit_code);
+  } else if (wait_result == WAIT_TIMEOUT) {
+    process_exit_code = WAIT_TIMEOUT;
+    TerminateProcess(info.hProcess, WAIT_TIMEOUT);
+  } else {
+    process_exit_code = GetLastError();
+  }
+  CloseHandle(info.hProcess);
+
+  bool response_loaded = false;
+  if (wait_result == WAIT_OBJECT_0 && process_exit_code == 0) {
+    response_loaded = ReadBinaryFile(response_path, response, sizeof(*response));
+  }
+
+  DeleteFileW(request_path.c_str());
+  DeleteFileW(response_path.c_str());
+  if (launch_error_code != nullptr) {
+    *launch_error_code = process_exit_code;
+  }
+  if (helper_debug != nullptr) {
+    std::ostringstream stream;
+    stream << "helper=" << helper_path.u8string()
+           << " wait_result=" << wait_result
+           << " exit_code=" << process_exit_code
+           << " response_loaded=" << BoolLabel(response_loaded);
+    *helper_debug = stream.str();
+  }
+  return response_loaded;
+}
+
 PowerShellMountResult MountResultFromServiceResult(
     ztwin::privileged_mount::Result service_result) {
   switch (service_result) {
@@ -564,12 +889,6 @@ bool TryPrivilegedMountServiceRequest(
     }
     return false;
   }
-  if (!IsPrivilegedMountServiceEnabled()) {
-    if (service_error_code != nullptr) {
-      *service_error_code = ERROR_SERVICE_DISABLED;
-    }
-    return false;
-  }
 
   ztwin::privileged_mount::Request request = {};
   request.command = static_cast<uint32_t>(command);
@@ -583,6 +902,40 @@ bool TryPrivilegedMountServiceRequest(
   strncpy_s(request.value, value.c_str(), _TRUNCATE);
 
   ztwin::privileged_mount::Response response = {};
+  std::string helper_debug;
+  if (RunStandaloneMountHelperRequest(request, &response, service_error_code,
+                                      &helper_debug)) {
+    if (service_error_code != nullptr) {
+      *service_error_code = response.service_error;
+    }
+    if (native_error_code != nullptr) {
+      *native_error_code = response.native_error;
+    }
+    if (service_message != nullptr) {
+      *service_message =
+          std::string(response.message,
+                      strnlen_s(response.message, sizeof(response.message))) +
+          (helper_debug.empty() ? "" : " helper_debug=" + helper_debug);
+    }
+    const auto result =
+        static_cast<ztwin::privileged_mount::Result>(response.result);
+    if (mount_result != nullptr) {
+      *mount_result = MountResultFromServiceResult(result);
+    }
+    return result == ztwin::privileged_mount::Result::kSuccess ||
+           result == ztwin::privileged_mount::Result::kAlreadyExists;
+  }
+  if (service_message != nullptr && !helper_debug.empty()) {
+    *service_message = helper_debug;
+  }
+
+  if (!IsPrivilegedMountServiceEnabled()) {
+    if (service_error_code != nullptr) {
+      *service_error_code = ERROR_SERVICE_DISABLED;
+    }
+    return false;
+  }
+
   DWORD transport_error = NO_ERROR;
   const bool transport_ok = ztwin::privileged_mount::SendRequest(
       request, &response, 3000, &transport_error);
@@ -733,7 +1086,13 @@ bool RunPowerShellScriptElevated(const std::wstring& script, DWORD* exit_code) {
     return false;
   }
   const std::string utf8_body = WideToUtf8(script);
-  const std::string utf8_script = "\xEF\xBB\xBF& { " + utf8_body + " }\r\n";
+  const std::wstring log_path = BuildRuntimePowerShellLogPath();
+  const std::string utf8_log_path =
+      WideToUtf8(EscapePowerShellSingleQuotedLiteral(log_path));
+  const std::string utf8_script =
+      "\xEF\xBB\xBF$__ztLogPath='" + utf8_log_path +
+      "'\r\nStart-Transcript -Path $__ztLogPath -Force | Out-Null\r\n& { " +
+      utf8_body + " }\r\n";
   temp_script.write(utf8_script.data(),
                     static_cast<std::streamsize>(utf8_script.size()));
   temp_script.close();
@@ -778,6 +1137,88 @@ bool RunPowerShellScriptElevated(const std::wstring& script, DWORD* exit_code) {
     *exit_code = process_exit_code;
   }
   return wait_result == WAIT_OBJECT_0 && process_exit_code == 0;
+}
+
+std::string EscapePowerShellDoubleQuotedLiteral(const std::wstring& input) {
+  std::string escaped = WideToUtf8(input);
+  std::string output;
+  output.reserve(escaped.size() + 8);
+  for (const char ch : escaped) {
+    if (ch == '`' || ch == '"' || ch == '$') {
+      output.push_back('`');
+    }
+    output.push_back(ch);
+  }
+  return output;
+}
+
+std::string FirewallRuleNameForProgram(const std::filesystem::path& program_path,
+                                       const char* suffix) {
+  std::ostringstream stream;
+  stream << "ZeroTier LibZT Host "
+         << program_path.filename().u8string()
+         << " " << suffix;
+  return stream.str();
+}
+
+bool EnsureFirewallRulesForCurrentHostExe(DWORD* helper_exit_code,
+                                          std::string* helper_debug) {
+  if (helper_exit_code != nullptr) {
+    *helper_exit_code = ERROR_GEN_FAILURE;
+  }
+  if (helper_debug != nullptr) {
+    helper_debug->clear();
+  }
+
+  const std::filesystem::path exe_path = CurrentExecutablePath();
+  if (exe_path.empty() || !std::filesystem::exists(exe_path)) {
+    if (helper_exit_code != nullptr) {
+      *helper_exit_code = ERROR_FILE_NOT_FOUND;
+    }
+    if (helper_debug != nullptr) {
+      *helper_debug = "host_exe_missing";
+    }
+    return false;
+  }
+
+  ztwin::privileged_mount::Request request = {};
+  request.command = static_cast<uint32_t>(
+      ztwin::privileged_mount::Command::kEnsureFirewallHostExe);
+  request.request_id =
+      (static_cast<uint64_t>(GetTickCount64()) << 16) ^ 0x46574CULL;
+  strncpy_s(request.value, exe_path.u8string().c_str(), _TRUNCATE);
+
+  ztwin::privileged_mount::Response response = {};
+  DWORD launch_error = ERROR_GEN_FAILURE;
+  std::string helper_detail;
+  const bool loaded = RunStandaloneMountHelperRequest(request, &response,
+                                                      &launch_error,
+                                                      &helper_detail);
+  if (helper_exit_code != nullptr) {
+    *helper_exit_code = loaded ? response.service_error : launch_error;
+  }
+  if (helper_debug != nullptr) {
+    std::ostringstream stream;
+    stream << "host_exe=" << exe_path.u8string()
+           << " loaded=" << BoolLabel(loaded)
+           << " launch_or_service_error="
+           << (loaded ? response.service_error : launch_error);
+    if (!helper_detail.empty()) {
+      stream << " helper=" << helper_detail;
+    }
+    if (loaded) {
+      const std::string message(
+          response.message, strnlen_s(response.message, sizeof(response.message)));
+      if (!message.empty()) {
+        stream << " response=" << message;
+      }
+    }
+    *helper_debug = stream.str();
+  }
+  return loaded && (response.result ==
+                        static_cast<uint32_t>(ztwin::privileged_mount::Result::kSuccess) ||
+                    response.result ==
+                        static_cast<uint32_t>(ztwin::privileged_mount::Result::kAlreadyExists));
 }
 
 bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code,
@@ -924,8 +1365,31 @@ PowerShellMountResult TryAddIpViaPowerShell(uint64_t network_id,
       if (ps_exit_code != nullptr) {
         *ps_exit_code = 0;
       }
+      std::ostringstream stream;
+      stream << "ip_bind_service_result"
+             << " network_id=" << FormatNetworkIdHex(network_id)
+             << " if_index=" << if_index
+             << " ip=" << ip_text
+             << "/" << static_cast<int>(prefix_length)
+             << " service_error=" << service_error
+             << " native_error=" << native_error
+             << " service_result=" << static_cast<int>(service_result)
+             << " service_message="
+             << (service_message.empty() ? "-" : service_message);
+      LogNodeTrace(stream.str());
       return service_result;
     }
+    std::ostringstream stream;
+    stream << "ip_bind_service_unavailable"
+           << " network_id=" << FormatNetworkIdHex(network_id)
+           << " if_index=" << if_index
+           << " ip=" << ip_text
+           << "/" << static_cast<int>(prefix_length)
+           << " service_error=" << service_error
+           << " native_error=" << native_error
+           << " service_message="
+           << (service_message.empty() ? "-" : service_message);
+    LogNodeTrace(stream.str());
   }
   const std::wstring escaped_ip = EscapePowerShellSingleQuotedLiteral(ip_wide);
   const AdapterBindingProbe adapter_probe = ProbeAdapterBinding(if_index);
@@ -1405,6 +1869,7 @@ ZeroTierWindowsRuntime::ZeroTierWindowsRuntime() {
   tap_backend_ = CreateWindowsTapBackendFromEnv();
   if (tap_backend_) {
     tap_backend_id_ = tap_backend_->BackendId();
+    LogNodeTrace("tap_backend_selected backend=" + tap_backend_id_);
   }
 }
 
@@ -2129,6 +2594,16 @@ const char* EventCodeToString(int code) {
       return "ZTS_EVENT_ADDR_ADDED_IP4";
     case ZTS_EVENT_ADDR_ADDED_IP6:
       return "ZTS_EVENT_ADDR_ADDED_IP6";
+    case ZTS_EVENT_PEER_DIRECT:
+      return "ZTS_EVENT_PEER_DIRECT";
+    case ZTS_EVENT_PEER_RELAY:
+      return "ZTS_EVENT_PEER_RELAY";
+    case ZTS_EVENT_PEER_UNREACHABLE:
+      return "ZTS_EVENT_PEER_UNREACHABLE";
+    case ZTS_EVENT_PEER_PATH_DISCOVERED:
+      return "ZTS_EVENT_PEER_PATH_DISCOVERED";
+    case ZTS_EVENT_PEER_PATH_DEAD:
+      return "ZTS_EVENT_PEER_PATH_DEAD";
     case ZTS_EVENT_NODE_FATAL_ERROR:
       return "ZTS_EVENT_NODE_FATAL_ERROR";
     default:
@@ -2179,6 +2654,10 @@ flutter::EncodableMap ZeroTierWindowsRuntime::BuildStatus() const {
        EncodableValue(node_started_ || node_online_)},
       {EncodableValue("joinedNetworks"), EncodableValue(joined_networks)},
       {EncodableValue("adapterBridge"), EncodableValue(adapter_payload)},
+      {EncodableValue("transportDiagnostics"),
+       EncodableValue(BuildTransportDiagnosticsSummaryLocked())},
+      {EncodableValue("peerDiagnostics"),
+       EncodableValue(BuildRecentPeerDiagnosticsLocked())},
       {EncodableValue("lastError"),
        last_error_.empty() ? EncodableValue() : EncodableValue(last_error_)},
       {EncodableValue("updatedAt"), EncodableValue(Iso8601NowUtc())},
@@ -2724,7 +3203,24 @@ bool ZeroTierWindowsRuntime::EnsurePrepared(std::string* error_message) {
   adapter_probe_ = adapter_bridge_.LastProbe();
   if (tap_backend_ != nullptr) {
     std::string backend_action;
-    if (tap_backend_->EnsureAdapterPresent(adapter_probe_, {}, &backend_action)) {
+    const bool backend_changed =
+        tap_backend_->EnsureAdapterPresent(adapter_probe_, {}, &backend_action);
+    {
+      std::ostringstream stream;
+      stream << "tap_backend_ensure_adapter"
+             << " phase=prepare"
+             << " backend=" << tap_backend_id_
+             << " changed=" << BoolLabel(backend_changed)
+             << " has_virtual_adapter="
+             << BoolLabel(adapter_probe_.has_virtual_adapter)
+             << " has_mount_candidate="
+             << BoolLabel(adapter_probe_.has_mount_candidate)
+             << " has_expected_network_ip="
+             << BoolLabel(adapter_probe_.has_expected_network_ip)
+             << " action=" << (backend_action.empty() ? "-" : backend_action);
+      LogNodeTrace(stream.str());
+    }
+    if (backend_changed) {
       constexpr int kProbeRetryCount = 6;
       for (int attempt = 0; attempt < kProbeRetryCount; ++attempt) {
         adapter_probe_ = adapter_bridge_.Refresh({});
@@ -2734,6 +3230,23 @@ bool ZeroTierWindowsRuntime::EnsurePrepared(std::string* error_message) {
         Sleep(250);
       }
     }
+  }
+  {
+    const std::filesystem::path host_exe = CurrentExecutablePath();
+    DWORD firewall_helper_exit = NO_ERROR;
+    std::string firewall_helper_debug;
+    const bool firewall_ready =
+        EnsureFirewallRulesForCurrentHostExe(&firewall_helper_exit,
+                                             &firewall_helper_debug);
+    std::ostringstream stream;
+    stream << "firewall_host_rule"
+           << " exe="
+           << (host_exe.empty() ? "-" : host_exe.u8string())
+           << " ready=" << BoolLabel(firewall_ready)
+           << " helper_exit_code=" << firewall_helper_exit
+           << " detail="
+           << (firewall_helper_debug.empty() ? "-" : firewall_helper_debug);
+    LogNodeTrace(stream.str());
   }
   ClearLastErrorLocked();
   if (error_message != nullptr) {
@@ -2786,7 +3299,12 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
   const bool should_log_event =
       event->event_code == ZTS_EVENT_NODE_ONLINE ||
       event->event_code == ZTS_EVENT_NODE_OFFLINE ||
-      event->event_code == ZTS_EVENT_NODE_DOWN;
+      event->event_code == ZTS_EVENT_NODE_DOWN ||
+      event->event_code == ZTS_EVENT_PEER_DIRECT ||
+      event->event_code == ZTS_EVENT_PEER_RELAY ||
+      event->event_code == ZTS_EVENT_PEER_UNREACHABLE ||
+      event->event_code == ZTS_EVENT_PEER_PATH_DISCOVERED ||
+      event->event_code == ZTS_EVENT_PEER_PATH_DEAD;
   if (event_name != nullptr && should_log_event) {
     std::ostringstream stream;
     stream << "libzt_event"
@@ -2795,6 +3313,9 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
     if (event->node != nullptr) {
       stream << " node_id=" << ToHexNetworkId(event->node->node_id)
              << " port=" << event->node->port_primary;
+    }
+    if (event->peer != nullptr) {
+      stream << " " << PeerSummary(event->peer);
     }
     LogNodeTrace(stream.str());
   }
@@ -2812,6 +3333,9 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
     }
     if (!IsUsableNodeId(node_id_)) {
       node_id_ = 0;
+    }
+    if (event->peer != nullptr && event->peer->peer_id != 0) {
+      observed_peer_ids_.insert(event->peer->peer_id);
     }
   }
 
@@ -2839,7 +3363,11 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
                << " last_control_at="
                << (last_node_control_at_utc_.empty() ? "-" : last_node_control_at_utc_)
                << " service_state=" << BuildServiceState()
-               << " tracked_networks=" << SummarizeTrackedNetworksLocked();
+               << " tracked_networks=" << SummarizeTrackedNetworksLocked()
+               << " transport=" << BuildTransportDiagnosticsSummaryLocked()
+               << " peers=" << BuildRecentPeerDiagnosticsLocked()
+               << " sockets="
+               << SummarizeUdpEndpointsForPid(GetCurrentProcessId(), node_port_);
         LogNodeTrace(stream.str());
       }
       EmitEvent(BuildEvent("nodeOnline", "ZeroTier node is online.", "",
@@ -2873,7 +3401,11 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
                << " node_online=" << BoolLabel(node_online_)
                << " node_offline=" << BoolLabel(node_offline_)
                << " last_error=" << (last_error_.empty() ? "-" : last_error_)
-               << " tracked_networks=" << SummarizeTrackedNetworksLocked();
+               << " tracked_networks=" << SummarizeTrackedNetworksLocked()
+               << " transport=" << BuildTransportDiagnosticsSummaryLocked()
+               << " peers=" << BuildRecentPeerDiagnosticsLocked()
+               << " sockets="
+               << SummarizeUdpEndpointsForPid(GetCurrentProcessId(), node_port_);
         LogNodeTrace(stream.str());
         if (last_node_control_hint_.rfind("joinNetwork.request:", 0) == 0) {
           const std::string network_id_hex =
@@ -3317,6 +3849,13 @@ bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
   for (const auto& address : record.assigned_addresses) {
     in_addr parsed = {};
     if (!ParseIpv4(address, &parsed)) {
+      std::ostringstream stream;
+      stream << "ip_bind_skip"
+             << " network_id=" << ToHexNetworkId(network_id)
+             << " if_index=" << adapter.if_index
+             << " address=" << address
+             << " reason=parse_ipv4_failed";
+      LogNodeTrace(stream.str());
       continue;
     }
     uint8_t prefix = 24;
@@ -3335,10 +3874,45 @@ bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
     const EnsureIpResult ip_result = EnsureIpv4AddressOnInterface(
         adapter.if_index, parsed.S_un.S_addr, prefix, &created_context,
         &native_error);
+    {
+      std::ostringstream stream;
+      stream << "ip_bind_attempt"
+             << " network_id=" << ToHexNetworkId(network_id)
+             << " if_index=" << adapter.if_index
+             << " adapter_name="
+             << (!adapter.friendly_name.empty()
+                     ? adapter.friendly_name
+                     : (!adapter.description.empty() ? adapter.description
+                                                     : adapter.adapter_name))
+             << " address=" << address
+             << "/" << static_cast<int>(prefix)
+             << " native_result=" << static_cast<int>(ip_result)
+             << " native_error=" << native_error
+             << " native_reason="
+             << (native_error == ERROR_ACCESS_DENIED && !IsProcessElevated()
+                     ? "permission_denied_non_elevated"
+                     : "-")
+             << " process_elevated=" << BoolLabel(IsProcessElevated())
+             << " privileged_executor="
+             << BoolLabel(IsPrivilegedMountExecutorEnabled())
+             << " privileged_service="
+             << BoolLabel(IsPrivilegedMountServiceEnabled());
+      LogNodeTrace(stream.str());
+    }
     if (ip_result == EnsureIpResult::kFailed) {
       const bool process_elevated = IsProcessElevated();
       const bool privileged_executor_enabled = IsPrivilegedMountExecutorEnabled();
       if (!process_elevated && !privileged_executor_enabled) {
+        std::ostringstream stream;
+        stream << "ip_bind_failed"
+               << " network_id=" << ToHexNetworkId(network_id)
+               << " if_index=" << adapter.if_index
+               << " address=" << address
+               << "/" << static_cast<int>(prefix)
+               << " fallback_skipped=true"
+               << " reason=not_elevated_and_no_executor"
+               << " native_error=" << native_error;
+        LogNodeTrace(stream.str());
         continue;
       }
 
@@ -3347,6 +3921,18 @@ bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
       const PowerShellMountResult ps_result =
           TryAddIpViaPowerShell(network_id, adapter.if_index, address, prefix,
                                 &ps_exit_code, true, &mount_executor);
+      {
+        std::ostringstream stream;
+        stream << "ip_bind_fallback"
+               << " network_id=" << ToHexNetworkId(network_id)
+               << " if_index=" << adapter.if_index
+               << " address=" << address
+               << "/" << static_cast<int>(prefix)
+               << " executor=" << mount_executor
+               << " ps_result=" << static_cast<int>(ps_result)
+               << " ps_exit_code=" << ps_exit_code;
+        LogNodeTrace(stream.str());
+      }
       if (ps_result == PowerShellMountResult::kCreated ||
           ps_result == PowerShellMountResult::kExists) {
         bound_any = true;
@@ -3358,6 +3944,17 @@ bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
       continue;
     }
     bound_any = true;
+    {
+      std::ostringstream stream;
+      stream << "ip_bind_success"
+             << " network_id=" << ToHexNetworkId(network_id)
+             << " if_index=" << adapter.if_index
+             << " address=" << address
+             << "/" << static_cast<int>(prefix)
+             << " created_context=" << created_context
+             << " created=" << BoolLabel(ip_result == EnsureIpResult::kCreated);
+      LogNodeTrace(stream.str());
+    }
     if (ip_result == EnsureIpResult::kCreated && created_ips != nullptr) {
       created_ips->push_back(MountedSystemIp{
           adapter.if_index, parsed.S_un.S_addr, prefix, created_context});
@@ -3802,8 +4399,25 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
       adapter_bridge_.Refresh(expected_addresses);
   if (tap_backend_ != nullptr) {
     std::string backend_action;
-    if (tap_backend_->EnsureAdapterPresent(adapter_probe, expected_addresses,
-                                           &backend_action)) {
+    const bool backend_changed = tap_backend_->EnsureAdapterPresent(
+        adapter_probe, expected_addresses, &backend_action);
+    {
+      std::ostringstream stream;
+      stream << "tap_backend_ensure_adapter"
+             << " phase=refresh"
+             << " backend=" << tap_backend_id_
+             << " changed=" << BoolLabel(backend_changed)
+             << " expected_addresses=" << JoinAddresses(expected_addresses)
+             << " has_virtual_adapter="
+             << BoolLabel(adapter_probe.has_virtual_adapter)
+             << " has_mount_candidate="
+             << BoolLabel(adapter_probe.has_mount_candidate)
+             << " has_expected_network_ip="
+             << BoolLabel(adapter_probe.has_expected_network_ip)
+             << " action=" << (backend_action.empty() ? "-" : backend_action);
+      LogNodeTrace(stream.str());
+    }
+    if (backend_changed) {
       constexpr int kProbeRetryCount = 6;
       for (int attempt = 0; attempt < kProbeRetryCount; ++attempt) {
         adapter_probe = adapter_bridge_.Refresh(expected_addresses);
@@ -3881,9 +4495,11 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
             tap_backend_ == nullptr
                 ? adapter.is_mount_candidate
                 : tap_backend_->IsUsableMountCandidate(adapter);
-        if (!backend_candidate) {
-          continue;
-        }
+        const std::string backend_decision =
+            tap_backend_ == nullptr
+                ? (adapter.is_mount_candidate ? "accept:no_backend_mount_candidate"
+                                              : "reject:not_mount_candidate")
+                : tap_backend_->DescribeMountCandidateDecision(adapter);
         const int backend_score =
             tap_backend_ == nullptr ? 0 : tap_backend_->FallbackScore(adapter);
         const bool matched = std::any_of(
@@ -3893,6 +4509,32 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                                adapter.ipv4_addresses.end(),
                                address) != adapter.ipv4_addresses.end();
             });
+        {
+          std::ostringstream stream;
+          stream << "adapter_probe_candidate"
+                 << " network_id=" << ToHexNetworkId(network_id)
+                 << " if_index=" << adapter.if_index
+                 << " adapter_name="
+                 << (!adapter.friendly_name.empty()
+                         ? adapter.friendly_name
+                         : (!adapter.description.empty() ? adapter.description
+                                                         : adapter.adapter_name))
+                 << " is_mount_candidate=" << BoolLabel(adapter.is_mount_candidate)
+                 << " backend_candidate=" << BoolLabel(backend_candidate)
+                 << " backend=" << tap_backend_id_
+                 << " backend_decision=" << backend_decision
+                 << " backend_score=" << backend_score
+                 << " matched_expected_ip=" << BoolLabel(matched)
+                 << " is_up=" << BoolLabel(adapter.is_up)
+                 << " media_status=" << adapter.media_status
+                 << " driver_kind=" << adapter.driver_kind
+                 << " has_expected_route="
+                 << BoolLabel(adapter.has_expected_route);
+          LogNodeTrace(stream.str());
+        }
+        if (!backend_candidate) {
+          continue;
+        }
         if (matched) {
           if (exact_match == nullptr ||
               backend_score > exact_match_score ||
@@ -3914,6 +4556,29 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
 
       selected_adapter = exact_match != nullptr ? exact_match : fallback_candidate;
       selected_exact_match = exact_match != nullptr;
+      {
+        std::ostringstream stream;
+        stream << "adapter_probe_selected"
+               << " network_id=" << ToHexNetworkId(network_id)
+               << " selection=" << (selected_exact_match ? "exact" : "fallback");
+        if (selected_adapter != nullptr) {
+          stream << " if_index=" << selected_adapter->if_index
+                 << " adapter_name="
+                 << (!selected_adapter->friendly_name.empty()
+                         ? selected_adapter->friendly_name
+                         : (!selected_adapter->description.empty()
+                                ? selected_adapter->description
+                                : selected_adapter->adapter_name))
+                 << " is_up=" << BoolLabel(selected_adapter->is_up)
+                 << " media_status=" << selected_adapter->media_status
+                 << " driver_kind=" << selected_adapter->driver_kind
+                 << " selected_exact_match=" << BoolLabel(selected_exact_match);
+        } else {
+          stream << " if_index=0 adapter_name=-";
+        }
+        stream << " assigned_addresses=" << JoinAddresses(record.assigned_addresses);
+        LogNodeTrace(stream.str());
+      }
       if (selected_adapter != nullptr) {
         record.matched_interface_name =
             !selected_adapter->friendly_name.empty()
@@ -3942,6 +4607,19 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
       if (EnsureInterfaceAdminUp(selected_adapter->if_index)) {
         record.matched_interface_up = true;
         record.tap_media_status = "up";
+        std::ostringstream stream;
+        stream << "adapter_probe_admin_up"
+               << " network_id=" << ToHexNetworkId(network_id)
+               << " if_index=" << selected_adapter->if_index
+               << " result=success";
+        LogNodeTrace(stream.str());
+      } else {
+        std::ostringstream stream;
+        stream << "adapter_probe_admin_up"
+               << " network_id=" << ToHexNetworkId(network_id)
+               << " if_index=" << selected_adapter->if_index
+               << " result=failed";
+        LogNodeTrace(stream.str());
       }
     }
 
@@ -3971,6 +4649,18 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
           if (selected_exact_match || !record.matched_interface_name.empty()) {
             record.local_interface_ready = true;
           }
+        } else {
+          std::ostringstream stream;
+          stream << "ip_bind_result"
+                 << " network_id=" << ToHexNetworkId(network_id)
+                 << " if_index=" << selected_adapter->if_index
+                 << " adapter_name=" << record.matched_interface_name
+                 << " ip_bound=false"
+                 << " local_interface_ready="
+                 << BoolLabel(record.local_interface_ready)
+                 << " assigned_addresses="
+                 << JoinAddresses(record.assigned_addresses);
+          LogNodeTrace(stream.str());
         }
       }
     }
@@ -4144,6 +4834,120 @@ std::string ZeroTierWindowsRuntime::SummarizeTrackedNetworksLocked() const {
            << ":connected=" << BoolLabel(network.is_connected)
            << ":mount=" << network.local_mount_state
            << ":addrs=" << network.assigned_addresses.size();
+  }
+  return stream.str();
+}
+
+std::string ZeroTierWindowsRuntime::BuildTransportDiagnosticsSummaryLocked() const {
+  zts_stats_counter_t stats = {};
+  int stats_result = ZTS_ERR_SERVICE;
+  uint64_t live_node_id = 0;
+  int live_node_port = 0;
+  {
+    std::scoped_lock api_lock(api_mutex_);
+    stats_result = zts_stats_get_all(&stats);
+    live_node_id = zts_node_get_id();
+    live_node_port = zts_node_get_port();
+  }
+
+  std::ostringstream stream;
+  stream << "node_id=" << ToHexNetworkId(node_id_)
+         << " node_port=" << node_port_
+         << " live_node_id=" << ToHexNetworkId(live_node_id)
+         << " live_node_port=" << live_node_port
+         << " stats_result=" << ErrorCodeToString(stats_result);
+  if (stats_result == ZTS_ERR_OK) {
+    stream << " udp_tx=" << stats.udp_tx
+           << " udp_rx=" << stats.udp_rx
+           << " udp_drop=" << stats.udp_drop
+           << " udp_err=" << stats.udp_err
+           << " link_tx=" << stats.link_tx
+           << " link_rx=" << stats.link_rx
+           << " link_drop=" << stats.link_drop
+           << " link_err=" << stats.link_err;
+  }
+  if (!networks_.empty()) {
+    stream << " nets=";
+    bool first = true;
+    for (const auto& [network_id, network] : networks_) {
+      if (!first) {
+        stream << "|";
+      }
+      first = false;
+      int live_status = 0;
+      int live_transport = 0;
+      int live_route_count = 0;
+      int live_name_result = ZTS_ERR_SERVICE;
+      char live_name[ZTS_MAX_NETWORK_SHORT_NAME_LENGTH + 1] = {0};
+      {
+        std::scoped_lock api_lock(api_mutex_);
+        live_status = zts_net_get_status(network_id);
+        live_transport = zts_net_transport_is_ready(network_id);
+        live_route_count = zts_core_query_route_count(network_id);
+        live_name_result =
+            zts_net_get_name(network_id, live_name,
+                             ZTS_MAX_NETWORK_SHORT_NAME_LENGTH);
+      }
+      stream << ToHexNetworkId(network_id)
+             << ":transport_evt=" << network.last_event_transport_ready
+             << ",transport_probe=" << network.last_probe_transport_ready
+             << ",transport_live=" << live_transport
+             << ",status=" << network.status
+             << ",status_live=" << NetworkStatusToString(live_status)
+             << ",route_count_live=" << live_route_count
+             << ",name_result_live=" << ErrorCodeToString(live_name_result)
+             << ",name_live="
+             << (live_name_result == ZTS_ERR_OK ? std::string(live_name)
+                                                : std::string())
+             << ",mount=" << network.local_mount_state;
+    }
+  }
+  return stream.str();
+}
+
+std::string ZeroTierWindowsRuntime::BuildRecentPeerDiagnosticsLocked() const {
+  if (observed_peer_ids_.empty()) {
+    return "-";
+  }
+
+  std::ostringstream stream;
+  bool first_peer = true;
+  for (const uint64_t peer_id : observed_peer_ids_) {
+    int path_count = 0;
+    {
+      std::scoped_lock api_lock(api_mutex_);
+      path_count = zts_core_query_path_count(peer_id);
+    }
+    if (!first_peer) {
+      stream << ";";
+    }
+    first_peer = false;
+    stream << FormatNetworkIdHex(peer_id)
+           << ":path_count=" << path_count;
+    if (path_count < 0) {
+      stream << "(" << ErrorCodeToString(path_count) << ")";
+    }
+    if (path_count > 0) {
+      stream << ",paths=";
+      for (int index = 0; index < path_count; ++index) {
+        char path_buffer[256] = {0};
+        int path_result = ZTS_ERR_SERVICE;
+        {
+          std::scoped_lock api_lock(api_mutex_);
+          path_result = zts_core_query_path(
+              peer_id, static_cast<unsigned int>(index), path_buffer,
+              static_cast<unsigned int>(sizeof(path_buffer)));
+        }
+        if (index > 0) {
+          stream << "|";
+        }
+        if (path_result >= 0 && path_buffer[0] != '\0') {
+          stream << path_buffer;
+        } else {
+          stream << "query_failed:" << ErrorCodeToString(path_result);
+        }
+      }
+    }
   }
   return stream.str();
 }

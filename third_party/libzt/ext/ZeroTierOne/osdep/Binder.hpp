@@ -436,6 +436,17 @@ class Binder {
 				++bi;
 			}
 			if (bi == _bindingCount) {
+#ifdef __WINDOWS__
+				{
+					char addrbuf[64];
+					fprintf(stderr,
+						"[ZT/BINDER] bind_attempt local=%s ifname=%s existing_bindings=%u interfaces_enumerated=%d\n",
+						ii->first.toString(addrbuf),
+						ii->second.c_str(),
+						(unsigned int)_bindingCount,
+						(int)interfacesEnumerated);
+				}
+#endif
 				udps = phy.udpBind(reinterpret_cast<const struct sockaddr*>(&(ii->first)), (void*)0, ZT_UDP_DESIRED_BUF_SIZE);
 				tcps = phy.tcpListen(reinterpret_cast<const struct sockaddr*>(&(ii->first)), (void*)0);
 				if ((udps) && (tcps)) {
@@ -457,10 +468,34 @@ class Binder {
 						_bindings[_bindingCount].tcpListenSock = tcps;
 						_bindings[_bindingCount].address = ii->first;
 						memcpy(_bindings[_bindingCount].ifname, (char*)ii->second.c_str(), (int)ii->second.length());
+#ifdef __WINDOWS__
+						{
+							char addrbuf[64];
+							fprintf(stderr,
+								"[ZT/BINDER] bind_result local=%s ifname=%s udp_ok=1 tcp_ok=1 binding_index=%u udp_socket=%lld tcp_socket=%lld\n",
+								ii->first.toString(addrbuf),
+								ii->second.c_str(),
+								(unsigned int)_bindingCount,
+								(long long)reinterpret_cast<int64_t>(udps),
+								(long long)reinterpret_cast<int64_t>(tcps));
+						}
+#endif
 						++_bindingCount;
 					}
 				}
 				else {
+#ifdef __WINDOWS__
+					{
+						char addrbuf[64];
+						fprintf(stderr,
+							"[ZT/BINDER] bind_result local=%s ifname=%s udp_ok=%d tcp_ok=%d binding_index=%u\n",
+							ii->first.toString(addrbuf),
+							ii->second.c_str(),
+							(udps ? 1 : 0),
+							(tcps ? 1 : 0),
+							(unsigned int)_bindingCount);
+					}
+#endif
 					phy.close(udps, false);
 					phy.close(tcps, false);
 				}

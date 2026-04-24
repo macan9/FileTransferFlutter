@@ -13,6 +13,8 @@ class ZeroTierWindowsTapBackend {
   virtual std::string BackendId() const = 0;
   virtual bool IsUsableMountCandidate(
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const = 0;
+  virtual std::string DescribeMountCandidateDecision(
+      const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const = 0;
   virtual int FallbackScore(
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const = 0;
 
@@ -26,6 +28,8 @@ class ZeroTierWindowsWintunTapBackend : public ZeroTierWindowsTapBackend {
  public:
   std::string BackendId() const override;
   bool IsUsableMountCandidate(
+      const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
+  std::string DescribeMountCandidateDecision(
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
   int FallbackScore(
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
@@ -56,6 +60,8 @@ class ZeroTierWindowsZtTapBackend : public ZeroTierWindowsTapBackend {
   std::string BackendId() const override;
   bool IsUsableMountCandidate(
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
+  std::string DescribeMountCandidateDecision(
+      const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
   int FallbackScore(
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
   bool EnsureAdapterPresent(
@@ -71,6 +77,8 @@ class ZeroTierWindowsAutoTapBackend : public ZeroTierWindowsTapBackend {
  public:
   std::string BackendId() const override;
   bool IsUsableMountCandidate(
+      const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
+  std::string DescribeMountCandidateDecision(
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
   int FallbackScore(
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;

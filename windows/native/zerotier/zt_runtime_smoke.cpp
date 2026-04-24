@@ -1,6 +1,7 @@
 #include "native/zerotier/zerotier_windows_runtime.h"
 
 #include <chrono>
+#include <exception>
 #include <cstring>
 #include <cstdint>
 #include <ctime>
@@ -180,6 +181,22 @@ void PrintStatus(const EncodableMap& status, const std::string& tag) {
             << (ReadBool(status, "isNodeRunning") ? "true" : "false")
             << " joinedNetworks=" << ReadList(status, "joinedNetworks").size()
             << " joinedNetworkIds=" << SummarizeNetworkIds(status)
+            << " transport=" << ReadString(status, "transportDiagnostics")
+            << " peers=" << ReadString(status, "peerDiagnostics")
+            << " lastError=" << ReadString(status, "lastError")
+            << std::endl;
+}
+
+void PrintMonitorState(const EncodableMap& status, int sample_index,
+                       const std::string& phase) {
+  std::cout << "[monitor-state] ts=" << FormatUtcNow()
+            << " sample=" << sample_index
+            << " phase=" << phase
+            << " serviceState=" << ReadString(status, "serviceState")
+            << " nodeId=" << ReadString(status, "nodeId")
+            << " joinedNetworks=" << ReadList(status, "joinedNetworks").size()
+            << " transport=" << ReadString(status, "transportDiagnostics")
+            << " peers=" << ReadString(status, "peerDiagnostics")
             << " lastError=" << ReadString(status, "lastError")
             << std::endl;
 }
@@ -187,6 +204,7 @@ void PrintStatus(const EncodableMap& status, const std::string& tag) {
 }  // namespace
 
 int main() {
+  try {
   int join_timeout_ms = 45000;
   int leave_timeout_ms = 30000;
   std::string probe_network_id;
@@ -194,6 +212,7 @@ int main() {
   bool require_route_bound = false;
   bool allow_mount_degraded = false;
   bool monitor_until_offline = false;
+  bool skip_monitor_probe = false;
   int poll_interval_ms = 1000;
   int max_monitor_seconds = 0;
   for (int index = 1; index < __argc; ++index) {
@@ -231,6 +250,10 @@ int main() {
     }
     if (std::strcmp(argument, "--monitor-until-offline") == 0) {
       monitor_until_offline = true;
+      continue;
+    }
+    if (std::strcmp(argument, "--skip-monitor-probe") == 0) {
+      skip_monitor_probe = true;
       continue;
     }
     if (std::strcmp(argument, "--poll-interval-ms") == 0 &&
@@ -332,6 +355,14 @@ int main() {
     if (monitor_until_offline) {
       probe_network_id = join_network_id;
       std::cout << "[smoke] monitor armed after successful join" << std::endl;
+      std::cout << "[smoke] monitor probe network=" << probe_network_id
+                << " maxMonitorSeconds=" << max_monitor_seconds
+                << " pollIntervalMs=" << poll_interval_ms
+                << " skipMonitorProbe="
+                << (skip_monitor_probe ? "true" : "false") << std::endl;
+      runtime.ClearEventCallback();
+      std::cout << "[smoke] event callback disabled before monitor loop"
+                << std::endl;
     } else {
       std::string leave_error;
       const bool leave_ok = runtime.LeaveNetwork(
@@ -365,12 +396,18 @@ int main() {
   if (monitor_until_offline) {
     const auto started_at = std::chrono::steady_clock::now();
     int sample_index = 0;
+    std::cout << "[smoke] entering monitor loop"
+              << " probeNetwork=" << probe_network_id
+              << " maxMonitorSeconds=" << max_monitor_seconds
+              << std::endl;
     while (true) {
       if (sample_index > 0) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(poll_interval_ms));
       }
+      PrintMonitorState(status, sample_index, "before_detect");
       status = runtime.DetectStatus();
+      PrintMonitorState(status, sample_index, "after_detect");
       std::cout << "[monitor] ts=" << FormatUtcNow()
                 << " sample=" << sample_index
                 << " serviceState=" << ReadString(status, "serviceState")
@@ -379,9 +416,13 @@ int main() {
                 << (ReadBool(status, "isNodeRunning") ? "true" : "false")
                 << " joinedNetworks=" << ReadList(status, "joinedNetworks").size()
                 << " joinedNetworkIds=" << SummarizeNetworkIds(status)
+                << " transport=" << ReadString(status, "transportDiagnostics")
+                << " peers=" << ReadString(status, "peerDiagnostics")
                 << " lastError=" << ReadString(status, "lastError")
                 << std::endl;
-      if (!probe_network_id.empty()) {
+      if (!probe_network_id.empty() && !skip_monitor_probe) {
+        std::cout << "[smoke] probing network " << probe_network_id
+                  << " sample=" << sample_index << std::endl;
         const EncodableMap probe =
             runtime.ProbeNetworkStateNow(std::stoull(probe_network_id, nullptr, 16));
         PrintProbeSummary(probe, "probe");
@@ -395,7 +436,9 @@ int main() {
                   << " offline_detected=true"
                   << " serviceState=" << service_state
                   << std::endl;
-        if (!probe_network_id.empty()) {
+        if (!probe_network_id.empty() && !skip_monitor_probe) {
+          std::cout << "[smoke] collecting offline probe"
+                    << " network=" << probe_network_id << std::endl;
           const EncodableMap probe = runtime.ProbeNetworkStateNow(
               std::stoull(probe_network_id, nullptr, 16));
           PrintProbeSummary(probe, "offline_probe");
@@ -536,4 +579,11 @@ int main() {
             << " matchedInterface=" << ReadString(*joined, "matchedInterfaceName")
             << std::endl;
   return ReadBool(*joined, "localInterfaceReady") ? 0 : 8;
+  } catch (const std::exception& error) {
+    std::cerr << "[smoke] fatal exception=" << error.what() << std::endl;
+    return 97;
+  } catch (...) {
+    std::cerr << "[smoke] fatal exception=unknown" << std::endl;
+    return 98;
+  }
 }
