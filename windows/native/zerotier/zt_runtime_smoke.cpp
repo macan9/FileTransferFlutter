@@ -3,8 +3,11 @@
 #include <chrono>
 #include <cstring>
 #include <cstdint>
+#include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,13 +87,99 @@ std::string ReadPrintable(const EncodableMap& map, const char* key) {
   return "";
 }
 
+std::string FormatUtcNow() {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+  std::tm utc_tm{};
+#if defined(_WIN32)
+  gmtime_s(&utc_tm, &now_time);
+#else
+  gmtime_r(&now_time, &utc_tm);
+#endif
+  std::ostringstream stream;
+  stream << std::put_time(&utc_tm, "%Y-%m-%dT%H:%M:%SZ");
+  return stream.str();
+}
+
+std::string SummarizeNetworkIds(const EncodableMap& status) {
+  const EncodableList networks = ReadList(status, "joinedNetworks");
+  if (networks.empty()) {
+    return "-";
+  }
+  std::ostringstream stream;
+  bool first = true;
+  for (const auto& item : networks) {
+    const std::optional<EncodableMap> network = ReadMap(item);
+    if (!network.has_value()) {
+      continue;
+    }
+    const std::string network_id = ReadString(*network, "networkId");
+    if (network_id.empty()) {
+      continue;
+    }
+    if (!first) {
+      stream << ",";
+    }
+    stream << network_id;
+    first = false;
+  }
+  return first ? "-" : stream.str();
+}
+
+void PrintProbeSummary(const EncodableMap& probe, const std::string& tag) {
+  std::cout << "[monitor] ts=" << FormatUtcNow()
+            << " tag=" << tag
+            << " networkId=" << ReadPrintable(probe, "networkId")
+            << " status=" << ReadPrintable(probe, "status")
+            << " statusCode=" << ReadPrintable(probe, "statusCode")
+            << " transportReady=" << ReadPrintable(probe, "transportReady")
+            << " addrResultName=" << ReadPrintable(probe, "addrResultName")
+            << " networkName=" << ReadPrintable(probe, "networkNameFromProbe")
+            << std::endl;
+
+  const auto runtime_record_it = probe.find(EncodableValue("runtimeRecord"));
+  if (runtime_record_it == probe.end()) {
+    return;
+  }
+  const std::optional<EncodableMap> runtime_record =
+      ReadMap(runtime_record_it->second);
+  if (!runtime_record.has_value()) {
+    return;
+  }
+  std::cout << "[monitor] ts=" << FormatUtcNow()
+            << " tag=" << tag << "_runtime"
+            << " localMountState="
+            << ReadPrintable(*runtime_record, "localMountState")
+            << " localInterfaceReady="
+            << ReadPrintable(*runtime_record, "localInterfaceReady")
+            << " systemIpBound="
+            << ReadPrintable(*runtime_record, "systemIpBound")
+            << " systemRouteBound="
+            << ReadPrintable(*runtime_record, "systemRouteBound")
+            << " mountDriverKind="
+            << ReadPrintable(*runtime_record, "mountDriverKind")
+            << " matchedInterfaceIfIndex="
+            << ReadPrintable(*runtime_record, "matchedInterfaceIfIndex")
+            << " tapMediaStatus="
+            << ReadPrintable(*runtime_record, "tapMediaStatus")
+            << " lastEventName="
+            << ReadPrintable(*runtime_record, "lastEventName")
+            << " lastProbeAddrResultName="
+            << ReadPrintable(*runtime_record, "lastProbeAddrResultName")
+            << " joinEventSequence="
+            << ReadPrintable(*runtime_record, "joinEventSequence")
+            << std::endl;
+}
+
 void PrintStatus(const EncodableMap& status, const std::string& tag) {
-  std::cout << "[smoke] " << tag
+  std::cout << "[smoke] ts=" << FormatUtcNow()
+            << " tag=" << tag
             << " serviceState=" << ReadString(status, "serviceState")
             << " nodeId=" << ReadString(status, "nodeId")
             << " isNodeRunning="
             << (ReadBool(status, "isNodeRunning") ? "true" : "false")
             << " joinedNetworks=" << ReadList(status, "joinedNetworks").size()
+            << " joinedNetworkIds=" << SummarizeNetworkIds(status)
             << " lastError=" << ReadString(status, "lastError")
             << std::endl;
 }
@@ -104,6 +193,9 @@ int main() {
   std::string join_network_id;
   bool require_route_bound = false;
   bool allow_mount_degraded = false;
+  bool monitor_until_offline = false;
+  int poll_interval_ms = 1000;
+  int max_monitor_seconds = 0;
   for (int index = 1; index < __argc; ++index) {
     const char* argument = __argv[index];
     if (argument == nullptr) {
@@ -135,6 +227,20 @@ int main() {
     }
     if (std::strcmp(argument, "--allow-mount-degraded") == 0) {
       allow_mount_degraded = true;
+      continue;
+    }
+    if (std::strcmp(argument, "--monitor-until-offline") == 0) {
+      monitor_until_offline = true;
+      continue;
+    }
+    if (std::strcmp(argument, "--poll-interval-ms") == 0 &&
+        index + 1 < __argc) {
+      poll_interval_ms = std::max(250, std::atoi(__argv[++index]));
+      continue;
+    }
+    if (std::strcmp(argument, "--max-monitor-seconds") == 0 &&
+        index + 1 < __argc) {
+      max_monitor_seconds = std::max(0, std::atoi(__argv[++index]));
     }
   }
 
@@ -159,6 +265,11 @@ int main() {
     }
   }
   PrintStatus(status, "detect");
+
+  if (monitor_until_offline && join_network_id.empty() &&
+      !probe_network_id.empty()) {
+    join_network_id = probe_network_id;
+  }
 
   if (!join_network_id.empty()) {
     std::cout << "[smoke] target network=" << join_network_id << std::endl;
@@ -218,32 +329,94 @@ int main() {
       return 13;
     }
 
-    std::string leave_error;
-    const bool leave_ok = runtime.LeaveNetwork(
-        std::stoull(join_network_id, nullptr, 16), "zt_runtime_smoke_target", &leave_error);
-    std::cout << "[smoke] leave ok=" << (leave_ok ? "true" : "false")
-              << " error=" << leave_error << std::endl;
-    if (!leave_ok) {
-      return 14;
-    }
-
-    bool left = false;
-    const int attempts = std::max(1, leave_timeout_ms / 500);
-    for (int attempt = 0; attempt < attempts; ++attempt) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-      status = runtime.DetectStatus();
-      if (!FindNetworkById(status, join_network_id).has_value()) {
-        left = true;
-        break;
+    if (monitor_until_offline) {
+      probe_network_id = join_network_id;
+      std::cout << "[smoke] monitor armed after successful join" << std::endl;
+    } else {
+      std::string leave_error;
+      const bool leave_ok = runtime.LeaveNetwork(
+          std::stoull(join_network_id, nullptr, 16), "zt_runtime_smoke_target", &leave_error);
+      std::cout << "[smoke] leave ok=" << (leave_ok ? "true" : "false")
+                << " error=" << leave_error << std::endl;
+      if (!leave_ok) {
+        return 14;
       }
+
+      bool left = false;
+      const int attempts = std::max(1, leave_timeout_ms / 500);
+      for (int attempt = 0; attempt < attempts; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        status = runtime.DetectStatus();
+        if (!FindNetworkById(status, join_network_id).has_value()) {
+          left = true;
+          break;
+        }
+      }
+      PrintStatus(status, "post-leave-target");
+      if (!left) {
+        std::cerr << "[smoke] network still present after leave timeout" << std::endl;
+        return 15;
+      }
+      std::cout << "[smoke] target join/probe/leave flow passed" << std::endl;
+      return 0;
     }
-    PrintStatus(status, "post-leave-target");
-    if (!left) {
-      std::cerr << "[smoke] network still present after leave timeout" << std::endl;
-      return 15;
+  }
+
+  if (monitor_until_offline) {
+    const auto started_at = std::chrono::steady_clock::now();
+    int sample_index = 0;
+    while (true) {
+      if (sample_index > 0) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(poll_interval_ms));
+      }
+      status = runtime.DetectStatus();
+      std::cout << "[monitor] ts=" << FormatUtcNow()
+                << " sample=" << sample_index
+                << " serviceState=" << ReadString(status, "serviceState")
+                << " nodeId=" << ReadString(status, "nodeId")
+                << " isNodeRunning="
+                << (ReadBool(status, "isNodeRunning") ? "true" : "false")
+                << " joinedNetworks=" << ReadList(status, "joinedNetworks").size()
+                << " joinedNetworkIds=" << SummarizeNetworkIds(status)
+                << " lastError=" << ReadString(status, "lastError")
+                << std::endl;
+      if (!probe_network_id.empty()) {
+        const EncodableMap probe =
+            runtime.ProbeNetworkStateNow(std::stoull(probe_network_id, nullptr, 16));
+        PrintProbeSummary(probe, "probe");
+      }
+
+      const std::string service_state = ReadString(status, "serviceState");
+      const bool offline_detected =
+          service_state == "offline" || service_state == "error";
+      if (offline_detected) {
+        std::cout << "[monitor] ts=" << FormatUtcNow()
+                  << " offline_detected=true"
+                  << " serviceState=" << service_state
+                  << std::endl;
+        if (!probe_network_id.empty()) {
+          const EncodableMap probe = runtime.ProbeNetworkStateNow(
+              std::stoull(probe_network_id, nullptr, 16));
+          PrintProbeSummary(probe, "offline_probe");
+        }
+        return 21;
+      }
+
+      if (max_monitor_seconds > 0) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - started_at)
+                .count();
+        if (elapsed >= max_monitor_seconds) {
+          std::cout << "[monitor] ts=" << FormatUtcNow()
+                    << " max_monitor_reached=true seconds=" << elapsed
+                    << std::endl;
+          return 0;
+        }
+      }
+      ++sample_index;
     }
-    std::cout << "[smoke] target join/probe/leave flow passed" << std::endl;
-    return 0;
   }
 
   if (!probe_network_id.empty()) {
