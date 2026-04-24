@@ -37,9 +37,6 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     _networkNameController = TextEditingController(text: 'My Private Network');
     _networkDescriptionController =
         TextEditingController(text: 'Private mesh for trusted devices');
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(networkingAgentRuntimeProvider.notifier).activate();
-    });
   }
 
   @override
@@ -210,6 +207,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                   SingleChildScrollView(
                     padding: const EdgeInsets.only(bottom: 16),
                     child: _OneClickNetworkingTab(
+                      actionOrbKey: const Key('networking-default-action-orb'),
                       defaultNetwork: dashboard.defaultNetwork,
                       currentDeviceId: config.deviceId,
                       agentState: agentState,
@@ -217,9 +215,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                       activeAction: dashboard.activeAction,
                       isLocalReady: isLocalReady,
                       runtimeStatus: runtimeStatus,
-                      onJoin: () => _joinDefaultNetwork(config),
-                      onLeave: () => _leaveDefaultNetwork(
-                          dashboard.defaultNetwork, runtimeStatus),
+                      onJoin: _joinDefaultNetwork,
+                      onLeave: () =>
+                          _leaveDefaultNetwork(dashboard.defaultNetwork),
                       onCopyIp: (String ip) => _copyToClipboard(
                         ip,
                         successMessage: '已复制虚拟 IP',
@@ -229,6 +227,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                   SingleChildScrollView(
                     padding: const EdgeInsets.only(bottom: 16),
                     child: _PrivateNetworkingTab(
+                      joinOrbKey: const Key('networking-private-join-orb'),
+                      hostOrbKey: const Key('networking-private-host-orb'),
                       codeController: _networkCodeController,
                       nameController: _networkNameController,
                       descriptionController: _networkDescriptionController,
@@ -239,8 +239,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                       isLocalReady: isLocalReady,
                       managedNetworks: dashboard.managedNetworks,
                       runtimeStatus: runtimeStatus,
-                      onJoinPressed: () => _joinByInviteCode(config),
-                      onHostPressed: () => _createPrivateNetwork(config),
+                      onJoinPressed: _joinByInviteCode,
+                      onHostPressed: _createPrivateNetwork,
                     ),
                   ),
                 ],
@@ -263,8 +263,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     await ref.read(networkingProvider.notifier).refresh();
   }
 
-  Future<void> _joinDefaultNetwork(AppConfig config) async {
-    await ref.read(networkingAgentRuntimeProvider.notifier).activate();
+  Future<void> _joinDefaultNetwork() async {
     final AppConfig readyConfig = ref.read(appConfigProvider);
     if (!_ensureRegistered(readyConfig)) {
       return;
@@ -274,17 +273,22 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       await ref
           .read(networkingProvider.notifier)
           .joinDefaultNetwork(deviceId: readyConfig.deviceId);
+      if (!mounted) {
+        return;
+      }
       unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
       unawaited(ref.read(networkingProvider.notifier).refresh());
       _showPageMessage('默认网络入网请求已提交，等待本机 Agent 执行 join。');
     } on RealtimeError catch (error) {
+      if (!mounted) {
+        return;
+      }
       _showPageMessage(error.message);
     }
   }
 
   Future<void> _leaveDefaultNetwork(
     ManagedNetwork? defaultNetwork,
-    ZeroTierRuntimeStatus runtimeStatus,
   ) async {
     final String networkId = defaultNetwork?.zeroTierNetworkId?.trim() ?? '';
     if (networkId.isEmpty) {
@@ -303,16 +307,24 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
           );
       unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
       await ref.read(networkingProvider.notifier).refresh();
+      if (!mounted) {
+        return;
+      }
       _showPageMessage('已取消默认网络组网。');
     } on RealtimeError catch (error) {
+      if (!mounted) {
+        return;
+      }
       _showPageMessage(error.message);
     } catch (error) {
+      if (!mounted) {
+        return;
+      }
       _showPageMessage('$error');
     }
   }
 
-  Future<void> _joinByInviteCode(AppConfig config) async {
-    await ref.read(networkingAgentRuntimeProvider.notifier).activate();
+  Future<void> _joinByInviteCode() async {
     final AppConfig readyConfig = ref.read(appConfigProvider);
     if (!_ensureRegistered(readyConfig)) {
       return;
@@ -330,14 +342,19 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             deviceId: readyConfig.deviceId,
           );
       unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
+      if (!mounted) {
+        return;
+      }
       _showPageMessage('邀请码组网请求已提交，等待本机 Agent 执行 join。');
     } on RealtimeError catch (error) {
+      if (!mounted) {
+        return;
+      }
       _showPageMessage(error.message);
     }
   }
 
-  Future<void> _createPrivateNetwork(AppConfig config) async {
-    await ref.read(networkingAgentRuntimeProvider.notifier).activate();
+  Future<void> _createPrivateNetwork() async {
     final AppConfig readyConfig = ref.read(appConfigProvider);
     if (!_ensureRegistered(readyConfig)) {
       return;
@@ -357,11 +374,20 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                 name: name,
                 description: description,
               );
+      if (!mounted) {
+        return;
+      }
       setState(() {
         _generatedNetworkCode = result.inviteCode.code;
       });
+      if (!mounted) {
+        return;
+      }
       _showPageMessage('私有网络已创建，邀请码 ${result.inviteCode.code} 已生成。');
     } on RealtimeError catch (error) {
+      if (!mounted) {
+        return;
+      }
       _showPageMessage(error.message);
     }
   }
@@ -412,6 +438,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   }
 
   void _showPageMessage(String message) {
+    if (!mounted) {
+      return;
+    }
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     messenger
       ..hideCurrentSnackBar()
@@ -473,10 +502,10 @@ class _HeroStatusCard extends StatelessWidget {
             runSpacing: 10,
             children: <Widget>[
               _InfoPill(
-                  label: '运行状态', value: _serviceStateLabel(runtimeStatus)),
+                  label: 'Runtime', value: _serviceStateLabel(runtimeStatus)),
               _InfoPill(
-                label: '节点',
-                value: runtimeStatus.isNodeRunning ? '运行中' : '未运行',
+                label: 'libzt Node',
+                value: _nodeStateLabel(runtimeStatus),
               ),
               _InfoPill(
                 label: '注册状态',
@@ -612,7 +641,9 @@ class _RuntimeInsightCard extends StatelessWidget {
             runSpacing: 10,
             children: <Widget>[
               _InfoPill(
-                  label: 'Service State', value: runtimeStatus.serviceState),
+                  label: 'Runtime', value: _serviceStateLabel(runtimeStatus)),
+              _InfoPill(
+                  label: 'libzt Node', value: _nodeStateLabel(runtimeStatus)),
               _InfoPill(
                 label: 'Last Updated',
                 value: _timeOrDash(runtimeStatus.updatedAt),
@@ -876,6 +907,7 @@ class _LocalNetworksCard extends StatelessWidget {
 
 class _OneClickNetworkingTab extends StatelessWidget {
   const _OneClickNetworkingTab({
+    required this.actionOrbKey,
     required this.defaultNetwork,
     required this.currentDeviceId,
     required this.agentState,
@@ -888,6 +920,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
     required this.onCopyIp,
   });
 
+  final Key actionOrbKey;
   final ManagedNetwork? defaultNetwork;
   final String currentDeviceId;
   final NetworkingAgentRuntimeState agentState;
@@ -926,12 +959,19 @@ class _OneClickNetworkingTab extends StatelessWidget {
         _isAcceptedMembershipStatus(currentMembershipStatus);
     final bool isSubmittingJoin = activeAction == 'join-default-network';
     final bool isSubmittingLeave = activeAction == 'leave-default-network';
+    final bool hasActiveJoinSession = agentState.hasActiveJoinSession &&
+        (agentState.activeNetworkActionNetworkId?.trim().toLowerCase() ?? '') ==
+            defaultNetworkId;
+    final bool hasActiveLeaveSession = agentState.hasActiveLeaveSession &&
+        (agentState.activeNetworkActionNetworkId?.trim().toLowerCase() ?? '') ==
+            defaultNetworkId;
     final bool isLocalAuthorizationPending =
         _isAuthorizationPendingLocalNetwork(localState);
-    final bool isTransitionLocked =
-        (agentState.isNetworkActionLocked || isSubmittingLeave) &&
-            (transitionNetworkId.isEmpty ||
-                transitionNetworkId == defaultNetworkId);
+    final bool isTransitionLocked = (agentState.isNetworkActionLocked ||
+            isSubmittingLeave ||
+            hasActiveLeaveSession) &&
+        (transitionNetworkId.isEmpty ||
+            transitionNetworkId == defaultNetworkId);
     final bool hasLocalMapping = localState != null &&
         !isLocalAuthorizationPending &&
         _isLocalNetworkMounted(localState, hasServiceAssignedIp);
@@ -940,13 +980,9 @@ class _OneClickNetworkingTab extends StatelessWidget {
     final bool isGrouped = !isMembershipRevoked && hasLocalMapping;
     final bool isAwaitingAuthorization =
         !isClosing && isLocalAuthorizationPending;
-    final bool localStillNegotiating = localState != null &&
-        !isGrouped &&
-        _isLocalNetworkNegotiating(localState, hasServiceAssignedIp);
-    final bool hasJoinIntentEvidence = isSubmittingJoin ||
-        localStillNegotiating ||
-        _hasRecentJoinIntent(agentState.recentRuntimeEvents, defaultNetworkId);
-    final bool isActivelyJoining = isSubmittingJoin || localStillNegotiating;
+    final bool hasJoinIntentEvidence = isSubmittingJoin || hasActiveJoinSession;
+    final bool isActivelyJoining =
+        hasActiveJoinSession || (isSubmittingJoin && !hasActiveLeaveSession);
     final _DefaultNetworkFlowState flowState = _resolveDefaultNetworkFlowState(
       isLocalReady: isLocalReady,
       isLocalInitializing: agentState.isLocalInitializing,
@@ -954,12 +990,12 @@ class _OneClickNetworkingTab extends StatelessWidget {
       isGrouped: isGrouped,
       isAwaitingAuthorization: isAwaitingAuthorization,
       isSubmittingJoin: isSubmittingJoin,
+      hasActiveJoinSession: hasActiveJoinSession,
       isBootstrapping: agentState.isBootstrapping,
       localState: localState,
       managedStatus: currentMembershipStatus,
       hasServiceAssignedIp: hasServiceAssignedIp,
       hasMembershipAccepted: isMembershipAccepted,
-      hasJoinIntentEvidence: hasJoinIntentEvidence,
       hasLastError: agentState.lastError?.trim().isNotEmpty == true,
     );
     final _DefaultNetworkFlowPresentation flowPresentation =
@@ -1001,6 +1037,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
             const SizedBox(height: 18),
           ],
           _NetworkingActionOrb(
+            key: actionOrbKey,
             label: flowPresentation.label,
             icon: flowPresentation.icon,
             subtitle: flowPresentation.subtitle,
@@ -1050,6 +1087,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
 
 class _PrivateNetworkingTab extends StatelessWidget {
   const _PrivateNetworkingTab({
+    required this.joinOrbKey,
+    required this.hostOrbKey,
     required this.codeController,
     required this.nameController,
     required this.descriptionController,
@@ -1064,6 +1103,8 @@ class _PrivateNetworkingTab extends StatelessWidget {
     required this.onHostPressed,
   });
 
+  final Key joinOrbKey;
+  final Key hostOrbKey;
   final TextEditingController codeController;
   final TextEditingController nameController;
   final TextEditingController descriptionController;
@@ -1123,6 +1164,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
             runSpacing: 18,
             children: <Widget>[
               _NetworkingActionOrb(
+                key: joinOrbKey,
                 label: isDisabled ? '本地初始化' : (isBusy ? '处理中' : '加入网络'),
                 icon: isDisabled
                     ? Icons.power_settings_new_rounded
@@ -1139,6 +1181,7 @@ class _PrivateNetworkingTab extends StatelessWidget {
                 onTap: isBusy || isDisabled ? null : onJoinPressed,
               ),
               _NetworkingActionOrb(
+                key: hostOrbKey,
                 label: isDisabled ? '本地初始化' : (isBusy ? '处理中' : '主持网络'),
                 icon: isDisabled
                     ? Icons.power_settings_new_rounded
@@ -2102,6 +2145,7 @@ class _DefaultNetworkFlowPresentation {
 
 class _NetworkingActionOrb extends StatelessWidget {
   const _NetworkingActionOrb({
+    super.key,
     required this.label,
     required this.icon,
     required this.subtitle,
@@ -2395,6 +2439,28 @@ String _serviceStateLabel(ZeroTierRuntimeStatus status) {
   }
 }
 
+String _nodeStateLabel(ZeroTierRuntimeStatus status) {
+  if (!status.isEnvironmentReady) {
+    return '未初始化';
+  }
+  if (status.isNodeReady) {
+    return 'ready';
+  }
+  if (status.isNodeOffline) {
+    return 'offline';
+  }
+  if (status.isNodeStarting) {
+    return 'starting';
+  }
+  if (status.isNodeErrored) {
+    return 'error';
+  }
+  if (status.serviceState == 'prepared') {
+    return '未启动';
+  }
+  return status.serviceState;
+}
+
 _RuntimeSignal _resolveRuntimeSignal({
   required ZeroTierRuntimeStatus runtimeStatus,
   required List<ZeroTierRuntimeEvent> recentEvents,
@@ -2429,10 +2495,10 @@ _RuntimeSignal _resolveRuntimeSignal({
     );
   }
 
-  if (hasActiveJoinedNetwork) {
+  if (runtimeStatus.isNodeReady && hasActiveJoinedNetwork) {
     return const _RuntimeSignal(
-      label: '网络已在线',
-      message: '当前本机仍检测到可用的 ZeroTier 本地网络映射，运行时状态以实际 joined network 为准。',
+      label: '网络在线',
+      message: '当前本机已检测到可用的 ZeroTier 本地网络映射，runtime 与 libzt 节点都已进入可用状态。',
       icon: Icons.check_circle_rounded,
       background: Color(0xFFEAF8EF),
       foreground: Color(0xFF15803D),
@@ -2456,7 +2522,7 @@ _RuntimeSignal _resolveRuntimeSignal({
           label: '节点当前离线',
           message: highlightedEvent.message?.trim().isNotEmpty == true
               ? highlightedEvent.message!
-              : 'ZeroTier 节点当前失去在线连接，这更像是连通性抖动，不等同于进程重启。',
+              : 'libzt 节点当前失去在线连接，这更像是节点在线性抖动，不等同于进程重启。',
           icon: Icons.wifi_off_rounded,
           background: const Color(0xFFFFF4E8),
           foreground: const Color(0xFFB45309),
@@ -2504,33 +2570,42 @@ _RuntimeSignal _resolveRuntimeSignal({
 
   switch (runtimeStatus.serviceState) {
     case 'running':
+      if (runtimeStatus.isNodeReady) {
+        return const _RuntimeSignal(
+          label: 'runtime ready',
+          message: 'libzt 节点已经 ready，UI 现在把这作为 runtime 真正可用的判定条件。',
+          icon: Icons.verified_rounded,
+          background: Color(0xFFEAF8EF),
+          foreground: Color(0xFF15803D),
+        );
+      }
       return const _RuntimeSignal(
-        label: '运行稳定',
-        message: 'ZeroTier runtime 正在运行，等待新的组网事件或网络状态变化。',
-        icon: Icons.verified_rounded,
-        background: Color(0xFFEAF8EF),
-        foreground: Color(0xFF15803D),
+        label: '节点未就绪',
+        message: '宿主 runtime 已进入 running，但 libzt 节点还没有完成 ready，UI 仍按未就绪处理。',
+        icon: Icons.hourglass_top_rounded,
+        background: Color(0xFFFFF4E8),
+        foreground: Color(0xFFB45309),
       );
     case 'offline':
       return const _RuntimeSignal(
         label: '节点离线',
-        message: 'ZeroTier 节点当前未在线，但本地 runtime 仍然存活；这更像是离线状态，不等同于重新启动中。',
+        message: 'libzt 节点当前不在线，虽然本地 runtime 还在，但 UI 不会把它显示成 ready。',
         icon: Icons.wifi_off_rounded,
         background: Color(0xFFFFF4E8),
         foreground: Color(0xFFB45309),
       );
     case 'starting':
       return const _RuntimeSignal(
-        label: '正在启动',
-        message: '本机 ZeroTier runtime 已开始启动，Node ID 与网络状态会在后续事件中回流。',
+        label: '节点启动中',
+        message: '宿主 runtime 已发起启动，但只有等 libzt 节点真正 ready 后，UI 才会进入 ready 显示。',
         icon: Icons.autorenew_rounded,
         background: Color(0xFFEAF2FF),
         foreground: Color(0xFF1D4ED8),
       );
     case 'prepared':
       return const _RuntimeSignal(
-        label: '本地已就绪',
-        message: '运行时环境已经准备完成，下一步可以发起节点启动和入网动作。',
+        label: '环境已就绪',
+        message: '当前只说明宿主环境可用，还不代表 libzt 节点已经 ready。',
         icon: Icons.construction_rounded,
         background: Color(0xFFFFF4E8),
         foreground: Color(0xFFB45309),
@@ -2603,6 +2678,17 @@ _NetworkVisualState _resolveNetworkVisualState({
   }
 
   if (localState == null) {
+    if (_isAcceptedMembershipStatus(managedStatus)) {
+      return _NetworkVisualState(
+        label: '等待本机入网',
+        message: hasServiceAssignedIp
+            ? '服务端已经分配 Service IP，正在等待本机 Agent 和 ZeroTier runtime 建立本地映射。'
+            : '服务端已接受当前设备入网，正在等待本机 ZeroTier 本地链路建立。',
+        icon: Icons.hourglass_top_rounded,
+        background: Color(0xFFEAF2FF),
+        foreground: Color(0xFF1D4ED8),
+      );
+    }
     if (!hasJoinIntentEvidence) {
       return const _NetworkVisualState(
         label: '尚未接入',
@@ -2610,24 +2696,6 @@ _NetworkVisualState _resolveNetworkVisualState({
         icon: Icons.link_off_rounded,
         background: Color(0xFFF3F4F6),
         foreground: Color(0xFF4B5563),
-      );
-    }
-    if (_isAcceptedMembershipStatus(managedStatus) && hasServiceAssignedIp) {
-      return const _NetworkVisualState(
-        label: '等待本机入网',
-        message: '服务端已经分配 Service IP，正在等待本机 Agent 和 ZeroTier runtime 建立本地映射。',
-        icon: Icons.hourglass_top_rounded,
-        background: Color(0xFFEAF2FF),
-        foreground: Color(0xFF1D4ED8),
-      );
-    }
-    if (_isAcceptedMembershipStatus(managedStatus)) {
-      return const _NetworkVisualState(
-        label: '正在入网',
-        message: '服务端已接受当前设备入网，正在等待本机 ZeroTier 本地链路建立。',
-        icon: Icons.sync_rounded,
-        background: Color(0xFFEAF2FF),
-        foreground: Color(0xFF1D4ED8),
       );
     }
     if (isBusy) {
@@ -2849,36 +2917,6 @@ bool _isHandshakePendingLocalNetwork(
   return serverAlreadyAccepted || localStillNegotiating;
 }
 
-bool _hasRecentJoinIntent(
-  List<ZeroTierRuntimeEvent> events,
-  String networkId,
-) {
-  final String targetNetworkId = networkId.trim().toLowerCase();
-  for (final ZeroTierRuntimeEvent event in events) {
-    final String eventNetworkId = event.networkId?.trim().toLowerCase() ?? '';
-    if (targetNetworkId.isNotEmpty && eventNetworkId != targetNetworkId) {
-      continue;
-    }
-    switch (event.type) {
-      case ZeroTierRuntimeEventType.networkJoining:
-      case ZeroTierRuntimeEventType.networkWaitingAuthorization:
-      case ZeroTierRuntimeEventType.networkOnline:
-      case ZeroTierRuntimeEventType.ipAssigned:
-        return true;
-      case ZeroTierRuntimeEventType.environmentReady:
-      case ZeroTierRuntimeEventType.permissionRequired:
-      case ZeroTierRuntimeEventType.nodeStarted:
-      case ZeroTierRuntimeEventType.nodeOnline:
-      case ZeroTierRuntimeEventType.nodeOffline:
-      case ZeroTierRuntimeEventType.nodeStopped:
-      case ZeroTierRuntimeEventType.networkLeft:
-      case ZeroTierRuntimeEventType.error:
-        continue;
-    }
-  }
-  return false;
-}
-
 bool _isEffectivelyLeftLocalNetwork(ZeroTierNetworkState? localState) {
   if (localState == null) {
     return true;
@@ -2903,14 +2941,15 @@ _DefaultNetworkFlowState _resolveDefaultNetworkFlowState({
   required bool isGrouped,
   required bool isAwaitingAuthorization,
   required bool isSubmittingJoin,
+  required bool hasActiveJoinSession,
   required bool isBootstrapping,
   required ZeroTierNetworkState? localState,
   required String? managedStatus,
   required bool hasServiceAssignedIp,
   required bool hasMembershipAccepted,
-  required bool hasJoinIntentEvidence,
   required bool hasLastError,
 }) {
+  final bool hasCurrentJoinIntent = isSubmittingJoin || hasActiveJoinSession;
   if (isClosing) {
     return _DefaultNetworkFlowState.closing;
   }
@@ -2920,17 +2959,18 @@ _DefaultNetworkFlowState _resolveDefaultNetworkFlowState({
   if (isGrouped) {
     return _DefaultNetworkFlowState.online;
   }
-  if (isAwaitingAuthorization) {
+  if (isAwaitingAuthorization && hasCurrentJoinIntent) {
     return _DefaultNetworkFlowState.awaitingAuthorization;
   }
-  if (localState != null &&
+  if (hasActiveJoinSession &&
+      localState != null &&
       (localState.status == 'REQUESTING_CONFIGURATION' ||
           (localState.status == 'OK' &&
               !_isLocalNetworkMounted(localState, hasServiceAssignedIp)) ||
           localState.status == 'UNKNOWN')) {
     return _DefaultNetworkFlowState.awaitingLocalConfig;
   }
-  if (hasMembershipAccepted && localState == null && hasJoinIntentEvidence) {
+  if (hasActiveJoinSession && hasMembershipAccepted && localState == null) {
     return _DefaultNetworkFlowState.awaitingLocalNetwork;
   }
   if (isSubmittingJoin) {

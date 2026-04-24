@@ -14,12 +14,23 @@
 #include <functional>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "native/zerotier/zerotier_windows_firewall_manager.h"
 #include "native/zerotier/zerotier_windows_network_manager.h"
 #include "native/zerotier/zerotier_windows_runtime.h"
+
+struct PendingMethodResult {
+  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result;
+  bool success = false;
+  std::string error_code;
+  std::string error_message;
+  std::optional<flutter::EncodableValue> value;
+};
+
+struct ZeroTierWindowsPluginState;
 
 class ZeroTierWindowsPlugin : public flutter::Plugin {
  public:
@@ -32,18 +43,9 @@ class ZeroTierWindowsPlugin : public flutter::Plugin {
   ZeroTierWindowsPlugin& operator=(const ZeroTierWindowsPlugin&) = delete;
 
  private:
-  static constexpr UINT kFlushEventsMessage = WM_APP + 0x4A1;
-  static constexpr UINT kFlushMethodResultsMessage = WM_APP + 0x4A2;
-
   using EventSink = flutter::EventSink<flutter::EncodableValue>;
   using MethodResult = flutter::MethodResult<flutter::EncodableValue>;
   using MethodCall = flutter::MethodCall<flutter::EncodableValue>;
-  struct PendingMethodResult {
-    std::unique_ptr<MethodResult> result;
-    bool success = false;
-    std::string error_code;
-    std::string error_message;
-  };
 
   void AttachRegistrar(flutter::PluginRegistrarWindows* registrar);
   void HandleMethodCall(const MethodCall& call,
@@ -52,6 +54,9 @@ class ZeroTierWindowsPlugin : public flutter::Plugin {
                              std::unique_ptr<MethodResult> result);
   void HandleLeaveNetworkCall(const flutter::EncodableMap& args,
                               std::unique_ptr<MethodResult> result);
+  void HandleRuntimeStatusCall(
+      std::unique_ptr<MethodResult> result,
+      std::function<flutter::EncodableMap(ZeroTierWindowsRuntime&)> work);
   std::unique_ptr<flutter::StreamHandlerError<flutter::EncodableValue>> OnListen(
       const flutter::EncodableValue* arguments,
       std::unique_ptr<EventSink>&& events);
@@ -64,17 +69,10 @@ class ZeroTierWindowsPlugin : public flutter::Plugin {
   std::optional<LRESULT> HandleWindowProc(HWND hwnd, UINT message, WPARAM wparam,
                                           LPARAM lparam);
 
-  ZeroTierWindowsRuntime runtime_;
-  ZeroTierWindowsNetworkManager network_manager_;
-  ZeroTierWindowsFirewallManager firewall_manager_;
+  std::shared_ptr<ZeroTierWindowsPluginState> state_;
   flutter::PluginRegistrarWindows* registrar_ = nullptr;
   HWND window_handle_ = nullptr;
   int window_proc_delegate_id_ = 0;
-  std::mutex event_mutex_;
-  std::deque<flutter::EncodableMap> pending_events_;
-  std::unique_ptr<EventSink> event_sink_;
-  std::mutex method_result_mutex_;
-  std::deque<PendingMethodResult> pending_method_results_;
 };
 
 #endif  // FLUTTER_RUNNER_ZEROTIER_WINDOWS_PLUGIN_H_

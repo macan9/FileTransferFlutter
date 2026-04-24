@@ -5,6 +5,85 @@
 #include <thread>
 #include <utility>
 
+constexpr UINT kFlushEventsMessage = WM_APP + 0x4A1;
+constexpr UINT kFlushMethodResultsMessage = WM_APP + 0x4A2;
+
+struct ZeroTierWindowsPluginState {
+  ZeroTierWindowsPluginState() : network_manager(&runtime) {}
+
+  ZeroTierWindowsRuntime runtime;
+  ZeroTierWindowsNetworkManager network_manager;
+  ZeroTierWindowsFirewallManager firewall_manager;
+  std::mutex event_mutex;
+  std::deque<flutter::EncodableMap> pending_events;
+  std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink;
+  std::mutex method_result_mutex;
+  std::deque<PendingMethodResult> pending_method_results;
+  HWND window_handle = nullptr;
+
+  void QueueEvent(const flutter::EncodableMap& event) {
+    {
+      std::scoped_lock lock(event_mutex);
+      pending_events.push_back(event);
+    }
+
+    if (window_handle != nullptr) {
+      PostMessage(window_handle, kFlushEventsMessage, 0, 0);
+    }
+  }
+
+  void QueueMethodResult(PendingMethodResult pending_result) {
+    {
+      std::scoped_lock lock(method_result_mutex);
+      pending_method_results.push_back(std::move(pending_result));
+    }
+
+    if (window_handle != nullptr) {
+      PostMessage(window_handle, kFlushMethodResultsMessage, 0, 0);
+    }
+  }
+
+  void FlushQueuedEvents() {
+    if (!event_sink) {
+      return;
+    }
+
+    std::deque<flutter::EncodableMap> items;
+    {
+      std::scoped_lock lock(event_mutex);
+      items.swap(pending_events);
+    }
+
+    for (const auto& event : items) {
+      event_sink->Success(flutter::EncodableValue(event));
+    }
+  }
+
+  void FlushQueuedMethodResults() {
+    std::deque<PendingMethodResult> items;
+    {
+      std::scoped_lock lock(method_result_mutex);
+      items.swap(pending_method_results);
+    }
+
+    for (auto& pending_result : items) {
+      if (pending_result.result == nullptr) {
+        continue;
+      }
+      if (pending_result.success) {
+        if (pending_result.value.has_value()) {
+          pending_result.result->Success(std::move(*pending_result.value));
+        } else {
+          pending_result.result->Success();
+        }
+      } else {
+        pending_result.result->Error(pending_result.error_code,
+                                     pending_result.error_message);
+      }
+    }
+  }
+};
+
 namespace {
 
 constexpr char kMethodChannelName[] =
@@ -54,14 +133,21 @@ bool ReadBoolArgument(const flutter::EncodableMap& arguments, const char* key,
 
 }  // namespace
 
-ZeroTierWindowsPlugin::ZeroTierWindowsPlugin() : network_manager_(&runtime_) {
-  runtime_.SetEventCallback([this](const flutter::EncodableMap& event) {
-    QueueEvent(event);
+ZeroTierWindowsPlugin::ZeroTierWindowsPlugin()
+    : state_(std::make_shared<ZeroTierWindowsPluginState>()) {
+  std::weak_ptr<ZeroTierWindowsPluginState> weak_state = state_;
+  state_->runtime.SetEventCallback([weak_state](const flutter::EncodableMap& event) {
+    if (auto state = weak_state.lock()) {
+      state->QueueEvent(event);
+    }
   });
 }
 
 ZeroTierWindowsPlugin::~ZeroTierWindowsPlugin() {
-  runtime_.ClearEventCallback();
+  if (state_) {
+    state_->runtime.ClearEventCallback();
+    state_->window_handle = nullptr;
+  }
   if (registrar_ != nullptr && window_proc_delegate_id_ != 0) {
     registrar_->UnregisterTopLevelWindowProcDelegate(window_proc_delegate_id_);
   }
@@ -113,6 +199,9 @@ void ZeroTierWindowsPlugin::AttachRegistrar(
 
   if (auto* view = registrar_->GetView(); view != nullptr) {
     window_handle_ = view->GetNativeWindow();
+    if (state_) {
+      state_->window_handle = window_handle_;
+    }
   }
 
   window_proc_delegate_id_ = registrar_->RegisterTopLevelWindowProcDelegate(
@@ -129,21 +218,33 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
   const flutter::EncodableMap empty_arguments;
   const flutter::EncodableMap& args =
       arguments == nullptr ? empty_arguments : *arguments;
+  if (!state_) {
+    result->Error("plugin_unavailable", "ZeroTier plugin state is unavailable.");
+    return;
+  }
 
   if (method_name == "detectStatus") {
-    result->Success(flutter::EncodableValue(runtime_.DetectStatus()));
+    HandleRuntimeStatusCall(
+        std::move(result),
+        [](ZeroTierWindowsRuntime& runtime) { return runtime.DetectStatus(); });
     return;
   }
   if (method_name == "prepareEnvironment") {
-    result->Success(flutter::EncodableValue(runtime_.PrepareEnvironment()));
+    HandleRuntimeStatusCall(std::move(result), [](ZeroTierWindowsRuntime& runtime) {
+      return runtime.PrepareEnvironment();
+    });
     return;
   }
   if (method_name == "startNode") {
-    result->Success(flutter::EncodableValue(runtime_.StartNode()));
+    HandleRuntimeStatusCall(
+        std::move(result),
+        [](ZeroTierWindowsRuntime& runtime) { return runtime.StartNode(); });
     return;
   }
   if (method_name == "stopNode") {
-    result->Success(flutter::EncodableValue(runtime_.StopNode()));
+    HandleRuntimeStatusCall(
+        std::move(result),
+        [](ZeroTierWindowsRuntime& runtime) { return runtime.StopNode(); });
     return;
   }
   if (method_name == "joinNetworkAndWaitForIp") {
@@ -155,12 +256,12 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
     return;
   }
   if (method_name == "listNetworks") {
-    result->Success(flutter::EncodableValue(network_manager_.ListNetworks()));
+    result->Success(flutter::EncodableValue(state_->network_manager.ListNetworks()));
     return;
   }
   if (method_name == "getNetworkDetail") {
     const std::string network_id = ReadStringArgument(args, "networkId");
-    const auto network = network_manager_.GetNetworkDetail(network_id);
+    const auto network = state_->network_manager.GetNetworkDetail(network_id);
     if (network.has_value()) {
       result->Success(flutter::EncodableValue(*network));
     } else {
@@ -171,7 +272,7 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
   if (method_name == "probeNetworkStateNow") {
     const std::string network_id = ReadStringArgument(args, "networkId");
     result->Success(
-        flutter::EncodableValue(network_manager_.ProbeNetworkStateNow(network_id)));
+        flutter::EncodableValue(state_->network_manager.ProbeNetworkStateNow(network_id)));
     return;
   }
   if (method_name == "applyFirewallRules") {
@@ -196,9 +297,9 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
       }
     }
     std::string error_message;
-    if (firewall_manager_.ApplyRules(ReadStringArgument(args, "ruleScopeId"),
-                                     ReadStringArgument(args, "peerZeroTierIp"),
-                                     ports, &error_message)) {
+    if (state_->firewall_manager.ApplyRules(ReadStringArgument(args, "ruleScopeId"),
+                                            ReadStringArgument(args, "peerZeroTierIp"),
+                                            ports, &error_message)) {
       result->Success();
     } else {
       result->Error("firewall_apply_failed", error_message);
@@ -207,8 +308,8 @@ void ZeroTierWindowsPlugin::HandleMethodCall(
   }
   if (method_name == "removeFirewallRules") {
     std::string error_message;
-    if (firewall_manager_.RemoveRules(ReadStringArgument(args, "ruleScopeId"),
-                                      &error_message)) {
+    if (state_->firewall_manager.RemoveRules(ReadStringArgument(args, "ruleScopeId"),
+                                             &error_message)) {
       result->Success();
     } else {
       result->Error("firewall_remove_failed", error_message);
@@ -226,18 +327,21 @@ void ZeroTierWindowsPlugin::HandleJoinNetworkCall(
   const int timeout_ms = ReadIntArgument(args, "timeoutMs");
   const bool allow_mount_degraded =
       ReadBoolArgument(args, "allowMountDegraded", false);
-  auto* plugin = this;
-  std::thread([plugin, network_id, timeout_ms, allow_mount_degraded,
+  std::weak_ptr<ZeroTierWindowsPluginState> weak_state = state_;
+  std::thread([weak_state, network_id, timeout_ms, allow_mount_degraded,
                result = std::move(result)]() mutable {
+    auto state = weak_state.lock();
+    if (!state || result == nullptr) {
+      return;
+    }
     std::string error_message;
-    const bool success = plugin->network_manager_.JoinNetworkAndWaitForIp(
+    const bool success = state->network_manager.JoinNetworkAndWaitForIp(
         network_id, timeout_ms, allow_mount_degraded, &error_message);
-    plugin->QueueMethodResult(PendingMethodResult{
-        std::move(result),
-        success,
-        "join_failed",
-        error_message,
-    });
+    if (success) {
+      result->Success();
+    } else {
+      result->Error("join_failed", error_message);
+    }
   }).detach();
 }
 
@@ -246,89 +350,78 @@ void ZeroTierWindowsPlugin::HandleLeaveNetworkCall(
     std::unique_ptr<MethodResult> result) {
   const std::string network_id = ReadStringArgument(args, "networkId");
   const std::string source = ReadStringArgument(args, "source");
-  auto* plugin = this;
-  std::thread([plugin, network_id, source, result = std::move(result)]() mutable {
+  std::weak_ptr<ZeroTierWindowsPluginState> weak_state = state_;
+  std::thread([weak_state, network_id, source,
+               result = std::move(result)]() mutable {
+    auto state = weak_state.lock();
+    if (!state || result == nullptr) {
+      return;
+    }
     std::string error_message;
     const bool success =
-        plugin->network_manager_.LeaveNetwork(network_id, source, &error_message);
-    plugin->QueueMethodResult(PendingMethodResult{
-        std::move(result),
-        success,
-        "leave_failed",
-        error_message,
-    });
+        state->network_manager.LeaveNetwork(network_id, source, &error_message);
+    if (success) {
+      result->Success();
+    } else {
+      result->Error("leave_failed", error_message);
+    }
+  }).detach();
+}
+
+void ZeroTierWindowsPlugin::HandleRuntimeStatusCall(
+    std::unique_ptr<MethodResult> result,
+    std::function<flutter::EncodableMap(ZeroTierWindowsRuntime&)> work) {
+  std::weak_ptr<ZeroTierWindowsPluginState> weak_state = state_;
+  std::thread([weak_state, work = std::move(work),
+               result = std::move(result)]() mutable {
+    auto state = weak_state.lock();
+    if (!state || result == nullptr) {
+      return;
+    }
+    flutter::EncodableMap payload = work(state->runtime);
+    result->Success(flutter::EncodableValue(payload));
   }).detach();
 }
 
 std::unique_ptr<flutter::StreamHandlerError<flutter::EncodableValue>>
 ZeroTierWindowsPlugin::OnListen(const flutter::EncodableValue* /*arguments*/,
                                 std::unique_ptr<EventSink>&& events) {
-  event_sink_ = std::move(events);
-  FlushQueuedEvents();
+  if (state_) {
+    state_->event_sink = std::move(events);
+    state_->FlushQueuedEvents();
+  }
   return nullptr;
 }
 
 std::unique_ptr<flutter::StreamHandlerError<flutter::EncodableValue>>
 ZeroTierWindowsPlugin::OnCancel(const flutter::EncodableValue* /*arguments*/) {
-  event_sink_.reset();
+  if (state_) {
+    state_->event_sink.reset();
+  }
   return nullptr;
 }
 
 void ZeroTierWindowsPlugin::QueueEvent(const flutter::EncodableMap& event) {
-  {
-    std::scoped_lock lock(event_mutex_);
-    pending_events_.push_back(event);
-  }
-
-  if (window_handle_ != nullptr) {
-    PostMessage(window_handle_, kFlushEventsMessage, 0, 0);
+  if (state_) {
+    state_->QueueEvent(event);
   }
 }
 
 void ZeroTierWindowsPlugin::QueueMethodResult(PendingMethodResult pending_result) {
-  {
-    std::scoped_lock lock(method_result_mutex_);
-    pending_method_results_.push_back(std::move(pending_result));
-  }
-
-  if (window_handle_ != nullptr) {
-    PostMessage(window_handle_, kFlushMethodResultsMessage, 0, 0);
+  if (state_) {
+    state_->QueueMethodResult(std::move(pending_result));
   }
 }
 
 void ZeroTierWindowsPlugin::FlushQueuedEvents() {
-  if (!event_sink_) {
-    return;
-  }
-
-  std::deque<flutter::EncodableMap> pending_events;
-  {
-    std::scoped_lock lock(event_mutex_);
-    pending_events.swap(pending_events_);
-  }
-
-  for (const auto& event : pending_events) {
-    event_sink_->Success(flutter::EncodableValue(event));
+  if (state_) {
+    state_->FlushQueuedEvents();
   }
 }
 
 void ZeroTierWindowsPlugin::FlushQueuedMethodResults() {
-  std::deque<PendingMethodResult> pending_method_results;
-  {
-    std::scoped_lock lock(method_result_mutex_);
-    pending_method_results.swap(pending_method_results_);
-  }
-
-  for (auto& pending_result : pending_method_results) {
-    if (pending_result.result == nullptr) {
-      continue;
-    }
-    if (pending_result.success) {
-      pending_result.result->Success();
-    } else {
-      pending_result.result->Error(pending_result.error_code,
-                                   pending_result.error_message);
-    }
+  if (state_) {
+    state_->FlushQueuedMethodResults();
   }
 }
 

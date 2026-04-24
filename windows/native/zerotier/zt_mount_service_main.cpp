@@ -1005,7 +1005,6 @@ int RunConsoleMode() {
   if (g_stop_event == nullptr) {
     return 2;
   }
-  std::puts("[ZT/WIN] zt_mount_service console mode started");
   ServiceLoop();
   CloseHandle(g_stop_event);
   g_stop_event = nullptr;

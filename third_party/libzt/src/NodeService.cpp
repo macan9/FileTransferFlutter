@@ -591,15 +591,6 @@ void NodeService::syncManagedStuff(NetworkState& n)
     }
     std::sort(newManagedIps.begin(), newManagedIps.end());
     newManagedIps.erase(std::unique(newManagedIps.begin(), newManagedIps.end()), newManagedIps.end());
-    const std::vector<InetAddress> tapIpsBefore = n.tap ? n.tap->ips() : std::vector<InetAddress>();
-    fprintf(
-        stderr,
-        "[libzt] syncManagedStuff net=%llx assignedAddressCount=%u managedIpsBefore=%u tapHasIpv4=%d tapHasIpv6=%d\n",
-        (unsigned long long)n.config.nwid,
-        n.config.assignedAddressCount,
-        (unsigned int)n.managedIps.size(),
-        hasFamily(tapIpsBefore, true) ? 1 : 0,
-        hasFamily(tapIpsBefore, false) ? 1 : 0);
     for (std::vector<InetAddress>::iterator ip(n.managedIps.begin()); ip != n.managedIps.end(); ++ip) {
         if (std::find(newManagedIps.begin(), newManagedIps.end(), *ip) == newManagedIps.end()) {
             if (! n.tap->removeIp(*ip)) {
@@ -625,12 +616,6 @@ void NodeService::syncManagedStuff(NetworkState& n)
     }
     for (std::vector<InetAddress>::iterator ip(newManagedIps.begin()); ip != newManagedIps.end(); ++ip) {
         if (std::find(n.managedIps.begin(), n.managedIps.end(), *ip) == n.managedIps.end()) {
-            fprintf(
-                stderr,
-                "[libzt] syncManagedStuff add attempt net=%llx ip=%s family=%s\n",
-                (unsigned long long)n.config.nwid,
-                ip->toString(ipbuf),
-                (*ip).isV4() ? "ipv4" : ((*ip).isV6() ? "ipv6" : "other"));
             if (! n.tap->addIp(*ip)) {
                 fprintf(stderr, "ERROR: unable to add ip address %s" ZT_EOL_S, ip->toString(ipbuf));
             }
@@ -653,14 +638,6 @@ void NodeService::syncManagedStuff(NetworkState& n)
         }
     }
     n.managedIps.swap(newManagedIps);
-    const std::vector<InetAddress> tapIpsAfter = n.tap ? n.tap->ips() : std::vector<InetAddress>();
-    fprintf(
-        stderr,
-        "[libzt] syncManagedStuff complete net=%llx managedIpsAfter=%u tapHasIpv4=%d tapHasIpv6=%d\n",
-        (unsigned long long)n.config.nwid,
-        (unsigned int)n.managedIps.size(),
-        hasFamily(tapIpsAfter, true) ? 1 : 0,
-        hasFamily(tapIpsAfter, false) ? 1 : 0);
 }
 
 void NodeService::syncManagedRoutes(NetworkState& n, const ZT_VirtualNetworkConfig& cfg, bool install)
@@ -672,11 +649,6 @@ void NodeService::syncManagedRoutes(NetworkState& n, const ZT_VirtualNetworkConf
     }
     const NET_IFINDEX ifIndex = winTap->interfaceIndex();
     if (ifIndex == (NET_IFINDEX)-1 || ifIndex == 0) {
-        fprintf(stderr,
-            "[libzt] syncManagedRoutes skip net=%llx reason=invalid_ifindex install=%d ifIndex=%u\n",
-            (unsigned long long)cfg.nwid,
-            install ? 1 : 0,
-            (unsigned int)ifIndex);
         return;
     }
 
@@ -788,7 +760,7 @@ void NodeService::syncManagedRoutes(NetworkState& n, const ZT_VirtualNetworkConf
             char vbuf[80] = { 0 };
             fprintf(
                 stderr,
-                "[libzt] syncManagedRoutes add failed net=%llx target=%s via=%s metric=%u rc=%lu\n",
+                "ERROR: syncManagedRoutes add failed net=%llx target=%s via=%s metric=%u rc=%lu\n",
                 (unsigned long long)cfg.nwid,
                 target.toString(tbuf),
                 via.toString(vbuf),
@@ -1024,15 +996,12 @@ EthernetTap* NodeService::createNetworkTap(uint64_t net_id, const ZT_VirtualNetw
 {
     if (!nwc) {
         fprintf(stderr,
-            "[libzt] tapFactory error=missing_network_config net=%llx\n",
+            "ERROR: tapFactory missing_network_config net=%llx\n",
             (unsigned long long)net_id);
         return (EthernetTap*)0;
     }
 #if defined(__WINDOWS__)
 #if defined(ZTS_ENABLE_WINDOWS_OS_TAP)
-    fprintf(stderr,
-        "[libzt] tapFactory platform=windows mode=windows_ethernet_tap net=%llx\n",
-        (unsigned long long)net_id);
     try {
         return new WindowsEthernetTap(
             _homePath.c_str(),
@@ -1047,15 +1016,12 @@ EthernetTap* NodeService::createNetworkTap(uint64_t net_id, const ZT_VirtualNetw
     catch (const std::exception& e) {
         fprintf(
             stderr,
-            "[libzt] tapFactory platform=windows mode=windows_ethernet_tap error=%s net=%llx\n",
+            "ERROR: tapFactory windows_ethernet_tap error=%s net=%llx\n",
             e.what(),
             (unsigned long long)net_id);
         return (EthernetTap*)0;
     }
 #else
-    fprintf(stderr,
-        "[libzt] tapFactory platform=windows mode=virtualtap_compat net=%llx\n",
-        (unsigned long long)net_id);
 #endif
 #endif
     return new VirtualTap(
@@ -1083,7 +1049,7 @@ int NodeService::nodeVirtualNetworkConfigFunction(
             if (!nwc) {
                 fprintf(
                     stderr,
-                    "[libzt] networkConfig error=missing_network_config net=%llx op=%d\n",
+                    "ERROR: networkConfig missing_network_config net=%llx op=%d\n",
                     (unsigned long long)net_id,
                     (int)op);
                 _nets.erase(net_id);
@@ -1092,7 +1058,7 @@ int NodeService::nodeVirtualNetworkConfigFunction(
             if ((op == ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_UP) && (!nuptr)) {
                 fprintf(
                     stderr,
-                    "[libzt] networkConfig error=missing_nuptr net=%llx op=%d\n",
+                    "ERROR: networkConfig missing_nuptr net=%llx op=%d\n",
                     (unsigned long long)net_id,
                     (int)op);
                 _nets.erase(net_id);
@@ -1109,28 +1075,6 @@ int NodeService::nodeVirtualNetworkConfigFunction(
                         }
                     }
                 }
-                fprintf(
-                    stderr,
-                    "[libzt] networkConfig op=UP net=%llx status=%d rev=%lu assigned=%u routes=%u mtu=%u tap=%p\n",
-                    (unsigned long long)net_id,
-                    (int)nwc->status,
-                    (unsigned long)nwc->netconfRevision,
-                    nwc->assignedAddressCount,
-                    nwc->routeCount,
-                    nwc->mtu,
-                    n.tap);
-            }
-            if (op == ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE) {
-                fprintf(
-                    stderr,
-                    "[libzt] networkConfig op=CONFIG_UPDATE net=%llx status=%d rev=%lu assigned=%u routes=%u mtu=%u tap=%p\n",
-                    (unsigned long long)net_id,
-                    (int)nwc->status,
-                    (unsigned long)nwc->netconfRevision,
-                    nwc->assignedAddressCount,
-                    nwc->routeCount,
-                    nwc->mtu,
-                    n.tap);
             }
             const ZT_VirtualNetworkConfig previousConfig = n.config;
             memcpy(&(n.config), nwc, sizeof(ZT_VirtualNetworkConfig));
@@ -1459,19 +1403,6 @@ void NodeService::generateSyntheticEvents()
                     readyIpv6 = managedHasIpv6 && tapHasIpv6;
                 }
 
-                fprintf(
-                    stderr,
-                    "[libzt] syntheticEvent net=%llx status=OK assigned=%u routeCount=%u managedHasIpv4=%d managedHasIpv6=%d tapHasIpv4=%d tapHasIpv6=%d readyIpv4=%d readyIpv6=%d path=%s\n",
-                    (unsigned long long)netState.config.nwid,
-                    netState.config.assignedAddressCount,
-                    netState.config.routeCount,
-                    managedHasIpv4 ? 1 : 0,
-                    managedHasIpv6 ? 1 : 0,
-                    tapHasIpv4 ? 1 : 0,
-                    tapHasIpv6 ? 1 : 0,
-                    readyIpv4 ? 1 : 0,
-                    readyIpv6 ? 1 : 0,
-                    vtap ? "virtualtap_lwip" : "ethernettap_host");
                 if (readyIpv4) {
                     sendEventToUser(ZTS_EVENT_NETWORK_READY_IP4, (void*)&netState);
                 }
@@ -1924,14 +1855,6 @@ void NodeService::nodeStatePutFunction(
     }
 
     if (len >= 0 && data != nullptr) {
-        if (type == ZT_STATE_OBJECT_NETWORK_CONFIG) {
-            fprintf(
-                stderr,
-                "[libzt] statePut networkConfig net=%llx bytes=%d path=%s\n",
-                (unsigned long long)id[0],
-                len,
-                p);
-        }
         // Check to see if we've already written this first. This reduces
         // redundant writes and I/O overhead on most platforms and has
         // little effect on others.
@@ -2035,14 +1958,6 @@ int NodeService::nodeStateGetFunction(
         int n = (int)fread(data, 1, maxlen, f);
         fclose(f);
         if (n >= 0) {
-            if (type == ZT_STATE_OBJECT_NETWORK_CONFIG) {
-                fprintf(
-                    stderr,
-                    "[libzt] stateGet networkConfig net=%llx bytes=%d path=%s\n",
-                    (unsigned long long)id[0],
-                    n,
-                    p);
-            }
             return n;
         }
     }

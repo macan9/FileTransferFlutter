@@ -72,6 +72,7 @@ class ZeroTierWindowsRuntime {
   using EventCallback = std::function<void(const flutter::EncodableMap&)>;
 
   ZeroTierWindowsRuntime();
+  ~ZeroTierWindowsRuntime();
 
   flutter::EncodableMap DetectStatus();
   flutter::EncodableMap PrepareEnvironment();
@@ -125,6 +126,10 @@ class ZeroTierWindowsRuntime {
   void PersistKnownNetworkIdsLocked() const;
   void RememberKnownNetworkLocked(uint64_t network_id);
   void ForgetKnownNetworkLocked(uint64_t network_id);
+  void SetLastNodeControlHintLocked(const std::string& hint);
+  std::string DescribeNodeTriggerLocked(const std::string& event_name) const;
+  std::string SummarizeTrackedNetworksLocked() const;
+  std::string BuildLiveNetworkProbeSummary(uint64_t network_id) const;
   std::string BuildServiceState() const;
   void SetLastErrorLocked(const std::string& message);
   void ClearLastErrorLocked();
@@ -147,7 +152,8 @@ class ZeroTierWindowsRuntime {
       uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
       const std::map<std::string, uint8_t>& managed_prefix_hints,
-      std::vector<MountedSystemRoute>* created_routes);
+      std::vector<MountedSystemRoute>* created_routes,
+      std::vector<MountedSystemRoute>* confirmed_routes);
   bool TryBindSystemIpForNetwork(
       uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
@@ -155,6 +161,9 @@ class ZeroTierWindowsRuntime {
       std::vector<MountedSystemIp>* created_ips);
   void RecordMountedSystemRoutesLocked(
       uint64_t network_id, const std::vector<MountedSystemRoute>& created_routes);
+  void RecordConfirmedSystemRoutesLocked(
+      uint64_t network_id,
+      const std::vector<MountedSystemRoute>& confirmed_routes);
   void RecordMountedSystemIpsLocked(
       uint64_t network_id, const std::vector<MountedSystemIp>& created_ips);
   void RemoveMountedSystemRoutesForNetwork(uint64_t network_id,
@@ -172,6 +181,7 @@ class ZeroTierWindowsRuntime {
   std::map<uint64_t, std::string> leave_request_sources_;
   std::map<uint64_t, std::vector<MountedSystemIp>> mounted_system_ips_;
   std::map<uint64_t, std::vector<MountedSystemRoute>> mounted_system_routes_;
+  std::map<uint64_t, std::vector<MountedSystemRoute>> confirmed_system_routes_;
   std::map<uint64_t, uint64_t> network_generations_;
   std::map<uint64_t, uint64_t> pending_leave_generations_;
   EventCallback event_callback_;
@@ -187,9 +197,12 @@ class ZeroTierWindowsRuntime {
   bool node_online_ = false;
   bool node_offline_ = false;
   bool stop_requested_ = false;
+  bool suppress_libzt_events_ = false;
   uint64_t next_network_generation_ = 0;
   int major_version_ = 0;
   int minor_version_ = 0;
+  std::string last_node_control_hint_ = "runtime.init";
+  std::string last_node_control_at_utc_;
   ZeroTierWindowsAdapterBridge adapter_bridge_;
   ZeroTierWindowsAdapterBridge::ProbeResult adapter_probe_;
   std::unique_ptr<ZeroTierWindowsTapBackend> tap_backend_;

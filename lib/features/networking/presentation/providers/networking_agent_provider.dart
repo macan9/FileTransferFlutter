@@ -15,8 +15,9 @@ import 'package:file_transfer_flutter/core/services/zerotier_facade.dart';
 import 'package:file_transfer_flutter/core/services/zerotier_local_service.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_providers.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+void debugPrint(String? message, {int? wrapWidth}) {}
 
 final zeroTierLocalServiceProvider = Provider<ZeroTierFacade>((Ref ref) {
   if (Platform.isWindows) {
@@ -55,6 +56,9 @@ class NetworkingAgentRuntimeState extends Equatable {
     this.lastRuntimeEvent,
     this.recentRuntimeEvents = const <ZeroTierRuntimeEvent>[],
     this.lastError,
+    this.activeNetworkActionType,
+    this.activeNetworkActionNetworkId,
+    this.activeNetworkActionStartedAt,
   });
 
   const NetworkingAgentRuntimeState.initial()
@@ -73,7 +77,10 @@ class NetworkingAgentRuntimeState extends Equatable {
         lastCommandSummary = null,
         lastRuntimeEvent = null,
         recentRuntimeEvents = const <ZeroTierRuntimeEvent>[],
-        lastError = null;
+        lastError = null,
+        activeNetworkActionType = null,
+        activeNetworkActionNetworkId = null,
+        activeNetworkActionStartedAt = null;
 
   final ZeroTierRuntimeStatus runtimeStatus;
   final bool isActivated;
@@ -91,11 +98,14 @@ class NetworkingAgentRuntimeState extends Equatable {
   final ZeroTierRuntimeEvent? lastRuntimeEvent;
   final List<ZeroTierRuntimeEvent> recentRuntimeEvents;
   final String? lastError;
+  final String? activeNetworkActionType;
+  final String? activeNetworkActionNetworkId;
+  final DateTime? activeNetworkActionStartedAt;
 
-  bool get isReady =>
-      runtimeStatus.cliAvailable && runtimeStatus.nodeId.trim().isNotEmpty;
-  bool get isLocalReady =>
-      runtimeStatus.cliAvailable && runtimeStatus.serviceState != 'unavailable';
+  bool get isReady => runtimeStatus.isNodeReady;
+  bool get isLocalReady => runtimeStatus.isNodeReady;
+  bool get hasActiveJoinSession => activeNetworkActionType == 'join';
+  bool get hasActiveLeaveSession => activeNetworkActionType == 'leave';
 
   NetworkingAgentRuntimeState copyWith({
     ZeroTierRuntimeStatus? runtimeStatus,
@@ -121,6 +131,12 @@ class NetworkingAgentRuntimeState extends Equatable {
     List<ZeroTierRuntimeEvent>? recentRuntimeEvents,
     String? lastError,
     bool clearLastError = false,
+    String? activeNetworkActionType,
+    bool clearActiveNetworkActionType = false,
+    String? activeNetworkActionNetworkId,
+    bool clearActiveNetworkActionNetworkId = false,
+    DateTime? activeNetworkActionStartedAt,
+    bool clearActiveNetworkActionStartedAt = false,
   }) {
     return NetworkingAgentRuntimeState(
       runtimeStatus: runtimeStatus ?? this.runtimeStatus,
@@ -151,6 +167,15 @@ class NetworkingAgentRuntimeState extends Equatable {
           : lastRuntimeEvent ?? this.lastRuntimeEvent,
       recentRuntimeEvents: recentRuntimeEvents ?? this.recentRuntimeEvents,
       lastError: clearLastError ? null : lastError ?? this.lastError,
+      activeNetworkActionType: clearActiveNetworkActionType
+          ? null
+          : activeNetworkActionType ?? this.activeNetworkActionType,
+      activeNetworkActionNetworkId: clearActiveNetworkActionNetworkId
+          ? null
+          : activeNetworkActionNetworkId ?? this.activeNetworkActionNetworkId,
+      activeNetworkActionStartedAt: clearActiveNetworkActionStartedAt
+          ? null
+          : activeNetworkActionStartedAt ?? this.activeNetworkActionStartedAt,
     );
   }
 
@@ -172,6 +197,9 @@ class NetworkingAgentRuntimeState extends Equatable {
         lastRuntimeEvent,
         recentRuntimeEvents,
         lastError,
+        activeNetworkActionType,
+        activeNetworkActionNetworkId,
+        activeNetworkActionStartedAt,
       ];
 }
 
@@ -181,6 +209,7 @@ class NetworkingAgentRuntimeController
   Timer? _pollTimer;
   StreamSubscription<ZeroTierRuntimeEvent>? _runtimeEventSubscription;
   final Map<String, int> _latestNetworkEventGeneration = <String, int>{};
+  final Map<String, DateTime> _awaitingAddressLogAt = <String, DateTime>{};
   bool _started = false;
   bool _busyBootstrapping = false;
   bool _busyPolling = false;
@@ -203,7 +232,6 @@ class NetworkingAgentRuntimeController
       await _refreshRuntimeStatus();
       return;
     }
-    await _initializeIdentity();
     await _sendHeartbeat();
     await _pollCommands();
     await _refreshRuntimeStatus();
@@ -274,6 +302,9 @@ class NetworkingAgentRuntimeController
       isNetworkTransitioning: true,
       networkTransitionLabel: '正在离开 ZeroTier 网络并收口本地链路',
       transitioningNetworkId: networkId,
+      activeNetworkActionType: 'leave',
+      activeNetworkActionNetworkId: networkId,
+      activeNetworkActionStartedAt: DateTime.now(),
       clearLastError: true,
     );
     debugPrint(
@@ -287,17 +318,18 @@ class NetworkingAgentRuntimeController
       if (_shouldWaitInDartForNetworkLeave) {
         await _waitForNetworkLeft(networkId);
       }
+      await _finalizeRuntimeRecoveryAfterLeave(
+        networkId,
+        deactivateWhenIdle: deactivateWhenIdle,
+      );
       state = state.copyWith(
         isNetworkActionLocked: false,
         isNetworkTransitioning: false,
         clearNetworkTransitionLabel: true,
         clearTransitioningNetworkId: true,
-      );
-      unawaited(
-        _finalizeRuntimeRecoveryAfterLeave(
-          networkId,
-          deactivateWhenIdle: deactivateWhenIdle,
-        ),
+        clearActiveNetworkActionType: true,
+        clearActiveNetworkActionNetworkId: true,
+        clearActiveNetworkActionStartedAt: true,
       );
     } catch (error) {
       state = state.copyWith(
@@ -305,6 +337,9 @@ class NetworkingAgentRuntimeController
         isNetworkTransitioning: false,
         clearNetworkTransitionLabel: true,
         clearTransitioningNetworkId: true,
+        clearActiveNetworkActionType: true,
+        clearActiveNetworkActionNetworkId: true,
+        clearActiveNetworkActionStartedAt: true,
       );
       rethrow;
     }
@@ -383,6 +418,9 @@ class NetworkingAgentRuntimeController
       isPolling: false,
       clearLastRuntimeEvent: true,
       recentRuntimeEvents: const <ZeroTierRuntimeEvent>[],
+      clearActiveNetworkActionType: true,
+      clearActiveNetworkActionNetworkId: true,
+      clearActiveNetworkActionStartedAt: true,
     );
     _latestNetworkEventGeneration.clear();
   }
@@ -436,11 +474,9 @@ class NetworkingAgentRuntimeController
         return;
       }
 
-      status = await _zeroTierService.startNode();
+      status = await _ensureNodeReadyForBootstrap(status);
       state = state.copyWith(runtimeStatus: status);
-      status = await _waitForNodeReady();
-      state = state.copyWith(runtimeStatus: status);
-      if (status.serviceState != 'running' || !status.hasNodeId) {
+      if (!status.isNodeReady) {
         state = state.copyWith(
           isBootstrapping: false,
           lastError: status.lastError ??
@@ -624,6 +660,8 @@ class NetworkingAgentRuntimeController
     AppConfig config,
     NetworkAgentCommand command,
   ) async {
+    String? activeActionType;
+    String? activeActionNetworkId;
     try {
       switch (command.type) {
         case 'join_zerotier_network':
@@ -635,13 +673,21 @@ class NetworkingAgentRuntimeController
                   'Command payload is missing networkId.');
             }
             debugPrint(
-              'Executing agent command: id=${command.id}, type=${command.type}, '
-              'networkId=$networkId, sessionId=${command.sessionId ?? '-'}',
+              'ZT join checkpoint[1] command-start '
+              'networkId=$networkId commandId=${command.id} '
+              'sessionId=${command.sessionId ?? '-'}',
             );
+            activeActionType = 'join';
+            activeActionNetworkId = networkId;
+            _beginNetworkActionSession(activeActionType, activeActionNetworkId);
             await _joinNetworkWithRecovery(networkId);
             await _ensureManagedAddressAssignedForCommand(networkId);
             await _refreshRuntimeStatus();
             await ref.read(networkingProvider.notifier).refresh();
+            _endNetworkActionSession(
+              actionType: activeActionType,
+              networkId: activeActionNetworkId,
+            );
             break;
           }
         case 'leave_zerotier_network':
@@ -655,9 +701,9 @@ class NetworkingAgentRuntimeController
             final String leaveSource =
                 'agent.command:${command.id.isEmpty ? 'unknown' : command.id}';
             debugPrint(
-              'Executing agent command: id=${command.id}, type=${command.type}, '
-              'networkId=$networkId, sessionId=${command.sessionId ?? '-'}, '
-              'source=$leaveSource',
+              'ZT leave checkpoint command-start '
+              'networkId=$networkId commandId=${command.id} '
+              'sessionId=${command.sessionId ?? '-'} source=$leaveSource',
             );
             if (await _shouldSuppressLeaveCommand(
               config,
@@ -670,6 +716,9 @@ class NetworkingAgentRuntimeController
               );
               break;
             }
+            activeActionType = 'leave';
+            activeActionNetworkId = networkId;
+            _beginNetworkActionSession(activeActionType, activeActionNetworkId);
             await _zeroTierService.leaveNetwork(
               networkId,
               source: leaveSource,
@@ -679,6 +728,10 @@ class NetworkingAgentRuntimeController
             }
             await _refreshRuntimeStatus();
             await ref.read(networkingProvider.notifier).refresh();
+            _endNetworkActionSession(
+              actionType: activeActionType,
+              networkId: activeActionNetworkId,
+            );
             break;
           }
         case 'apply_firewall_rules':
@@ -752,7 +805,47 @@ class NetworkingAgentRuntimeController
         lastCommandSummary: 'Failed ${command.type}',
         lastError: error is RealtimeError ? error.message : '$error',
       );
+      _endNetworkActionSession(
+        actionType: activeActionType,
+        networkId: activeActionNetworkId,
+      );
     }
+  }
+
+  void _beginNetworkActionSession(String? actionType, String? networkId) {
+    if (actionType == null || networkId == null || networkId.trim().isEmpty) {
+      return;
+    }
+    state = state.copyWith(
+      activeNetworkActionType: actionType,
+      activeNetworkActionNetworkId: networkId,
+      activeNetworkActionStartedAt: DateTime.now(),
+    );
+  }
+
+  void _endNetworkActionSession({
+    required String? actionType,
+    required String? networkId,
+  }) {
+    final String currentType = state.activeNetworkActionType?.trim() ?? '';
+    final String currentNetworkId =
+        state.activeNetworkActionNetworkId?.trim().toLowerCase() ?? '';
+    final String targetType = actionType?.trim() ?? '';
+    final String targetNetworkId = networkId?.trim().toLowerCase() ?? '';
+    if (currentType.isEmpty || currentNetworkId.isEmpty) {
+      return;
+    }
+    if (targetType.isNotEmpty && currentType != targetType) {
+      return;
+    }
+    if (targetNetworkId.isNotEmpty && currentNetworkId != targetNetworkId) {
+      return;
+    }
+    state = state.copyWith(
+      clearActiveNetworkActionType: true,
+      clearActiveNetworkActionNetworkId: true,
+      clearActiveNetworkActionStartedAt: true,
+    );
   }
 
   Future<void> _refreshRuntimeStatus() async {
@@ -773,6 +866,7 @@ class NetworkingAgentRuntimeController
         lastError: status.lastError,
         clearLastError: status.lastError?.trim().isNotEmpty != true,
       );
+      _logAwaitingAddressCheckpoint(status);
     } catch (error) {
       if (revision != _runtimeRefreshRevision) {
         return;
@@ -784,7 +878,13 @@ class NetworkingAgentRuntimeController
   }
 
   Future<void> _joinNetworkWithRecovery(String networkId) async {
+    if (await _shouldSkipJoinBecauseNetworkReady(networkId)) {
+      return;
+    }
     await _ensureNodeOnlineForJoin();
+    if (await _shouldSkipJoinBecauseNetworkReady(networkId)) {
+      return;
+    }
     try {
       await _joinNetworkWithNativeTimeoutGuard(networkId);
     } catch (error) {
@@ -801,6 +901,17 @@ class NetworkingAgentRuntimeController
     if (_shouldWaitInDartForNetworkJoin) {
       await _waitForNetworkReady(networkId);
     }
+  }
+
+  Future<bool> _shouldSkipJoinBecauseNetworkReady(String networkId) async {
+    ZeroTierRuntimeStatus status = state.runtimeStatus;
+    ZeroTierNetworkState? network = _findJoinedNetwork(status, networkId);
+    if (network == null) {
+      status = await _zeroTierService.detectStatus();
+      state = state.copyWith(runtimeStatus: status);
+      network = _findJoinedNetwork(status, networkId);
+    }
+    return network != null && _isNetworkFullyReadyForCommand(network);
   }
 
   bool _shouldAttemptWindowsJoinRecovery(Object error) {
@@ -1005,13 +1116,58 @@ class NetworkingAgentRuntimeController
     for (int attempt = 0; attempt < 30; attempt += 1) {
       await Future<void>.delayed(const Duration(milliseconds: 500));
       latest = await _zeroTierService.detectStatus();
-      if (latest.serviceState == 'running' ||
+      if (latest.isNodeReady ||
           latest.serviceState == 'error' ||
           latest.lastError?.trim().isNotEmpty == true) {
         return latest;
       }
     }
     return latest;
+  }
+
+  Future<ZeroTierRuntimeStatus> _ensureNodeReadyForBootstrap(
+    ZeroTierRuntimeStatus status,
+  ) async {
+    if (status.isNodeReady) {
+      return status;
+    }
+
+    if (status.serviceState == 'starting') {
+      debugPrint(
+        'ZeroTier bootstrap preflight: node already starting, '
+        'waiting instead of requesting another startNode.',
+      );
+      return _waitForNodeReady();
+    }
+
+    if (status.serviceState == 'offline') {
+      debugPrint(
+        'ZeroTier bootstrap preflight: node is offline, '
+        'waiting for recovery and skipping proactive restart.',
+      );
+      final ZeroTierRuntimeStatus recovered =
+          await _waitForOfflineNodeRecovery();
+      if (recovered.isNodeReady) {
+        return recovered;
+      }
+      return recovered;
+    }
+
+    if (status.serviceState == 'prepared' || !status.isNodeRunning) {
+      debugPrint(
+        'ZeroTier bootstrap preflight: requesting startNode '
+        'serviceState=${status.serviceState}, '
+        'isNodeRunning=${status.isNodeRunning}',
+      );
+      status = await _zeroTierService.startNode();
+      state = state.copyWith(runtimeStatus: status);
+      if (status.isNodeReady) {
+        return status;
+      }
+      return _waitForNodeReady();
+    }
+
+    return status;
   }
 
   Future<void> _ensureNodeOnlineForJoin() async {
@@ -1023,7 +1179,7 @@ class NetworkingAgentRuntimeController
       'joinedNetworks=${status.joinedNetworks.length}, '
       'lastError=${status.lastError ?? '-'}',
     );
-    if (status.serviceState == 'running') {
+    if (status.isNodeReady) {
       return;
     }
 
@@ -1036,7 +1192,7 @@ class NetworkingAgentRuntimeController
         'joinedNetworks=${status.joinedNetworks.length}, '
         'lastError=${status.lastError ?? '-'}',
       );
-      if (status.serviceState == 'running') {
+      if (status.isNodeReady) {
         return;
       }
     }
@@ -1050,7 +1206,7 @@ class NetworkingAgentRuntimeController
         'joinedNetworks=${status.joinedNetworks.length}, '
         'lastError=${status.lastError ?? '-'}',
       );
-      if (status.serviceState == 'running') {
+      if (status.isNodeReady) {
         return;
       }
     }
@@ -1064,7 +1220,7 @@ class NetworkingAgentRuntimeController
       'joinedNetworks=${status.joinedNetworks.length}, '
       'lastError=${status.lastError ?? '-'}',
     );
-    if (status.serviceState == 'running') {
+    if (status.isNodeReady) {
       return;
     }
 
@@ -1077,7 +1233,7 @@ class NetworkingAgentRuntimeController
       'joinedNetworks=${status.joinedNetworks.length}, '
       'lastError=${status.lastError ?? '-'}',
     );
-    if (status.serviceState == 'running') {
+    if (status.isNodeReady) {
       return;
     }
 
@@ -1268,7 +1424,20 @@ class NetworkingAgentRuntimeController
       ? const Duration(minutes: 2)
       : const Duration(seconds: 30);
 
-  bool get _allowMountDegradedJoin => false;
+  bool get _allowMountDegradedJoin => Platform.isWindows;
+
+  ZeroTierNetworkState? _findJoinedNetwork(
+    ZeroTierRuntimeStatus status,
+    String networkId,
+  ) {
+    final String normalized = networkId.trim().toLowerCase();
+    for (final ZeroTierNetworkState network in status.joinedNetworks) {
+      if (network.networkId.trim().toLowerCase() == normalized) {
+        return network;
+      }
+    }
+    return null;
+  }
 
   bool _isTerminalNetworkFailure(String status) {
     switch (status) {
@@ -1290,12 +1459,7 @@ class NetworkingAgentRuntimeController
       );
       return;
     }
-    debugPrint(
-      'ZeroTier runtime event: type=${event.type.name}, '
-      'message=${event.message ?? '-'}, '
-      'networkId=${event.networkId ?? '-'}, '
-      'payload=${event.payload}',
-    );
+    _logJoinRuntimeCheckpoint(event);
     final List<ZeroTierRuntimeEvent> recentEvents = <ZeroTierRuntimeEvent>[
       event,
       ...state.recentRuntimeEvents
@@ -1631,7 +1795,7 @@ class NetworkingAgentRuntimeController
           item.isConnected ||
           item.assignedAddresses.isNotEmpty,
     );
-    return status.serviceState == 'running' && hasActiveJoinedNetwork;
+    return status.isNodeReady && hasActiveJoinedNetwork;
   }
 
   bool _isRecoverableRuntimeError(String? error) {
@@ -1707,5 +1871,72 @@ class NetworkingAgentRuntimeController
     _heartbeatTimer?.cancel();
     _pollTimer?.cancel();
     unawaited(_runtimeEventSubscription?.cancel());
+  }
+
+  void _logJoinRuntimeCheckpoint(ZeroTierRuntimeEvent event) {
+    final String activeType = state.activeNetworkActionType?.trim() ?? '';
+    final String activeNetworkId =
+        state.activeNetworkActionNetworkId?.trim().toLowerCase() ?? '';
+    final String eventNetworkId = event.networkId?.trim().toLowerCase() ?? '';
+    if (activeType != 'join' ||
+        activeNetworkId.isEmpty ||
+        eventNetworkId != activeNetworkId) {
+      return;
+    }
+    switch (event.type) {
+      case ZeroTierRuntimeEventType.networkJoining:
+      case ZeroTierRuntimeEventType.networkWaitingAuthorization:
+      case ZeroTierRuntimeEventType.networkOnline:
+      case ZeroTierRuntimeEventType.ipAssigned:
+      case ZeroTierRuntimeEventType.error:
+        debugPrint(
+          'ZT join checkpoint[2] runtime-event '
+          'networkId=$eventNetworkId type=${event.type.name} '
+          'message=${event.message ?? '-'}',
+        );
+        return;
+      case ZeroTierRuntimeEventType.environmentReady:
+      case ZeroTierRuntimeEventType.permissionRequired:
+      case ZeroTierRuntimeEventType.nodeStarted:
+      case ZeroTierRuntimeEventType.nodeOnline:
+      case ZeroTierRuntimeEventType.nodeOffline:
+      case ZeroTierRuntimeEventType.nodeStopped:
+      case ZeroTierRuntimeEventType.networkLeft:
+        return;
+    }
+  }
+
+  void _logAwaitingAddressCheckpoint(ZeroTierRuntimeStatus status) {
+    final String activeType = state.activeNetworkActionType?.trim() ?? '';
+    final String activeNetworkId =
+        state.activeNetworkActionNetworkId?.trim() ?? '';
+    if (activeType != 'join' || activeNetworkId.isEmpty) {
+      return;
+    }
+    final ZeroTierNetworkState? network = status.joinedNetworks
+        .where((ZeroTierNetworkState item) => item.networkId == activeNetworkId)
+        .cast<ZeroTierNetworkState?>()
+        .firstWhere(
+          (ZeroTierNetworkState? item) => item != null,
+          orElse: () => null,
+        );
+    if (network == null || network.localMountState != 'awaiting_address') {
+      _awaitingAddressLogAt.remove(activeNetworkId);
+      return;
+    }
+    final DateTime now = DateTime.now();
+    final DateTime? lastLoggedAt = _awaitingAddressLogAt[activeNetworkId];
+    if (lastLoggedAt != null &&
+        now.difference(lastLoggedAt) < const Duration(seconds: 3)) {
+      return;
+    }
+    _awaitingAddressLogAt[activeNetworkId] = now;
+    debugPrint(
+      'ZT join checkpoint[3] awaiting-address '
+      'networkId=$activeNetworkId serviceState=${status.serviceState} '
+      'authorized=${network.isAuthorized} connected=${network.isConnected} '
+      'status=${network.status} addresses=${network.assignedAddresses.length} '
+      'mount=${network.localMountState}',
+    );
   }
 }

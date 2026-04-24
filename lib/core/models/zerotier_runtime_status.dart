@@ -39,6 +39,14 @@ class ZeroTierRuntimeStatus extends Equatable {
 
   bool get hasNodeId => nodeId.trim().isNotEmpty;
   bool get cliAvailable => serviceState != 'unavailable';
+  bool get isEnvironmentReady => cliAvailable;
+  bool get isNodeReady =>
+      serviceState == 'running' && isNodeRunning && hasNodeId;
+  bool get isNodeStarting =>
+      serviceState == 'starting' ||
+      (isNodeRunning && !isNodeReady && serviceState != 'offline');
+  bool get isNodeOffline => serviceState == 'offline';
+  bool get isNodeErrored => serviceState == 'error';
 
   ZeroTierRuntimeStatus copyWith({
     String? nodeId,
