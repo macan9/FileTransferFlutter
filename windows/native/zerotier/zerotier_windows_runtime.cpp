@@ -1,16 +1,28 @@
-#include "native/zerotier/zerotier_windows_runtime.h"
-
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
+#ifdef _WIN32_WINNT
+#undef _WIN32_WINNT
 #endif
+#define _WIN32_WINNT 0x0600
 
-#include <ZeroTierSockets.h>
+#ifdef WINVER
+#undef WINVER
+#endif
+#define WINVER 0x0600
+
+#ifdef NTDDI_VERSION
+#undef NTDDI_VERSION
+#endif
+#define NTDDI_VERSION 0x06000000
+
 #include <WinSock2.h>
 #include <Windows.h>
-#include <shellapi.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <shellapi.h>
 #include <ws2tcpip.h>
+
+#include <ZeroTierSockets.h>
+
+#include "native/zerotier/zerotier_windows_runtime.h"
 
 #include "native/zerotier/zerotier_windows_privileged_mount_ipc.h"
 
@@ -219,6 +231,13 @@ bool IsJoinClosedLoopReady(const ZeroTierWindowsNetworkRecord& network,
   if (network.local_interface_ready) {
     return true;
   }
+  // On some Windows/Wintun setups, node_online can flap even after
+  // network/auth/connect and local mount have converged.
+  if (network.status == "OK" && network.is_authorized && network.is_connected &&
+      network.local_mount_state == "ready" &&
+      !network.assigned_addresses.empty()) {
+    return true;
+  }
   return false;
 }
 
@@ -342,6 +361,102 @@ std::wstring EscapePowerShellSingleQuotedLiteral(const std::wstring& input) {
     }
   }
   return escaped;
+}
+
+std::wstring EscapePowerShellSingleQuotedLiteral(const std::string& input) {
+  return EscapePowerShellSingleQuotedLiteral(Utf8ToWide(input));
+}
+
+std::string GuidToString(const GUID& guid) {
+  char text[64] = {0};
+  std::snprintf(text, sizeof(text),
+                "{%08lX-%04hX-%04hX-%02hhX%02hhX-%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX}",
+                guid.Data1, guid.Data2, guid.Data3, guid.Data4[0],
+                guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4],
+                guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+  return text;
+}
+
+struct AdapterBindingProbe {
+  bool found = false;
+  uint32_t if_index = 0;
+  uint64_t luid = 0;
+  std::string alias;
+  std::string interface_guid;
+  std::string adapter_name;
+  std::string description;
+};
+
+AdapterBindingProbe ProbeAdapterBinding(uint32_t if_index) {
+  AdapterBindingProbe probe;
+  probe.if_index = if_index;
+  ULONG size = 0;
+  if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr,
+                           nullptr, &size) != ERROR_BUFFER_OVERFLOW) {
+    return probe;
+  }
+  std::vector<unsigned char> buffer(size);
+  IP_ADAPTER_ADDRESSES* addrs =
+      reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+  if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr,
+                           addrs, &size) != NO_ERROR) {
+    return probe;
+  }
+  for (const IP_ADAPTER_ADDRESSES* adapter = addrs; adapter != nullptr;
+       adapter = adapter->Next) {
+    if (adapter->IfIndex != if_index) {
+      continue;
+    }
+    probe.found = true;
+    probe.luid = adapter->Luid.Value;
+    probe.alias = WideToUtf8(adapter->FriendlyName == nullptr
+                                 ? std::wstring()
+                                 : std::wstring(adapter->FriendlyName));
+    probe.adapter_name = adapter->AdapterName == nullptr ? "" : adapter->AdapterName;
+    probe.description = WideToUtf8(adapter->Description == nullptr
+                                       ? std::wstring()
+                                       : std::wstring(adapter->Description));
+    GUID interface_guid = {};
+    if (ConvertInterfaceLuidToGuid(&adapter->Luid, &interface_guid) == NO_ERROR) {
+      probe.interface_guid = GuidToString(interface_guid);
+    }
+    return probe;
+  }
+  return probe;
+}
+
+void AppendAdapterBindingScript(std::wostringstream* script, uint32_t if_index,
+                                const AdapterBindingProbe& probe) {
+  if (script == nullptr) {
+    return;
+  }
+  *script << L"Write-Output 'TRACE=adapter_binding_probe_start'; "
+          << L"Write-Output 'GAA_FOUND=" << (probe.found ? L"true" : L"false")
+          << L"'; "
+          << L"Write-Output 'GAA_IFINDEX=" << probe.if_index << L"'; "
+          << L"Write-Output 'GAA_LUID=" << probe.luid << L"'; "
+          << L"Write-Output 'GAA_ALIAS="
+          << EscapePowerShellSingleQuotedLiteral(probe.alias) << L"'; "
+          << L"Write-Output 'GAA_INTERFACE_GUID="
+          << EscapePowerShellSingleQuotedLiteral(probe.interface_guid) << L"'; "
+          << L"$ipIf = Get-NetIPInterface -InterfaceIndex " << if_index
+          << L" -AddressFamily IPv4 -ErrorAction SilentlyContinue; "
+          << L"if ($ipIf) { $ipIf | Select-Object InterfaceIndex,InterfaceAlias,InterfaceGuid,AddressFamily,ConnectionState,NlMtu,InterfaceMetric | Format-List | Out-String | Write-Output } else { Write-Output 'NETIPIF_FOUND=false' }; "
+          << L"$adapterByGuid = $null; $adapterByAlias = $null; ";
+  if (!probe.interface_guid.empty()) {
+    *script << L"$adapterByGuid = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceGuid -eq '"
+            << EscapePowerShellSingleQuotedLiteral(probe.interface_guid)
+            << L"' } | Select-Object -First 1; ";
+  }
+  if (!probe.alias.empty()) {
+    *script << L"$adapterByAlias = Get-NetAdapter -Name '"
+            << EscapePowerShellSingleQuotedLiteral(probe.alias)
+            << L"' -ErrorAction SilentlyContinue; ";
+  }
+  *script << L"$bindAdapter = if ($adapterByGuid) { $adapterByGuid } elseif ($adapterByAlias) { $adapterByAlias } else { $null }; "
+          << L"if ($bindAdapter) { Write-Output ('BIND_ALIAS=' + $bindAdapter.Name); Write-Output ('BIND_GUID=' + $bindAdapter.InterfaceGuid); Write-Output ('BIND_IFINDEX=' + $bindAdapter.ifIndex) } else { Write-Output 'BIND_ADAPTER_FOUND=false' }; "
+          << L"if (-not $bindAdapter) { throw 'adapter binding target not visible via InterfaceGuid/InterfaceAlias' }; "
+          << L"$bindAlias = $bindAdapter.Name; ";
 }
 
 bool IsProcessElevated() {
@@ -535,6 +650,47 @@ bool CreateTempPowerShellScriptPath(const wchar_t* prefix,
   return true;
 }
 
+std::filesystem::path RuntimePowerShellLogDirectory() {
+  char* local_app_data = nullptr;
+  size_t env_size = 0;
+  const errno_t env_result =
+      _dupenv_s(&local_app_data, &env_size, "LOCALAPPDATA");
+  std::filesystem::path root =
+      env_result != 0 || local_app_data == nullptr
+          ? std::filesystem::temp_directory_path()
+          : std::filesystem::path(local_app_data);
+  if (local_app_data != nullptr) {
+    free(local_app_data);
+  }
+  std::filesystem::path dir =
+      root / "FileTransferFlutter" / "zerotier" / "logs" / "powershell";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  return dir;
+}
+
+std::wstring BuildRuntimePowerShellLogPath() {
+  SYSTEMTIME st = {};
+  GetLocalTime(&st);
+  std::wostringstream name;
+  name << L"zt_runtime_ps_" << st.wYear
+       << (st.wMonth < 10 ? L"0" : L"") << st.wMonth
+       << (st.wDay < 10 ? L"0" : L"") << st.wDay << L"_"
+       << (st.wHour < 10 ? L"0" : L"") << st.wHour
+       << (st.wMinute < 10 ? L"0" : L"") << st.wMinute
+       << (st.wSecond < 10 ? L"0" : L"") << st.wSecond << L"_"
+       << GetCurrentProcessId() << L"_" << GetCurrentThreadId() << L".log";
+  return (RuntimePowerShellLogDirectory() / name.str()).wstring();
+}
+
+void AppendTextFile(const std::wstring& path, const std::string& content) {
+  std::ofstream file(std::filesystem::path(path),
+                     std::ios::binary | std::ios::app);
+  if (file.is_open()) {
+    file.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+}
+
 bool RunPowerShellScriptElevated(const std::wstring& script, DWORD* exit_code) {
   if (exit_code != nullptr) {
     *exit_code = ERROR_GEN_FAILURE;
@@ -629,20 +785,72 @@ bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code,
     return RunPowerShellScriptElevated(script, exit_code);
   }
 
+  std::wstring temp_script_path;
+  DWORD temp_path_error = NO_ERROR;
+  if (!CreateTempPowerShellScriptPath(L"ztm", &temp_script_path,
+                                      &temp_path_error)) {
+    if (exit_code != nullptr) {
+      *exit_code = temp_path_error;
+    }
+    return false;
+  }
+  const std::string utf8_body = WideToUtf8(script);
+  const std::string utf8_script = "\xEF\xBB\xBF& { " + utf8_body + " }\r\n";
+  std::ofstream temp_script(std::filesystem::path(temp_script_path),
+                            std::ios::binary | std::ios::trunc);
+  if (!temp_script.is_open()) {
+    DeleteFileW(temp_script_path.c_str());
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_OPEN_FAILED;
+    }
+    return false;
+  }
+  temp_script.write(utf8_script.data(),
+                    static_cast<std::streamsize>(utf8_script.size()));
+  temp_script.close();
+
+  const std::wstring log_path = BuildRuntimePowerShellLogPath();
+  AppendTextFile(log_path, "---- script_path ----\r\n" +
+                               WideToUtf8(temp_script_path) +
+                               "\r\n---- script_content ----\r\n" + utf8_body +
+                               "\r\n---- output ----\r\n");
+
+  SECURITY_ATTRIBUTES attr = {};
+  attr.nLength = sizeof(attr);
+  attr.bInheritHandle = TRUE;
+  HANDLE log_handle = CreateFileW(
+      log_path.c_str(), FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &attr,
+      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (log_handle == INVALID_HANDLE_VALUE) {
+    DeleteFileW(temp_script_path.c_str());
+    if (exit_code != nullptr) {
+      *exit_code = GetLastError();
+    }
+    return false;
+  }
+
   std::wstring command_line =
-      L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& { " +
-      script + L" }\"";
+      L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
+      temp_script_path + L"\"";
   std::vector<wchar_t> command_line_buffer(command_line.begin(),
                                            command_line.end());
   command_line_buffer.push_back(L'\0');
 
   STARTUPINFOW startup = {};
   startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  startup.hStdOutput = log_handle;
+  startup.hStdError = log_handle;
   PROCESS_INFORMATION process = {};
-  if (!CreateProcessW(nullptr, command_line_buffer.data(), nullptr, nullptr, FALSE,
+  if (!CreateProcessW(nullptr, command_line_buffer.data(), nullptr, nullptr, TRUE,
                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+    const DWORD create_error = GetLastError();
+    CloseHandle(log_handle);
+    DeleteFileW(temp_script_path.c_str());
     if (exit_code != nullptr) {
-      *exit_code = GetLastError();
+      *exit_code = create_error;
     }
     return false;
   }
@@ -660,6 +868,11 @@ bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code,
 
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
+  CloseHandle(log_handle);
+  AppendTextFile(log_path, "\r\nexit_code=" +
+                               std::to_string(process_exit_code) +
+                               "\r\n---- end ----\r\n");
+  DeleteFileW(temp_script_path.c_str());
 
   if (exit_code != nullptr) {
     *exit_code = process_exit_code;
@@ -684,7 +897,7 @@ PowerShellMountResult TryAddIpViaPowerShell(uint64_t network_id,
     }
     return PowerShellMountResult::kFailed;
   }
-  if (allow_privileged_executor && !IsProcessElevated()) {
+  if (allow_privileged_executor) {
     DWORD service_error = NO_ERROR;
     DWORD native_error = NO_ERROR;
     PowerShellMountResult service_result = PowerShellMountResult::kFailed;
@@ -727,21 +940,31 @@ PowerShellMountResult TryAddIpViaPowerShell(uint64_t network_id,
               << std::endl;
   }
   const std::wstring escaped_ip = EscapePowerShellSingleQuotedLiteral(ip_wide);
+  const AdapterBindingProbe adapter_probe = ProbeAdapterBinding(if_index);
 
   std::wostringstream script;
-  script << L"try { "
-         << L"$existing = Get-NetIPAddress -InterfaceIndex " << if_index
+  script << L"try { ";
+  AppendAdapterBindingScript(&script, if_index, adapter_probe);
+  script << L"$existing = Get-NetIPAddress -InterfaceAlias $bindAlias"
          << L" -AddressFamily IPv4 -IPAddress '" << escaped_ip
          << L"' -ErrorAction SilentlyContinue; "
          << L"if (-not $existing) { "
-         << L"New-NetIPAddress -InterfaceIndex " << if_index
+         << L"New-NetIPAddress -InterfaceAlias $bindAlias"
          << L" -IPAddress '" << escaped_ip
          << L"' -PrefixLength " << static_cast<int>(prefix_length)
          << L" -AddressFamily IPv4 -Type Unicast -ErrorAction Stop | Out-Null "
+         << L"$verified = Get-NetIPAddress -InterfaceAlias $bindAlias"
+         << L" -AddressFamily IPv4 -IPAddress '" << escaped_ip
+         << L"' -ErrorAction SilentlyContinue; "
+         << L"if (-not $verified) { throw 'New-NetIPAddress completed but verification by InterfaceAlias failed' }; "
+         << L"Write-Output ('VERIFY_ALIAS=' + $verified.InterfaceAlias); "
+         << L"Write-Output ('VERIFY_IFINDEX=' + $verified.InterfaceIndex); "
          << L"exit 2 "
          << L"}; "
+         << L"Write-Output ('VERIFY_ALIAS=' + $existing.InterfaceAlias); "
+         << L"Write-Output ('VERIFY_IFINDEX=' + $existing.InterfaceIndex); "
          << L"exit 0 "
-         << L"} catch { exit 1 }";
+         << L"} catch { Write-Output ('ERR_MSG=' + $_.Exception.Message); Write-Output ('ERR_FQID=' + $_.FullyQualifiedErrorId); exit 1 }";
   const bool success = RunPowerShellScript(script.str(), ps_exit_code,
                                            allow_privileged_executor);
   if (success) {
@@ -769,7 +992,7 @@ PowerShellMountResult TryAddRouteViaPowerShell(uint32_t if_index,
     }
     return PowerShellMountResult::kFailed;
   }
-  if (allow_privileged_executor && !IsProcessElevated()) {
+  if (allow_privileged_executor) {
     DWORD service_error = NO_ERROR;
     DWORD native_error = NO_ERROR;
     PowerShellMountResult service_result = PowerShellMountResult::kFailed;
@@ -851,7 +1074,7 @@ bool TryRemoveIpViaPowerShell(uint64_t network_id, uint32_t if_index,
     }
     return false;
   }
-  if (allow_privileged_executor && !IsProcessElevated()) {
+  if (allow_privileged_executor) {
     DWORD service_error = NO_ERROR;
     DWORD native_error = NO_ERROR;
     PowerShellMountResult ignored_result = PowerShellMountResult::kFailed;
@@ -870,17 +1093,19 @@ bool TryRemoveIpViaPowerShell(uint64_t network_id, uint32_t if_index,
     }
   }
   const std::wstring escaped_ip = EscapePowerShellSingleQuotedLiteral(ip_wide);
+  const AdapterBindingProbe adapter_probe = ProbeAdapterBinding(if_index);
 
   std::wostringstream script;
-  script << L"try { "
-         << L"$existing = Get-NetIPAddress -InterfaceIndex " << if_index
+  script << L"try { ";
+  AppendAdapterBindingScript(&script, if_index, adapter_probe);
+  script << L"$existing = Get-NetIPAddress -InterfaceAlias $bindAlias"
          << L" -AddressFamily IPv4 -IPAddress '" << escaped_ip
          << L"' -ErrorAction SilentlyContinue; "
          << L"if ($existing) { "
          << L"$existing | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop "
          << L"}; "
          << L"exit 0 "
-         << L"} catch { exit 1 }";
+         << L"} catch { Write-Output ('ERR_MSG=' + $_.Exception.Message); Write-Output ('ERR_FQID=' + $_.FullyQualifiedErrorId); exit 1 }";
   return RunPowerShellScript(script.str(), ps_exit_code,
                              allow_privileged_executor);
 }
@@ -899,7 +1124,7 @@ bool TryRemoveRouteViaPowerShell(uint64_t network_id, uint32_t if_index,
     }
     return false;
   }
-  if (allow_privileged_executor && !IsProcessElevated()) {
+  if (allow_privileged_executor) {
     DWORD service_error = NO_ERROR;
     DWORD native_error = NO_ERROR;
     PowerShellMountResult ignored_result = PowerShellMountResult::kFailed;

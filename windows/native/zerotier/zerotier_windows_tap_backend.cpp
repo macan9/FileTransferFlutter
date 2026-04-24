@@ -1,9 +1,26 @@
-#include "native/zerotier/zerotier_windows_tap_backend.h"
+#ifdef _WIN32_WINNT
+#undef _WIN32_WINNT
+#endif
+#define _WIN32_WINNT 0x0600
 
+#ifdef WINVER
+#undef WINVER
+#endif
+#define WINVER 0x0600
+
+#ifdef NTDDI_VERSION
+#undef NTDDI_VERSION
+#endif
+#define NTDDI_VERSION 0x06000000
+
+#include <WinSock2.h>
 #include <Windows.h>
-#include <shellapi.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <shellapi.h>
+#include <ws2tcpip.h>
+
+#include "native/zerotier/zerotier_windows_tap_backend.h"
 
 #include <algorithm>
 #include <cctype>
@@ -246,6 +263,80 @@ bool RunPowerShellScriptElevated(const std::wstring& script, DWORD* exit_code) {
     process_exit_code = GetLastError();
   }
   CloseHandle(info.hProcess);
+  DeleteFileW(script_path.c_str());
+
+  if (exit_code != nullptr) {
+    *exit_code = process_exit_code;
+  }
+  return wait_result == WAIT_OBJECT_0 && process_exit_code == 0;
+}
+
+bool RunPowerShellScriptHidden(const std::wstring& script, DWORD* exit_code) {
+  if (exit_code != nullptr) {
+    *exit_code = ERROR_GEN_FAILURE;
+  }
+  if (script.empty()) {
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+
+  std::wstring script_path;
+  DWORD temp_path_error = NO_ERROR;
+  if (!CreateTempPowerShellScriptPath(L"ztw", &script_path, &temp_path_error)) {
+    if (exit_code != nullptr) {
+      *exit_code = temp_path_error;
+    }
+    return false;
+  }
+  std::ofstream stream(std::filesystem::path(script_path),
+                       std::ios::binary | std::ios::trunc);
+  if (!stream.is_open()) {
+    DeleteFileW(script_path.c_str());
+    if (exit_code != nullptr) {
+      *exit_code = ERROR_OPEN_FAILED;
+    }
+    return false;
+  }
+  const std::string script_utf8 = "\xEF\xBB\xBF& { " + WideToUtf8(script) + " }\r\n";
+  stream.write(script_utf8.data(),
+               static_cast<std::streamsize>(script_utf8.size()));
+  stream.close();
+
+  std::wstring command_line =
+      L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
+      script_path + L"\"";
+  std::vector<wchar_t> command_line_buffer(command_line.begin(),
+                                           command_line.end());
+  command_line_buffer.push_back(L'\0');
+
+  STARTUPINFOW startup = {};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process = {};
+  if (!CreateProcessW(nullptr, command_line_buffer.data(), nullptr, nullptr,
+                      FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                      &process)) {
+    const DWORD create_error = GetLastError();
+    DeleteFileW(script_path.c_str());
+    if (exit_code != nullptr) {
+      *exit_code = create_error;
+    }
+    return false;
+  }
+
+  DWORD process_exit_code = ERROR_GEN_FAILURE;
+  const DWORD wait_result = WaitForSingleObject(process.hProcess, 15000);
+  if (wait_result == WAIT_OBJECT_0) {
+    GetExitCodeProcess(process.hProcess, &process_exit_code);
+  } else if (wait_result == WAIT_TIMEOUT) {
+    process_exit_code = WAIT_TIMEOUT;
+    TerminateProcess(process.hProcess, WAIT_TIMEOUT);
+  } else {
+    process_exit_code = GetLastError();
+  }
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
   DeleteFileW(script_path.c_str());
 
   if (exit_code != nullptr) {
@@ -539,6 +630,97 @@ bool HasLikelyWintunAdapter(const ZeroTierWindowsAdapterBridge::ProbeResult& pro
   return false;
 }
 
+bool IsIpv4InterfaceConfigurable(const NET_LUID& luid, NET_IFINDEX if_index,
+                                 DWORD* native_error) {
+  if (native_error != nullptr) {
+    *native_error = NO_ERROR;
+  }
+  NET_IFINDEX resolved_if_index = if_index;
+  if (resolved_if_index == 0 && luid.Value != 0) {
+    const DWORD convert_result = ConvertInterfaceLuidToIndex(&luid, &resolved_if_index);
+    if (convert_result != NO_ERROR) {
+      if (native_error != nullptr) {
+        *native_error = convert_result;
+      }
+      return false;
+    }
+  }
+  if (resolved_if_index == 0) {
+    if (native_error != nullptr) {
+      *native_error = ERROR_INVALID_PARAMETER;
+    }
+    return false;
+  }
+  std::wostringstream script;
+  script << L"$ErrorActionPreference='Stop'; "
+         << L"$ipIf = Get-NetIPInterface -InterfaceIndex " << resolved_if_index
+         << L" -AddressFamily IPv4 -ErrorAction SilentlyContinue; "
+         << L"if (-not $ipIf) { exit 2 }; "
+         << L"$adapter = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.ifIndex -eq "
+         << resolved_if_index << L" } | Select-Object -First 1; "
+         << L"if (-not $adapter) { exit 3 }; "
+         << L"exit 0";
+  DWORD result = ERROR_GEN_FAILURE;
+  const bool ok = RunPowerShellScriptHidden(script.str(), &result);
+  if (native_error != nullptr) {
+    *native_error = result;
+  }
+  return ok;
+}
+
+bool IsAdapterRecordConfigurable(
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
+    DWORD* native_error) {
+  NET_LUID luid = {};
+  luid.Value = adapter.luid;
+  return IsIpv4InterfaceConfigurable(luid, adapter.if_index, native_error);
+}
+
+bool HasConfigurableWintunAdapter(
+    const ZeroTierWindowsAdapterBridge::ProbeResult& probe_result,
+    std::string* detail) {
+  DWORD last_error = ERROR_NOT_FOUND;
+  for (const auto& adapter : probe_result.adapters) {
+    if (adapter.driver_kind != "wintun" && adapter.driver_kind != "wireguard") {
+      continue;
+    }
+    DWORD native_error = NO_ERROR;
+    if (IsAdapterRecordConfigurable(adapter, &native_error)) {
+      if (detail != nullptr) {
+        std::ostringstream stream;
+        stream << "if_index=" << adapter.if_index << " luid=" << adapter.luid
+               << " alias=" << adapter.friendly_name;
+        *detail = stream.str();
+      }
+      return true;
+    }
+    last_error = native_error;
+  }
+  if (detail != nullptr) {
+    *detail = "last_error=" + std::to_string(last_error);
+  }
+  return false;
+}
+
+bool WaitForIpv4InterfaceConfigurable(const NET_LUID& luid, NET_IFINDEX if_index,
+                                      int attempts, DWORD sleep_ms,
+                                      DWORD* native_error) {
+  DWORD last_error = ERROR_NOT_FOUND;
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    if (IsIpv4InterfaceConfigurable(luid, if_index, &last_error)) {
+      if (native_error != nullptr) {
+        *native_error = NO_ERROR;
+      }
+      return true;
+    }
+    Sleep(sleep_ms);
+  }
+  if (native_error != nullptr) {
+    *native_error = last_error;
+  }
+  return false;
+}
+
 bool HasExpectedAddress(
     const ZeroTierWindowsAdapterBridge::ProbeResult& probe_result,
     const std::vector<std::string>& expected_ipv4_addresses) {
@@ -614,10 +796,20 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
     consecutive_failures_ = 0;
     return false;
   }
-  if (HasLikelyWintunAdapter(probe_result)) {
+  std::string configurable_detail;
+  if (HasConfigurableWintunAdapter(probe_result, &configurable_detail)) {
     install_state_ = InstallState::kInstalled;
     consecutive_failures_ = 0;
+    next_bootstrap_tick_ms_ = 0;
+    if (action_summary != nullptr) {
+      *action_summary = "wintun adapter configurable " + configurable_detail;
+    }
     return false;
+  }
+  if (HasLikelyWintunAdapter(probe_result) && action_summary != nullptr) {
+    *action_summary =
+        "wintun adapter visible via GetAdaptersAddresses but not configurable " +
+        configurable_detail;
   }
   const unsigned long long now = GetTickCount64();
   if (install_state_ == InstallState::kInstalled &&
@@ -738,6 +930,9 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
       Sleep(200);
     }
   }
+  DWORD configurable_error = ERROR_NOT_FOUND;
+  const bool configurable = WaitForIpv4InterfaceConfigurable(
+      luid, if_index, 30, 250, &configurable_error);
   if (!enumerated) {
     ++consecutive_failures_;
     install_state_ = InstallState::kRepairNeeded;
@@ -746,6 +941,21 @@ bool ZeroTierWindowsWintunTapBackend::EnsureAdapterPresent(
       std::ostringstream stream;
       stream << "wintun adapter created but not enumerable"
              << " if_index=" << if_index
+             << " state=" << InstallStateLabel();
+      *action_summary = stream.str();
+    }
+    return false;
+  }
+  if (!configurable) {
+    ++consecutive_failures_;
+    install_state_ = InstallState::kRepairNeeded;
+    next_bootstrap_tick_ms_ = now + BootstrapRetryDelayMs(bootstrap_attempts_);
+    if (action_summary != nullptr) {
+      std::ostringstream stream;
+      stream << "wintun adapter created but IPv4 interface not configurable"
+             << " if_index=" << if_index
+             << " luid=" << luid.Value
+             << " native_error=" << configurable_error
              << " state=" << InstallStateLabel();
       *action_summary = stream.str();
     }

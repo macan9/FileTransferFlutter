@@ -140,6 +140,148 @@ bool HasIpv4Address(uint32_t if_index, uint32_t address_network_order) {
   return false;
 }
 
+std::string WideToUtf8(const wchar_t* text) {
+  if (text == nullptr || text[0] == L'\0') {
+    return "";
+  }
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0,
+                                       nullptr, nullptr);
+  if (size <= 1) {
+    return "";
+  }
+  std::string output(static_cast<size_t>(size - 1), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text, -1, output.data(), size, nullptr,
+                      nullptr);
+  return output;
+}
+
+std::string GuidToString(const GUID& guid) {
+  char text[64] = {0};
+  std::snprintf(text, sizeof(text),
+                "{%08lX-%04hX-%04hX-%02hhX%02hhX-%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX}",
+                guid.Data1, guid.Data2, guid.Data3, guid.Data4[0],
+                guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4],
+                guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+  return text;
+}
+
+std::string EscapePowerShellSingleQuotedLiteral(const std::string& input) {
+  std::string escaped;
+  escaped.reserve(input.size());
+  for (const char ch : input) {
+    escaped.push_back(ch);
+    if (ch == '\'') {
+      escaped.push_back('\'');
+    }
+  }
+  return escaped;
+}
+
+struct AdapterVisibilityProbe {
+  bool found = false;
+  uint32_t if_index = 0;
+  uint64_t luid = 0;
+  std::string alias;
+  std::string adapter_name;
+  std::string description;
+  std::string interface_guid;
+  std::string oper_status;
+};
+
+std::string OperStatusToString(IF_OPER_STATUS status) {
+  switch (status) {
+    case IfOperStatusUp:
+      return "Up";
+    case IfOperStatusDown:
+      return "Down";
+    case IfOperStatusTesting:
+      return "Testing";
+    case IfOperStatusUnknown:
+      return "Unknown";
+    case IfOperStatusDormant:
+      return "Dormant";
+    case IfOperStatusNotPresent:
+      return "NotPresent";
+    case IfOperStatusLowerLayerDown:
+      return "LowerLayerDown";
+  }
+  return std::to_string(static_cast<int>(status));
+}
+
+AdapterVisibilityProbe ProbeAdapterViaGetAdaptersAddresses(uint32_t if_index) {
+  AdapterVisibilityProbe probe;
+  probe.if_index = if_index;
+  ULONG size = 0;
+  if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr,
+                           nullptr, &size) != ERROR_BUFFER_OVERFLOW) {
+    return probe;
+  }
+  std::vector<unsigned char> buffer(size);
+  IP_ADAPTER_ADDRESSES* addrs =
+      reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+  if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr,
+                           addrs, &size) != NO_ERROR) {
+    return probe;
+  }
+  for (const IP_ADAPTER_ADDRESSES* adapter = addrs; adapter != nullptr;
+       adapter = adapter->Next) {
+    if (adapter->IfIndex != if_index) {
+      continue;
+    }
+    probe.found = true;
+    probe.luid = adapter->Luid.Value;
+    probe.alias = WideToUtf8(adapter->FriendlyName);
+    probe.adapter_name = adapter->AdapterName == nullptr ? "" : adapter->AdapterName;
+    probe.description = WideToUtf8(adapter->Description);
+    probe.oper_status = OperStatusToString(adapter->OperStatus);
+    GUID interface_guid = {};
+    if (ConvertInterfaceLuidToGuid(&adapter->Luid, &interface_guid) == NO_ERROR) {
+      probe.interface_guid = GuidToString(interface_guid);
+    }
+    return probe;
+  }
+  return probe;
+}
+
+std::string BuildAdapterVisibilityProbeScript(
+    uint32_t if_index, const AdapterVisibilityProbe& probe) {
+  std::ostringstream script;
+  script << "  Write-Output 'TRACE=adapter_visibility_probe_start'\n"
+         << "  Write-Output 'GAA_FOUND=" << (probe.found ? "true" : "false")
+         << "'\n"
+         << "  Write-Output 'GAA_IFINDEX=" << probe.if_index << "'\n"
+         << "  Write-Output 'GAA_LUID=" << probe.luid << "'\n"
+         << "  Write-Output 'GAA_ALIAS="
+         << EscapePowerShellSingleQuotedLiteral(probe.alias) << "'\n"
+         << "  Write-Output 'GAA_INTERFACE_GUID="
+         << EscapePowerShellSingleQuotedLiteral(probe.interface_guid) << "'\n"
+         << "  Write-Output 'GAA_ADAPTER_NAME="
+         << EscapePowerShellSingleQuotedLiteral(probe.adapter_name) << "'\n"
+         << "  Write-Output 'GAA_DESCRIPTION="
+         << EscapePowerShellSingleQuotedLiteral(probe.description) << "'\n"
+         << "  Write-Output 'GAA_OPER_STATUS="
+         << EscapePowerShellSingleQuotedLiteral(probe.oper_status) << "'\n"
+         << "  $ipIf = Get-NetIPInterface -InterfaceIndex " << if_index
+         << " -AddressFamily IPv4 -ErrorAction SilentlyContinue\n"
+         << "  if ($ipIf) { $ipIf | Select-Object InterfaceIndex,InterfaceAlias,InterfaceGuid,AddressFamily,ConnectionState,NlMtu,InterfaceMetric | Format-List | Out-String | Write-Output } else { Write-Output 'NETIPIF_FOUND=false' }\n"
+         << "  $adapterByGuid = $null\n"
+         << "  $adapterByAlias = $null\n";
+  if (!probe.interface_guid.empty()) {
+    script << "  $adapterByGuid = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceGuid -eq '"
+           << EscapePowerShellSingleQuotedLiteral(probe.interface_guid)
+           << "' } | Select-Object -First 1\n";
+  }
+  if (!probe.alias.empty()) {
+    script << "  $adapterByAlias = Get-NetAdapter -Name '"
+           << EscapePowerShellSingleQuotedLiteral(probe.alias)
+           << "' -ErrorAction SilentlyContinue\n";
+  }
+  script
+      << "  $bindAdapter = if ($adapterByGuid) { $adapterByGuid } elseif ($adapterByAlias) { $adapterByAlias } else { $null }\n"
+      << "  if ($bindAdapter) { Write-Output ('BIND_ALIAS=' + $bindAdapter.Name); Write-Output ('BIND_GUID=' + $bindAdapter.InterfaceGuid); Write-Output ('BIND_IFINDEX=' + $bindAdapter.ifIndex) } else { Write-Output 'BIND_ADAPTER_FOUND=false' }\n";
+  return script.str();
+}
+
 bool HasRoute(uint32_t if_index, uint32_t destination_network_order,
               uint8_t prefix_length) {
   ULONG size = 0;
@@ -383,21 +525,35 @@ Result EnsureIpViaPowerShell(uint32_t if_index, const std::string& ip_text,
                              uint8_t prefix_length, DWORD* ps_exit_code,
                              uint64_t request_id,
                              std::string* diagnostics_log_path) {
+  const AdapterVisibilityProbe adapter_probe =
+      ProbeAdapterViaGetAdaptersAddresses(if_index);
   const std::string script =
       "$ErrorActionPreference='Stop'\n"
       "try {\n"
-      "  Write-Output 'TRACE=ensure_ip_start'\n"
-      "  $existing = Get-NetIPAddress -InterfaceIndex " + std::to_string(if_index) +
+      "  Write-Output 'TRACE=ensure_ip_start'\n" +
+      BuildAdapterVisibilityProbeScript(if_index, adapter_probe) +
+      "  if (-not $bindAdapter) { throw 'adapter binding target not visible via InterfaceGuid/InterfaceAlias' }\n"
+      "  $bindAlias = $bindAdapter.Name\n"
+      "  $bindGuid = $bindAdapter.InterfaceGuid\n"
+      "  $existing = Get-NetIPAddress -InterfaceAlias $bindAlias" +
       " -AddressFamily IPv4 -IPAddress '" + ip_text +
       "' -ErrorAction SilentlyContinue\n"
       "  if (-not $existing) {\n"
-      "    New-NetIPAddress -InterfaceIndex " + std::to_string(if_index) +
+      "    New-NetIPAddress -InterfaceAlias $bindAlias" +
       " -IPAddress '" + ip_text + "' -PrefixLength " +
       std::to_string(static_cast<int>(prefix_length)) +
       " -AddressFamily IPv4 -Type Unicast -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\n"
+      "    $verified = Get-NetIPAddress -InterfaceAlias $bindAlias" +
+      " -AddressFamily IPv4 -IPAddress '" + ip_text +
+      "' -ErrorAction SilentlyContinue\n"
+      "    if (-not $verified) { throw 'New-NetIPAddress completed but verification by InterfaceAlias failed' }\n"
+      "    Write-Output ('VERIFY_ALIAS=' + $verified.InterfaceAlias)\n"
+      "    Write-Output ('VERIFY_IFINDEX=' + $verified.InterfaceIndex)\n"
       "    Write-Output 'RESULT=created'\n"
       "    exit 2\n"
       "  }\n"
+      "  Write-Output ('VERIFY_ALIAS=' + $existing.InterfaceAlias)\n"
+      "  Write-Output ('VERIFY_IFINDEX=' + $existing.InterfaceIndex)\n"
       "  Write-Output 'RESULT=exists'\n"
       "  exit 0\n"
       "} catch {\n"
@@ -474,7 +630,13 @@ Result EnsureIpv4AddressViaNetio(uint32_t if_index, uint32_t address_network_ord
   }
   MIB_UNICASTIPADDRESS_ROW row = {};
   InitializeUnicastIpAddressEntry(&row);
-  row.InterfaceIndex = if_index;
+  const AdapterVisibilityProbe adapter_probe =
+      ProbeAdapterViaGetAdaptersAddresses(if_index);
+  if (adapter_probe.found) {
+    row.InterfaceLuid.Value = adapter_probe.luid;
+  } else {
+    row.InterfaceIndex = if_index;
+  }
   row.Address.si_family = AF_INET;
   row.Address.Ipv4.sin_family = AF_INET;
   row.Address.Ipv4.sin_addr.S_un.S_addr = address_network_order;
