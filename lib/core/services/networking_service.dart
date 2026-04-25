@@ -406,20 +406,30 @@ class HttpNetworkingService implements NetworkingService {
     }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw RealtimeError(_extractErrorMessage(decoded, response.statusCode));
+      throw _extractRealtimeError(decoded, response.statusCode);
     }
 
     return decoded;
   }
 
-  String _extractErrorMessage(dynamic decoded, int statusCode) {
+  RealtimeError _extractRealtimeError(dynamic decoded, int statusCode) {
     if (decoded is Map) {
       final dynamic message = decoded['message'] ?? decoded['error'];
-      if (message is String && message.trim().isNotEmpty) {
-        return message;
-      }
+      return RealtimeError(
+        message is String && message.trim().isNotEmpty
+            ? message
+            : '请求失败，状态码 $statusCode',
+        statusCode: statusCode,
+        code: decoded['code']?.toString(),
+        bootstrapRequired: decoded['bootstrapRequired'] == true,
+        bootstrapEndpoint: decoded['bootstrapEndpoint']?.toString(),
+        agentRegisterEndpoint: decoded['agentRegisterEndpoint']?.toString(),
+      );
     }
-    return '请求失败，状态码 $statusCode';
+    return RealtimeError(
+      '请求失败，状态码 $statusCode',
+      statusCode: statusCode,
+    );
   }
 
   ManagedNetwork _extractManagedNetwork(dynamic decoded) {

@@ -216,6 +216,7 @@ class NetworkingAgentRuntimeController
   bool _suppressCommandPollingDuringRuntimeRecovery = false;
   DateTime? _commandPollingSuppressedAt;
   int _runtimeRefreshRevision = 0;
+  int _consecutiveHeartbeatTransportFailureCount = 0;
 
   NetworkingService get _networkingService =>
       ref.read(networkingServiceProvider);
@@ -551,22 +552,71 @@ class NetworkingAgentRuntimeController
 
     state = state.copyWith(isHeartbeating: true);
     try {
-      await _networkingService.heartbeatAgent(
-        deviceId: config.deviceId,
-        agentToken: config.agentToken,
-        zeroTierNodeId: config.zeroTierNodeId,
-      );
+      try {
+        await _networkingService.heartbeatAgent(
+          deviceId: config.deviceId,
+          agentToken: config.agentToken,
+          zeroTierNodeId: config.zeroTierNodeId,
+        );
+      } on RealtimeError catch (error) {
+        if (!await _recoverIdentityIfRequired(error)) {
+          rethrow;
+        }
+        config = ref.read(appConfigProvider);
+        if (config.agentToken.trim().isEmpty ||
+            config.deviceId.trim().isEmpty ||
+            config.zeroTierNodeId.trim().isEmpty) {
+          throw const RealtimeError(
+            'Agent identity recovery completed without usable credentials.',
+          );
+        }
+        await _networkingService.heartbeatAgent(
+          deviceId: config.deviceId,
+          agentToken: config.agentToken,
+          zeroTierNodeId: config.zeroTierNodeId,
+        );
+      }
       state = state.copyWith(
         isHeartbeating: false,
         lastHeartbeatAt: DateTime.now(),
         clearLastError: true,
       );
+      _consecutiveHeartbeatTransportFailureCount = 0;
     } catch (error) {
+      if (_isTransientHeartbeatTransportError(error)) {
+        _consecutiveHeartbeatTransportFailureCount += 1;
+        if (_consecutiveHeartbeatTransportFailureCount < 3) {
+          debugPrint(
+            'Ignoring transient heartbeat transport error '
+            '($_consecutiveHeartbeatTransportFailureCount/3): $error',
+          );
+          state = state.copyWith(isHeartbeating: false);
+          return;
+        }
+      } else {
+        _consecutiveHeartbeatTransportFailureCount = 0;
+      }
       state = state.copyWith(
         isHeartbeating: false,
         lastError: error is RealtimeError ? error.message : '$error',
       );
     }
+  }
+
+  bool _isTransientHeartbeatTransportError(Object error) {
+    final String message = error.toString().toLowerCase();
+    return message
+            .contains('connection closed before full header was received') ||
+        message.contains('connection reset by peer') ||
+        message.contains('connection terminated during handshake') ||
+        message.contains('connection refused') ||
+        message.contains('software caused connection abort') ||
+        message.contains('connection aborted') ||
+        message.contains('broken pipe') ||
+        message.contains('failed host lookup') ||
+        message.contains('timed out') ||
+        message.contains('socketexception') ||
+        message.contains('clientexception');
   }
 
   Future<void> _pollCommands() async {
@@ -615,11 +665,29 @@ class NetworkingAgentRuntimeController
     _busyPolling = true;
     state = state.copyWith(isPolling: true);
     try {
-      final List<NetworkAgentCommand> commands =
-          await _networkingService.fetchAgentCommands(
-        deviceId: config.deviceId,
-        agentToken: config.agentToken,
-      );
+      List<NetworkAgentCommand> commands;
+      try {
+        commands = await _networkingService.fetchAgentCommands(
+          deviceId: config.deviceId,
+          agentToken: config.agentToken,
+        );
+      } on RealtimeError catch (error) {
+        if (!await _recoverIdentityIfRequired(error)) {
+          rethrow;
+        }
+        config = ref.read(appConfigProvider);
+        if (config.agentToken.trim().isEmpty ||
+            config.deviceId.trim().isEmpty ||
+            config.zeroTierNodeId.trim().isEmpty) {
+          throw const RealtimeError(
+            'Agent identity recovery completed without usable credentials.',
+          );
+        }
+        commands = await _networkingService.fetchAgentCommands(
+          deviceId: config.deviceId,
+          agentToken: config.agentToken,
+        );
+      }
 
       if (commands.isEmpty) {
         state = state.copyWith(
@@ -1677,6 +1745,32 @@ class NetworkingAgentRuntimeController
     );
     await _initializeIdentity();
     return ref.read(appConfigProvider);
+  }
+
+  Future<bool> _recoverIdentityIfRequired(RealtimeError error) async {
+    if (!_isBootstrapRequiredError(error)) {
+      return false;
+    }
+    final AppConfig config = ref.read(appConfigProvider);
+    await ref.read(appConfigProvider.notifier).save(
+          config.copyWith(
+            deviceId: '',
+            agentToken: '',
+          ),
+        );
+    await _initializeIdentity();
+    final AppConfig refreshed = ref.read(appConfigProvider);
+    return refreshed.deviceId.trim().isNotEmpty &&
+        refreshed.agentToken.trim().isNotEmpty &&
+        refreshed.zeroTierNodeId.trim().isNotEmpty;
+  }
+
+  bool _isBootstrapRequiredError(RealtimeError error) {
+    if (error.requiresBootstrapRecovery) {
+      return true;
+    }
+    final String message = error.message.trim().toLowerCase();
+    return message.contains('does not exist') && message.contains('device ');
   }
 
   Future<void> _ensureManagedAddressAssignedForCommand(String networkId) async {

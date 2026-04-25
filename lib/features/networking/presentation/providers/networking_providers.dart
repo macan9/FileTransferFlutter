@@ -125,6 +125,23 @@ class NetworkingController extends AsyncNotifier<NetworkingDashboardState> {
     return result;
   }
 
+  Future<ManagedNetwork> leaveManagedNetwork({
+    required String networkId,
+    required String deviceId,
+  }) async {
+    late final ManagedNetwork result;
+    await _runAction(
+      action: 'leave-managed-network',
+      run: () async {
+        result = await _service.leaveManagedNetwork(
+          networkId: networkId,
+          deviceId: deviceId,
+        );
+      },
+    );
+    return result;
+  }
+
   Future<PairingSession> createPairingSession({
     required String initiatorDeviceId,
     required String targetDeviceId,

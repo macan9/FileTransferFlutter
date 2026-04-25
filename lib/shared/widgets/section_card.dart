@@ -6,12 +6,14 @@ class SectionCard extends StatelessWidget {
     required this.title,
     this.subtitle,
     this.titleAction,
+    this.header,
     required this.child,
   });
 
   final String title;
   final String? subtitle;
   final Widget? titleAction;
+  final Widget? header;
   final Widget child;
 
   @override
@@ -24,26 +26,30 @@ class SectionCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: <Widget>[
-                Expanded(
-                  child: Text(title, style: theme.textTheme.titleMedium),
-                ),
-                if (titleAction != null) ...<Widget>[
-                  const SizedBox(width: 12),
-                  titleAction!,
+            if (header != null)
+              header!
+            else ...<Widget>[
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: <Widget>[
+                  Expanded(
+                    child: Text(title, style: theme.textTheme.titleMedium),
+                  ),
+                  if (titleAction != null) ...<Widget>[
+                    const SizedBox(width: 12),
+                    titleAction!,
+                  ],
                 ],
-              ],
-            ),
-            if (subtitle != null) ...<Widget>[
-              const SizedBox(height: 8),
-              Text(
-                subtitle!,
-                style: theme.textTheme.bodyMedium?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
               ),
+              if (subtitle != null) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(
+                  subtitle!,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
             ],
             const SizedBox(height: 16),
             child,

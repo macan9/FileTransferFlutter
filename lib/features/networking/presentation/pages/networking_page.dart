@@ -24,6 +24,107 @@ class NetworkingPage extends ConsumerStatefulWidget {
   ConsumerState<NetworkingPage> createState() => _NetworkingPageState();
 }
 
+enum NetworkingSection { agent, runtime, alignment, localNetworks }
+
+class NetworkingSectionPage extends ConsumerWidget {
+  const NetworkingSectionPage({
+    super.key,
+    required this.section,
+  });
+
+  final NetworkingSection section;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final AppConfig config = ref.watch(appConfigProvider);
+    final AsyncValue<NetworkingDashboardState> networkingAsync =
+        ref.watch(networkingProvider);
+    final NetworkingDashboardState dashboard =
+        networkingAsync.valueOrNull ?? const NetworkingDashboardState.initial();
+    final NetworkingAgentRuntimeState agentState =
+        ref.watch(networkingAgentRuntimeProvider);
+    final ZeroTierRuntimeStatus runtimeStatus = agentState.runtimeStatus;
+    final bool isRegistered = config.agentToken.trim().isNotEmpty &&
+        config.zeroTierNodeId.trim().isNotEmpty &&
+        config.deviceId.trim().isNotEmpty;
+
+    final String title;
+    final Widget child;
+    switch (section) {
+      case NetworkingSection.agent:
+        title = 'Agent 实况';
+        child = _HeroStatusCard(
+          runtimeStatus: runtimeStatus,
+          agentState: agentState,
+          config: config,
+          isRegistered: isRegistered,
+          recentEvents: agentState.recentRuntimeEvents,
+          lastError: agentState.lastError,
+          onRefresh: () async {
+            await ref
+                .read(networkingAgentRuntimeProvider.notifier)
+                .refreshNow();
+            await ref.read(networkingProvider.notifier).refresh();
+          },
+          onCopyToken: config.agentToken.trim().isEmpty
+              ? null
+              : () async {
+                  await Clipboard.setData(
+                    ClipboardData(text: config.agentToken),
+                  );
+                  if (!context.mounted) {
+                    return;
+                  }
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('已复制 Agent Token')),
+                  );
+                },
+        );
+      case NetworkingSection.runtime:
+        title = '运行时事件';
+        child = _RuntimeInsightCard(
+          runtimeStatus: runtimeStatus,
+          recentEvents: agentState.recentRuntimeEvents,
+          lastError: agentState.lastError,
+          onRefresh: () async {
+            await ref
+                .read(networkingAgentRuntimeProvider.notifier)
+                .refreshNow();
+          },
+        );
+      case NetworkingSection.alignment:
+        title = '架构联动';
+        child = _NetworkingAlignmentCard(
+          defaultNetwork: dashboard.defaultNetwork,
+          managedNetworks: dashboard.managedNetworks,
+          deviceIdentity: dashboard.deviceIdentity,
+          runtimeStatus: runtimeStatus,
+        );
+      case NetworkingSection.localNetworks:
+        title = '本地网络';
+        child = _LocalNetworksCard(
+          currentDeviceId: config.deviceId,
+          runtimeStatus: runtimeStatus,
+          managedNetworks: dashboard.managedNetworks,
+        );
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: Text(title)),
+      body: RefreshIndicator(
+        onRefresh: () async {
+          await ref.read(networkingAgentRuntimeProvider.notifier).refreshNow();
+          await ref.read(networkingProvider.notifier).refresh();
+        },
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: <Widget>[child],
+        ),
+      ),
+    );
+  }
+}
+
 class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   late final TextEditingController _networkCodeController;
   late final TextEditingController _networkNameController;
@@ -1121,7 +1222,6 @@ class _PrivateNetworkingTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final bool isDisabled = agentState.isLocalInitializing || !isLocalReady;
-
     return SectionCard(
       title: '私有网络编排',
       subtitle: '先完成本地 ZeroTier 初始化，再通过邀请码或创建私有网络发起后台组网。',

@@ -1,5 +1,5 @@
 {
-  "mode": "dev",
+  "mode": "pro",
   "devServerUrl": "http://localhost:3000",
-  "proServerUrl": "http://139.196.158.225:3000"
+  "proServerUrl": "http://139.196.158.225:3100"
 }

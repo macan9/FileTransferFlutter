@@ -49,6 +49,44 @@ RouteBase _buildRootShellRoute() {
             builder: (BuildContext context, GoRouterState state) {
               return const NetworkingPage();
             },
+            routes: <RouteBase>[
+              GoRoute(
+                path: 'agent',
+                name: AppRouteNames.networkingAgent,
+                builder: (BuildContext context, GoRouterState state) {
+                  return const NetworkingSectionPage(
+                    section: NetworkingSection.agent,
+                  );
+                },
+              ),
+              GoRoute(
+                path: 'runtime',
+                name: AppRouteNames.networkingRuntime,
+                builder: (BuildContext context, GoRouterState state) {
+                  return const NetworkingSectionPage(
+                    section: NetworkingSection.runtime,
+                  );
+                },
+              ),
+              GoRoute(
+                path: 'alignment',
+                name: AppRouteNames.networkingAlignment,
+                builder: (BuildContext context, GoRouterState state) {
+                  return const NetworkingSectionPage(
+                    section: NetworkingSection.alignment,
+                  );
+                },
+              ),
+              GoRoute(
+                path: 'local',
+                name: AppRouteNames.networkingLocal,
+                builder: (BuildContext context, GoRouterState state) {
+                  return const NetworkingSectionPage(
+                    section: NetworkingSection.localNetworks,
+                  );
+                },
+              ),
+            ],
           ),
         ],
       ),
