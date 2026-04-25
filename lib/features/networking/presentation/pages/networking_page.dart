@@ -133,6 +133,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   late final TextEditingController _networkDescriptionController;
   String? _generatedNetworkCode;
   bool _hasDefaultNetworkingIntent = false;
+  bool _isDefaultJoinTransitioning = false;
+  bool _isDefaultLeaveTransitioning = false;
   int _selectedPrimaryTab = 0;
   int _selectedPrivateTab = 0;
 
@@ -158,6 +160,21 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       networkingAgentRuntimeProvider,
       (NetworkingAgentRuntimeState? previous,
           NetworkingAgentRuntimeState next) {
+        final bool hasJoinProgress = next.hasActiveJoinSession ||
+            next.isNetworkActionLocked ||
+            next.activeNetworkActionType == 'join';
+        final bool hasLeaveProgress = next.hasActiveLeaveSession ||
+            next.activeNetworkActionType == 'leave';
+        if (!hasJoinProgress && _isDefaultJoinTransitioning && mounted) {
+          setState(() {
+            _isDefaultJoinTransitioning = false;
+          });
+        }
+        if (!hasLeaveProgress && _isDefaultLeaveTransitioning && mounted) {
+          setState(() {
+            _isDefaultLeaveTransitioning = false;
+          });
+        }
         final ZeroTierRuntimeEvent? nextEvent = next.lastRuntimeEvent;
         if (nextEvent != null && nextEvent != previous?.lastRuntimeEvent) {
           _showPageMessage(_eventMessage(nextEvent));
@@ -246,6 +263,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                           isExternallyLocked: defaultLockedByPrivate,
                           externalLockMessage: '当前已有私有组网任务进行中',
                           hasSessionJoinIntent: _hasDefaultNetworkingIntent,
+                          isLocallyJoining: _isDefaultJoinTransitioning,
+                          isLocallyLeaving: _isDefaultLeaveTransitioning,
                           onJoin: _joinDefaultNetwork,
                           onLeave: () =>
                               _leaveDefaultNetwork(dashboard.defaultNetwork),
@@ -317,6 +336,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       if (mounted) {
         setState(() {
           _hasDefaultNetworkingIntent = true;
+          _isDefaultJoinTransitioning = true;
+          _isDefaultLeaveTransitioning = false;
         });
       }
       await ref
@@ -332,6 +353,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       if (!mounted) {
         return;
       }
+      setState(() {
+        _isDefaultJoinTransitioning = false;
+      });
       _showPageMessage(error.message);
     }
   }
@@ -350,6 +374,12 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       if (!_ensureRegistered(readyConfig)) {
         return;
       }
+      if (mounted) {
+        setState(() {
+          _isDefaultLeaveTransitioning = true;
+          _isDefaultJoinTransitioning = false;
+        });
+      }
 
       await ref.read(networkingProvider.notifier).leaveDefaultNetwork(
             deviceId: readyConfig.deviceId,
@@ -361,12 +391,16 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       }
       setState(() {
         _hasDefaultNetworkingIntent = false;
+        _isDefaultLeaveTransitioning = false;
       });
       _showPageMessage('已取消默认网络组网。');
     } on RealtimeError catch (error) {
       if (!mounted) {
         return;
       }
+      setState(() {
+        _isDefaultLeaveTransitioning = false;
+      });
       _showPageMessage(error.message);
     } catch (error) {
       if (!mounted) {
@@ -991,6 +1025,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
     required this.isExternallyLocked,
     required this.externalLockMessage,
     required this.hasSessionJoinIntent,
+    required this.isLocallyJoining,
+    required this.isLocallyLeaving,
     required this.onJoin,
     required this.onLeave,
     required this.onCopyIp,
@@ -1007,6 +1043,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
   final bool isExternallyLocked;
   final String externalLockMessage;
   final bool hasSessionJoinIntent;
+  final bool isLocallyJoining;
+  final bool isLocallyLeaving;
   final VoidCallback onJoin;
   final VoidCallback onLeave;
   final ValueChanged<String> onCopyIp;
@@ -1044,7 +1082,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
         _isAuthorizationPendingLocalNetwork(localState);
     final bool isTransitionLocked = (agentState.isNetworkActionLocked ||
             isSubmittingLeave ||
-            hasActiveLeaveSession) &&
+            hasActiveLeaveSession ||
+            isLocallyLeaving) &&
         (transitionNetworkId.isEmpty ||
             transitionNetworkId == defaultNetworkId);
     final bool hasLocalMapping = localState != null &&
@@ -1054,18 +1093,29 @@ class _OneClickNetworkingTab extends StatelessWidget {
         isTransitionLocked || (isMembershipRevoked && localState != null);
     final bool isGrouped =
         !isMembershipRevoked && hasLocalMapping && hasSessionJoinIntent;
+    final bool isOptimisticallyJoining = hasSessionJoinIntent &&
+        (isBusy || isLocallyJoining) &&
+        !isGrouped &&
+        !isSubmittingLeave &&
+        !hasActiveLeaveSession &&
+        !isLocallyLeaving &&
+        !isSubmittingJoin &&
+        !hasActiveJoinSession;
     final bool isAwaitingAuthorization =
         !isClosing && isLocalAuthorizationPending;
-    final bool hasJoinIntentEvidence = isSubmittingJoin || hasActiveJoinSession;
-    final bool isActivelyJoining =
-        hasActiveJoinSession || (isSubmittingJoin && !hasActiveLeaveSession);
+    final bool effectiveSubmittingJoin =
+        isSubmittingJoin || isOptimisticallyJoining;
+    final bool hasJoinIntentEvidence =
+        effectiveSubmittingJoin || hasActiveJoinSession;
+    final bool isActivelyJoining = hasActiveJoinSession ||
+        (effectiveSubmittingJoin && !hasActiveLeaveSession);
     final _DefaultNetworkFlowState flowState = _resolveDefaultNetworkFlowState(
       isLocalReady: isLocalReady,
       isLocalInitializing: agentState.isLocalInitializing,
       isClosing: isClosing,
       isGrouped: isGrouped,
       isAwaitingAuthorization: isAwaitingAuthorization,
-      isSubmittingJoin: isSubmittingJoin,
+      isSubmittingJoin: effectiveSubmittingJoin,
       hasActiveJoinSession: hasActiveJoinSession,
       isBootstrapping: agentState.isBootstrapping,
       localState: localState,
@@ -1099,7 +1149,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
         : flowPresentation.subtitle;
 
     return SectionCard(
-      title: '??????',
+      title: '默认网络编排',
       subtitle: sectionSubtitle,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
@@ -2550,22 +2600,22 @@ String _serviceStateLabel(ZeroTierRuntimeStatus status) {
 
 String _nodeStateLabel(ZeroTierRuntimeStatus status) {
   if (!status.isEnvironmentReady) {
-    return '????';
+    return '未初始化';
   }
   if (_isNodeOperational(status)) {
-    return '???';
+    return '已就绪';
   }
   if (status.isNodeOffline) {
-    return '??';
+    return '离线';
   }
   if (status.isNodeStarting) {
-    return '???';
+    return '启动中';
   }
   if (status.isNodeErrored) {
-    return '??';
+    return '异常';
   }
   if (status.serviceState == 'prepared') {
-    return '???';
+    return '未启动';
   }
   return status.serviceState;
 }
