@@ -127,14 +127,35 @@ class NetworkingSectionPage extends ConsumerWidget {
   }
 }
 
+enum _PrivateNetworkingFlowState {
+  idle,
+  serverOrchestrating,
+  localOrchestrating,
+  success,
+  closing,
+}
+
+enum _DefaultNetworkingUiState {
+  idle,
+  serverOrchestrating,
+  localOrchestrating,
+  awaitingAuthorization,
+  success,
+  closing,
+}
+
 class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   late final TextEditingController _networkCodeController;
-  late final TextEditingController _networkNameController;
-  late final TextEditingController _networkDescriptionController;
+  ManagedNetwork? _createdPrivateNetwork;
   String? _generatedNetworkCode;
+  String? _lastJoinedPrivateCode;
+  _PrivateNetworkingFlowState _hostFlowState = _PrivateNetworkingFlowState.idle;
+  _PrivateNetworkingFlowState _joinFlowState = _PrivateNetworkingFlowState.idle;
+  _DefaultNetworkingUiState _defaultFlowState = _DefaultNetworkingUiState.idle;
   bool _hasDefaultNetworkingIntent = false;
   bool _isDefaultJoinTransitioning = false;
   bool _isDefaultLeaveTransitioning = false;
+  DateTime? _defaultJoinTransitionStartedAt;
   int _selectedPrimaryTab = 0;
   int _selectedPrivateTab = 0;
 
@@ -142,15 +163,11 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   void initState() {
     super.initState();
     _networkCodeController = TextEditingController();
-    _networkNameController = TextEditingController(text: '我的私有网络');
-    _networkDescriptionController = TextEditingController(text: '用于可信设备的私有组网');
   }
 
   @override
   void dispose() {
     _networkCodeController.dispose();
-    _networkNameController.dispose();
-    _networkDescriptionController.dispose();
     super.dispose();
   }
 
@@ -160,19 +177,145 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       networkingAgentRuntimeProvider,
       (NetworkingAgentRuntimeState? previous,
           NetworkingAgentRuntimeState next) {
-        final bool hasJoinProgress = next.hasActiveJoinSession ||
-            next.isNetworkActionLocked ||
-            next.activeNetworkActionType == 'join';
-        final bool hasLeaveProgress = next.hasActiveLeaveSession ||
-            next.activeNetworkActionType == 'leave';
-        if (!hasJoinProgress && _isDefaultJoinTransitioning && mounted) {
+        final ZeroTierRuntimeEventType? nextEventType =
+            next.lastRuntimeEvent?.type;
+        final bool joinProgressObserved = next.hasActiveJoinSession ||
+            next.activeNetworkActionType == 'join' ||
+            nextEventType == ZeroTierRuntimeEventType.networkJoining ||
+            nextEventType ==
+                ZeroTierRuntimeEventType.networkWaitingAuthorization ||
+            nextEventType == ZeroTierRuntimeEventType.ipAssigned ||
+            nextEventType == ZeroTierRuntimeEventType.networkOnline ||
+            nextEventType == ZeroTierRuntimeEventType.error;
+        final bool leaveProgressObserved = next.hasActiveLeaveSession ||
+            next.activeNetworkActionType == 'leave' ||
+            nextEventType == ZeroTierRuntimeEventType.networkLeft ||
+            nextEventType == ZeroTierRuntimeEventType.error;
+        if (joinProgressObserved && _isDefaultJoinTransitioning && mounted) {
           setState(() {
             _isDefaultJoinTransitioning = false;
           });
         }
-        if (!hasLeaveProgress && _isDefaultLeaveTransitioning && mounted) {
+        if (leaveProgressObserved && _isDefaultLeaveTransitioning && mounted) {
           setState(() {
             _isDefaultLeaveTransitioning = false;
+          });
+        }
+        final AppConfig currentConfig = ref.read(appConfigProvider);
+        final NetworkingDashboardState currentDashboard =
+            ref.read(networkingProvider).valueOrNull ??
+                const NetworkingDashboardState.initial();
+        final ManagedNetwork? currentDefaultNetwork =
+            currentDashboard.defaultNetwork;
+        ZeroTierNetworkState? currentDefaultLocalState;
+        final String currentDefaultNetworkId =
+            currentDefaultNetwork?.zeroTierNetworkId?.trim().toLowerCase() ??
+                '';
+        if (currentDefaultNetworkId.isNotEmpty) {
+          for (final ZeroTierNetworkState state
+              in next.runtimeStatus.joinedNetworks) {
+            if (state.networkId.trim().toLowerCase() ==
+                currentDefaultNetworkId) {
+              currentDefaultLocalState = state;
+              break;
+            }
+          }
+        }
+        final String? currentDefaultManagedStatus = _currentMembershipStatus(
+          currentDefaultNetwork,
+          currentConfig.deviceId,
+        );
+        final bool currentDefaultAccepted =
+            _isAcceptedMembershipStatus(currentDefaultManagedStatus);
+        final bool currentDefaultOnline = currentDefaultNetwork != null &&
+            _isManagedNetworkOnline(
+              network: currentDefaultNetwork,
+              currentDeviceId: currentConfig.deviceId,
+              runtimeStatus: next.runtimeStatus,
+            );
+        if (_hasDefaultNetworkingIntent &&
+            _defaultFlowState != _DefaultNetworkingUiState.closing &&
+            mounted) {
+          if (currentDefaultOnline) {
+            setState(() {
+              _defaultFlowState = _DefaultNetworkingUiState.success;
+            });
+          } else if (_isAuthorizationPendingLocalNetwork(
+              currentDefaultLocalState)) {
+            setState(() {
+              _defaultFlowState =
+                  _DefaultNetworkingUiState.awaitingAuthorization;
+            });
+          } else if ((joinProgressObserved || currentDefaultAccepted) &&
+              _defaultFlowState ==
+                  _DefaultNetworkingUiState.serverOrchestrating) {
+            setState(() {
+              _defaultFlowState = _DefaultNetworkingUiState.localOrchestrating;
+            });
+          }
+        } else if (!_hasDefaultNetworkingIntent &&
+            _defaultFlowState == _DefaultNetworkingUiState.success &&
+            !currentDefaultOnline &&
+            mounted) {
+          setState(() {
+            _defaultFlowState = _DefaultNetworkingUiState.idle;
+          });
+        }
+        final List<ManagedNetwork> currentPrivateNetworks = currentDashboard
+            .managedNetworks
+            .where((ManagedNetwork network) => network.isPrivate)
+            .toList(growable: false);
+        final ManagedNetwork? hostedNetwork = _findManagedNetworkById(
+              currentPrivateNetworks,
+              _createdPrivateNetwork?.id,
+            ) ??
+            _createdPrivateNetwork;
+        final bool hostedPrivateOnline = hostedNetwork != null &&
+            _isManagedNetworkOnline(
+              network: hostedNetwork,
+              currentDeviceId: currentConfig.deviceId,
+              runtimeStatus: next.runtimeStatus,
+            );
+        final ManagedNetwork? joinedNetwork = _findManagedNetworkByInviteCode(
+          currentPrivateNetworks,
+          _lastJoinedPrivateCode,
+        );
+        final bool joinedPrivateOnline = joinedNetwork != null &&
+            _isManagedNetworkOnline(
+              network: joinedNetwork,
+              currentDeviceId: currentConfig.deviceId,
+              runtimeStatus: next.runtimeStatus,
+            );
+        final ZeroTierRuntimeEventType? eventType = next.lastRuntimeEvent?.type;
+        if (_joinFlowState == _PrivateNetworkingFlowState.serverOrchestrating &&
+            (eventType == ZeroTierRuntimeEventType.networkJoining ||
+                eventType ==
+                    ZeroTierRuntimeEventType.networkWaitingAuthorization ||
+                eventType == ZeroTierRuntimeEventType.ipAssigned)) {
+          setState(() {
+            _joinFlowState = _PrivateNetworkingFlowState.localOrchestrating;
+          });
+        }
+        if (joinedPrivateOnline &&
+            _joinFlowState != _PrivateNetworkingFlowState.success &&
+            mounted) {
+          setState(() {
+            _joinFlowState = _PrivateNetworkingFlowState.success;
+          });
+        }
+        if (!joinedPrivateOnline &&
+            _joinFlowState == _PrivateNetworkingFlowState.success &&
+            (_lastJoinedPrivateCode?.trim().isEmpty ?? true) &&
+            mounted) {
+          setState(() {
+            _joinFlowState = _PrivateNetworkingFlowState.idle;
+          });
+        }
+        if (_hostFlowState == _PrivateNetworkingFlowState.localOrchestrating &&
+            hostedPrivateOnline &&
+            mounted) {
+          setState(() {
+            _hostFlowState = _PrivateNetworkingFlowState.success;
           });
         }
         final ZeroTierRuntimeEvent? nextEvent = next.lastRuntimeEvent;
@@ -200,21 +343,14 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     final bool isRegistered = config.agentToken.trim().isNotEmpty &&
         config.zeroTierNodeId.trim().isNotEmpty &&
         config.deviceId.trim().isNotEmpty;
-    final List<ManagedNetwork> privateNetworks = dashboard.managedNetworks
-        .where((ManagedNetwork network) => network.isPrivate)
-        .toList(growable: false);
-    final bool hasPrivateNetworkOnline = privateNetworks.any(
-      (ManagedNetwork network) => _isManagedNetworkOnline(
-        network: network,
-        currentDeviceId: config.deviceId,
-        runtimeStatus: runtimeStatus,
-      ),
-    );
     final bool isPrivateNetworkingBusy =
         dashboard.activeAction == 'create-private-network' ||
             dashboard.activeAction == 'join-by-invite-code';
+    final bool hasPrivateFlowContext =
+        _hostFlowState != _PrivateNetworkingFlowState.idle ||
+            _joinFlowState != _PrivateNetworkingFlowState.idle;
     final bool defaultLockedByPrivate =
-        hasPrivateNetworkOnline || isPrivateNetworkingBusy;
+        hasPrivateFlowContext || isPrivateNetworkingBusy;
     final bool privateLockedByDefault = _isDefaultNetworkLocked(
       defaultNetwork: dashboard.defaultNetwork,
       currentDeviceId: config.deviceId,
@@ -265,6 +401,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                           hasSessionJoinIntent: _hasDefaultNetworkingIntent,
                           isLocallyJoining: _isDefaultJoinTransitioning,
                           isLocallyLeaving: _isDefaultLeaveTransitioning,
+                          uiFlowState: _defaultFlowState,
+                          defaultJoinTransitionStartedAt:
+                              _defaultJoinTransitionStartedAt,
                           onJoin: _joinDefaultNetwork,
                           onLeave: () =>
                               _leaveDefaultNetwork(dashboard.defaultNetwork),
@@ -278,12 +417,15 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                           joinOrbKey: const Key('networking-private-join-orb'),
                           hostOrbKey: const Key('networking-private-host-orb'),
                           codeController: _networkCodeController,
-                          nameController: _networkNameController,
-                          descriptionController: _networkDescriptionController,
+                          createdNetwork: _createdPrivateNetwork,
                           generatedCode: _generatedNetworkCode,
+                          lastJoinedCode: _lastJoinedPrivateCode,
+                          hostFlowState: _hostFlowState,
+                          joinFlowState: _joinFlowState,
                           currentDeviceId: config.deviceId,
                           agentState: agentState,
                           isBusy: dashboard.isSubmitting,
+                          activeAction: dashboard.activeAction,
                           isLocalReady: isLocalReady,
                           managedNetworks: dashboard.managedNetworks,
                           runtimeStatus: runtimeStatus,
@@ -338,6 +480,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
           _hasDefaultNetworkingIntent = true;
           _isDefaultJoinTransitioning = true;
           _isDefaultLeaveTransitioning = false;
+          _defaultFlowState = _DefaultNetworkingUiState.serverOrchestrating;
+          _defaultJoinTransitionStartedAt = DateTime.now();
         });
       }
       await ref
@@ -355,6 +499,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       }
       setState(() {
         _isDefaultJoinTransitioning = false;
+        _defaultFlowState = _DefaultNetworkingUiState.idle;
+        _defaultJoinTransitionStartedAt = null;
       });
       _showPageMessage(error.message);
     }
@@ -378,6 +524,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         setState(() {
           _isDefaultLeaveTransitioning = true;
           _isDefaultJoinTransitioning = false;
+          _defaultFlowState = _DefaultNetworkingUiState.closing;
+          _defaultJoinTransitionStartedAt = null;
         });
       }
 
@@ -392,6 +540,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       setState(() {
         _hasDefaultNetworkingIntent = false;
         _isDefaultLeaveTransitioning = false;
+        _defaultFlowState = _DefaultNetworkingUiState.idle;
+        _defaultJoinTransitionStartedAt = null;
       });
       _showPageMessage('已取消默认网络组网。');
     } on RealtimeError catch (error) {
@@ -400,6 +550,12 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       }
       setState(() {
         _isDefaultLeaveTransitioning = false;
+        if (_hasDefaultNetworkingIntent) {
+          _defaultFlowState = _DefaultNetworkingUiState.success;
+        } else {
+          _defaultFlowState = _DefaultNetworkingUiState.idle;
+        }
+        _defaultJoinTransitionStartedAt = null;
       });
       _showPageMessage(error.message);
     } catch (error) {
@@ -421,13 +577,32 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       _showPageMessage('请先输入邀请码。');
       return;
     }
+    if (code.length != 8) {
+      _showPageMessage('请输入 8 位验证码。');
+      return;
+    }
 
     try {
+      if (mounted) {
+        setState(() {
+          _hostFlowState = _PrivateNetworkingFlowState.idle;
+          _lastJoinedPrivateCode = code;
+          _joinFlowState = _PrivateNetworkingFlowState.serverOrchestrating;
+          _selectedPrivateTab = 1;
+        });
+      }
       await ref.read(networkingProvider.notifier).joinByInviteCode(
             code: code,
             deviceId: readyConfig.deviceId,
           );
+      if (mounted &&
+          _joinFlowState == _PrivateNetworkingFlowState.serverOrchestrating) {
+        setState(() {
+          _joinFlowState = _PrivateNetworkingFlowState.localOrchestrating;
+        });
+      }
       unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
+      unawaited(ref.read(networkingProvider.notifier).refresh());
       if (!mounted) {
         return;
       }
@@ -436,6 +611,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       if (!mounted) {
         return;
       }
+      setState(() {
+        _joinFlowState = _PrivateNetworkingFlowState.idle;
+      });
       _showPageMessage(error.message);
     }
   }
@@ -452,7 +630,19 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       return;
     }
 
+    final _PrivateNetworkingFlowState previousHostFlowState = _hostFlowState;
+    final _PrivateNetworkingFlowState previousJoinFlowState = _joinFlowState;
+
     try {
+      if (mounted) {
+        setState(() {
+          if (_selectedPrivateTab == 0) {
+            _hostFlowState = _PrivateNetworkingFlowState.closing;
+          } else {
+            _joinFlowState = _PrivateNetworkingFlowState.closing;
+          }
+        });
+      }
       await ref.read(networkingProvider.notifier).leaveManagedNetwork(
             networkId: networkId,
             deviceId: readyConfig.deviceId,
@@ -462,11 +652,22 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       if (!mounted) {
         return;
       }
+      setState(() {
+        _createdPrivateNetwork = null;
+        _generatedNetworkCode = null;
+        _lastJoinedPrivateCode = null;
+        _hostFlowState = _PrivateNetworkingFlowState.idle;
+        _joinFlowState = _PrivateNetworkingFlowState.idle;
+      });
       _showPageMessage('私有网络已断开。');
     } on RealtimeError catch (error) {
       if (!mounted) {
         return;
       }
+      setState(() {
+        _hostFlowState = previousHostFlowState;
+        _joinFlowState = previousJoinFlowState;
+      });
       _showPageMessage(error.message);
     }
   }
@@ -477,26 +678,34 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       return;
     }
 
-    final String name = _networkNameController.text.trim();
-    final String description = _networkDescriptionController.text.trim();
-    if (name.isEmpty) {
-      _showPageMessage('请先输入私有网络名称。');
-      return;
-    }
+    final String name = _buildDefaultPrivateNetworkName(readyConfig);
 
     try {
+      if (mounted) {
+        setState(() {
+          _selectedPrivateTab = 0;
+          _hostFlowState = _PrivateNetworkingFlowState.serverOrchestrating;
+          _joinFlowState = _PrivateNetworkingFlowState.idle;
+          _lastJoinedPrivateCode = null;
+        });
+      }
       final PrivateNetworkCreationResult result =
-          await ref.read(networkingProvider.notifier).createPrivateNetwork(
+          await ref.read(networkingServiceProvider).createPrivateNetwork(
                 ownerDeviceId: readyConfig.deviceId,
                 name: name,
-                description: description,
               );
       if (!mounted) {
         return;
       }
       setState(() {
+        _createdPrivateNetwork = result.network;
         _generatedNetworkCode = result.inviteCode.code;
+        _lastJoinedPrivateCode = null;
+        _hostFlowState = _PrivateNetworkingFlowState.localOrchestrating;
+        _selectedPrivateTab = 0;
       });
+      unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
+      unawaited(ref.read(networkingProvider.notifier).refresh());
       if (!mounted) {
         return;
       }
@@ -505,6 +714,9 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       if (!mounted) {
         return;
       }
+      setState(() {
+        _hostFlowState = _PrivateNetworkingFlowState.idle;
+      });
       _showPageMessage(error.message);
     }
   }
@@ -1027,6 +1239,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
     required this.hasSessionJoinIntent,
     required this.isLocallyJoining,
     required this.isLocallyLeaving,
+    required this.uiFlowState,
+    required this.defaultJoinTransitionStartedAt,
     required this.onJoin,
     required this.onLeave,
     required this.onCopyIp,
@@ -1045,6 +1259,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
   final bool hasSessionJoinIntent;
   final bool isLocallyJoining;
   final bool isLocallyLeaving;
+  final _DefaultNetworkingUiState uiFlowState;
+  final DateTime? defaultJoinTransitionStartedAt;
   final VoidCallback onJoin;
   final VoidCallback onLeave;
   final ValueChanged<String> onCopyIp;
@@ -1093,6 +1309,12 @@ class _OneClickNetworkingTab extends StatelessWidget {
         isTransitionLocked || (isMembershipRevoked && localState != null);
     final bool isGrouped =
         !isMembershipRevoked && hasLocalMapping && hasSessionJoinIntent;
+    final bool shouldHoldJoinOrchestration = hasSessionJoinIntent &&
+        defaultJoinTransitionStartedAt != null &&
+        DateTime.now()
+                .difference(defaultJoinTransitionStartedAt!)
+                .inMilliseconds <
+            900;
     final bool isOptimisticallyJoining = hasSessionJoinIntent &&
         (isBusy || isLocallyJoining) &&
         !isGrouped &&
@@ -1101,19 +1323,22 @@ class _OneClickNetworkingTab extends StatelessWidget {
         !isLocallyLeaving &&
         !isSubmittingJoin &&
         !hasActiveJoinSession;
+    final bool effectiveGrouped = isGrouped && !shouldHoldJoinOrchestration;
     final bool isAwaitingAuthorization =
         !isClosing && isLocalAuthorizationPending;
-    final bool effectiveSubmittingJoin =
-        isSubmittingJoin || isOptimisticallyJoining;
+    final bool effectiveSubmittingJoin = isSubmittingJoin ||
+        isOptimisticallyJoining ||
+        shouldHoldJoinOrchestration;
     final bool hasJoinIntentEvidence =
         effectiveSubmittingJoin || hasActiveJoinSession;
     final bool isActivelyJoining = hasActiveJoinSession ||
         (effectiveSubmittingJoin && !hasActiveLeaveSession);
-    final _DefaultNetworkFlowState flowState = _resolveDefaultNetworkFlowState(
+    final _DefaultNetworkFlowState resolvedFlowState =
+        _resolveDefaultNetworkFlowState(
       isLocalReady: isLocalReady,
       isLocalInitializing: agentState.isLocalInitializing,
       isClosing: isClosing,
-      isGrouped: isGrouped,
+      isGrouped: effectiveGrouped,
       isAwaitingAuthorization: isAwaitingAuthorization,
       isSubmittingJoin: effectiveSubmittingJoin,
       hasActiveJoinSession: hasActiveJoinSession,
@@ -1124,6 +1349,17 @@ class _OneClickNetworkingTab extends StatelessWidget {
       hasMembershipAccepted: isMembershipAccepted,
       hasLastError: agentState.lastError?.trim().isNotEmpty == true,
     );
+    final _DefaultNetworkFlowState flowState = switch (uiFlowState) {
+      _DefaultNetworkingUiState.idle => resolvedFlowState,
+      _DefaultNetworkingUiState.serverOrchestrating =>
+        _DefaultNetworkFlowState.orchestrating,
+      _DefaultNetworkingUiState.localOrchestrating =>
+        _DefaultNetworkFlowState.awaitingLocalConfig,
+      _DefaultNetworkingUiState.awaitingAuthorization =>
+        _DefaultNetworkFlowState.awaitingAuthorization,
+      _DefaultNetworkingUiState.success => _DefaultNetworkFlowState.online,
+      _DefaultNetworkingUiState.closing => _DefaultNetworkFlowState.closing,
+    };
     final _DefaultNetworkFlowPresentation flowPresentation =
         _describeDefaultNetworkFlowState(
       flowState,
@@ -1167,7 +1403,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
                     ? onLeave
                     : onJoin,
           ),
-          if (!isClosing &&
+          if (flowState == _DefaultNetworkFlowState.online &&
+              !isClosing &&
               localState != null &&
               localState.assignedAddresses.isNotEmpty) ...<Widget>[
             const SizedBox(height: 16),
@@ -1211,18 +1448,21 @@ class _PrivateNetworkingTab extends StatelessWidget {
     required this.joinOrbKey,
     required this.hostOrbKey,
     required this.codeController,
-    required this.nameController,
-    required this.descriptionController,
+    required this.createdNetwork,
     required this.generatedCode,
     required this.currentDeviceId,
+    required this.hostFlowState,
+    required this.joinFlowState,
     required this.agentState,
     required this.isBusy,
+    required this.activeAction,
     required this.isLocalReady,
     required this.managedNetworks,
     required this.runtimeStatus,
     required this.selectedMode,
     required this.isExternallyLocked,
     required this.externalLockMessage,
+    required this.lastJoinedCode,
     required this.onModeChanged,
     required this.onJoinPressed,
     required this.onHostPressed,
@@ -1233,18 +1473,21 @@ class _PrivateNetworkingTab extends StatelessWidget {
   final Key joinOrbKey;
   final Key hostOrbKey;
   final TextEditingController codeController;
-  final TextEditingController nameController;
-  final TextEditingController descriptionController;
+  final ManagedNetwork? createdNetwork;
   final String? generatedCode;
   final String currentDeviceId;
+  final _PrivateNetworkingFlowState hostFlowState;
+  final _PrivateNetworkingFlowState joinFlowState;
   final NetworkingAgentRuntimeState agentState;
   final bool isBusy;
+  final String? activeAction;
   final bool isLocalReady;
   final List<ManagedNetwork> managedNetworks;
   final ZeroTierRuntimeStatus runtimeStatus;
   final int selectedMode;
   final bool isExternallyLocked;
   final String externalLockMessage;
+  final String? lastJoinedCode;
   final ValueChanged<int> onModeChanged;
   final VoidCallback onJoinPressed;
   final VoidCallback onHostPressed;
@@ -1258,8 +1501,27 @@ class _PrivateNetworkingTab extends StatelessWidget {
     final List<ManagedNetwork> privateNetworks = managedNetworks
         .where((ManagedNetwork network) => network.isPrivate)
         .toList(growable: false);
-    final ManagedNetwork? onlinePrivateNetwork =
-        privateNetworks.cast<ManagedNetwork?>().firstWhere(
+    final bool isHostMode = selectedMode == 0;
+    final List<ManagedNetwork> hostNetworks = privateNetworks
+        .where(
+          (ManagedNetwork network) =>
+              _isHostManagedNetwork(network, currentDeviceId),
+        )
+        .toList(growable: false);
+    final List<ManagedNetwork> joinNetworks = privateNetworks
+        .where(
+          (ManagedNetwork network) =>
+              !_isHostManagedNetwork(network, currentDeviceId),
+        )
+        .toList(growable: false);
+    final ManagedNetwork? hostNetworkById = _findManagedNetworkById(
+      privateNetworks,
+      createdNetwork?.id,
+    );
+    final ManagedNetwork? joinNetworkByCode =
+        _findManagedNetworkByInviteCode(joinNetworks, lastJoinedCode);
+    final ManagedNetwork? onlineHostNetwork =
+        hostNetworks.cast<ManagedNetwork?>().firstWhere(
               (ManagedNetwork? network) =>
                   network != null &&
                   _isManagedNetworkOnline(
@@ -1269,32 +1531,94 @@ class _PrivateNetworkingTab extends StatelessWidget {
                   ),
               orElse: () => null,
             );
-    final bool isHostMode = selectedMode == 0;
-    final ManagedNetwork? displayNetwork = onlinePrivateNetwork ??
-        (privateNetworks.isEmpty ? null : privateNetworks.first);
+    final ManagedNetwork? onlineJoinNetwork =
+        joinNetworks.cast<ManagedNetwork?>().firstWhere(
+              (ManagedNetwork? network) =>
+                  network != null &&
+                  _isManagedNetworkOnline(
+                    network: network,
+                    currentDeviceId: currentDeviceId,
+                    runtimeStatus: runtimeStatus,
+                  ),
+              orElse: () => null,
+            );
+    final ManagedNetwork? displayNetwork = isHostMode
+        ? (hostNetworkById ??
+            createdNetwork ??
+            (generatedCode?.trim().isNotEmpty == true
+                ? onlineHostNetwork
+                : null))
+        : (joinNetworkByCode ?? onlineJoinNetwork);
     final ZeroTierNetworkState? localState = displayNetwork == null
         ? null
         : _findLocal(runtimeStatus, displayNetwork);
-    final bool hasOnlinePrivateNetwork = onlinePrivateNetwork != null;
+    final _PrivateNetworkingFlowState activeFlowState =
+        isHostMode ? hostFlowState : joinFlowState;
+    final bool hostCodeReady = generatedCode?.trim().isNotEmpty == true;
+    final bool hostCreationReady =
+        hostFlowState == _PrivateNetworkingFlowState.success;
+    final bool hasOnlinePrivateNetwork =
+        activeFlowState == _PrivateNetworkingFlowState.success;
+    final ManagedNetwork? activeNetwork =
+        isHostMode ? displayNetwork : (joinNetworkByCode ?? onlineJoinNetwork);
     final String? inviteCode =
-        generatedCode ?? _activeInviteCode(displayNetwork);
+        isHostMode ? (hostCodeReady ? generatedCode : null) : null;
     final List<String> addresses =
         localState?.assignedAddresses ?? const <String>[];
+    final bool isClosing =
+        activeFlowState == _PrivateNetworkingFlowState.closing;
+    final bool isServerOrchestrating =
+        activeFlowState == _PrivateNetworkingFlowState.serverOrchestrating;
+    final bool isLocalOrchestrating =
+        activeFlowState == _PrivateNetworkingFlowState.localOrchestrating;
+    final bool isPrivateOrchestrating =
+        isServerOrchestrating || isLocalOrchestrating || isClosing;
+    final bool isModeSwitchLocked =
+        activeFlowState != _PrivateNetworkingFlowState.idle;
 
-    final String orbLabel = !isLocalReady
-        ? '环境未就绪'
-        : hasOnlinePrivateNetwork
-            ? '取消组网'
-            : isBusy
-                ? '网络编排中'
-                : (isHostMode ? '主持网络' : '加入网络');
-    final String orbSubtitle = !isLocalReady
-        ? '请等待本地运行时完成初始化。'
-        : hasOnlinePrivateNetwork
-            ? '当前私有网络已在线，点击可取消组网。'
-            : isBusy
-                ? '当前私有网络编排仍在进行中。'
-                : (isHostMode ? '创建私有网络并生成验证码。' : '输入 6 位验证码加入私有网络。');
+    final String orbLabel;
+    final String orbSubtitle;
+    final IconData orbIcon;
+    final _NetworkingOrbTone orbTone;
+    final bool orbSpinning;
+
+    if (!isLocalReady) {
+      orbLabel = '环境未就绪';
+      orbSubtitle = '请等待本地环境初始化';
+      orbIcon = Icons.hourglass_top_rounded;
+      orbTone = _NetworkingOrbTone.disabled;
+      orbSpinning = true;
+    } else if (hasOnlinePrivateNetwork) {
+      orbLabel = '组网成功';
+      orbSubtitle = '点击可取消';
+      orbIcon = Icons.check_circle_rounded;
+      orbTone = _NetworkingOrbTone.success;
+      orbSpinning = false;
+    } else if (isClosing) {
+      orbLabel = '网络回收中';
+      orbSubtitle = '正在回收当前网络链路';
+      orbIcon = Icons.sync_rounded;
+      orbTone = _NetworkingOrbTone.active;
+      orbSpinning = true;
+    } else if (isServerOrchestrating) {
+      orbLabel = '网络编排';
+      orbSubtitle = '请求服务器网络编排中';
+      orbIcon = Icons.sync_rounded;
+      orbTone = _NetworkingOrbTone.active;
+      orbSpinning = true;
+    } else if (isLocalOrchestrating) {
+      orbLabel = '网络编排';
+      orbSubtitle = '本地网络编排中';
+      orbIcon = Icons.sync_rounded;
+      orbTone = _NetworkingOrbTone.active;
+      orbSpinning = true;
+    } else {
+      orbLabel = isHostMode ? '主持网络' : '加入网络';
+      orbSubtitle = isHostMode ? '本地环境已就绪\n开始创建私有网络' : '本地环境已就绪\n输入验证码加入网络';
+      orbIcon = isHostMode ? Icons.wifi_tethering_rounded : Icons.login_rounded;
+      orbTone = _NetworkingOrbTone.idle;
+      orbSpinning = false;
+    }
 
     return SectionCard(
       title: '私有网络编排',
@@ -1306,28 +1630,19 @@ class _PrivateNetworkingTab extends StatelessWidget {
             selectedIndex: selectedMode,
             labels: const <String>['主持网络', '加入网络'],
             compact: true,
+            isLocked: isModeSwitchLocked,
             onSelected: onModeChanged,
           ),
           const SizedBox(height: 16),
-          if (isHostMode)
-            TextField(
-              controller: nameController,
-              enabled: !isBusy && !isDisabled,
-              decoration: const InputDecoration(
-                labelText: '私有网络名称',
-                hintText: '例如 我的私有网络',
-                prefixIcon: Icon(Icons.drive_file_rename_outline_rounded),
-              ),
-            )
-          else
+          if (!isHostMode)
             TextField(
               controller: codeController,
-              enabled: !isBusy && !isDisabled,
+              enabled: !isBusy && !isDisabled && !isPrivateOrchestrating,
               textInputAction: TextInputAction.done,
-              maxLength: 6,
+              maxLength: 8,
               decoration: const InputDecoration(
                 labelText: '验证码',
-                hintText: '输入 6 位验证码',
+                hintText: '输入 8 位验证码',
                 prefixIcon: Icon(Icons.password_rounded),
               ),
             ),
@@ -1336,35 +1651,40 @@ class _PrivateNetworkingTab extends StatelessWidget {
             child: _NetworkingActionOrb(
               key: isHostMode ? hostOrbKey : joinOrbKey,
               label: orbLabel,
-              icon: hasOnlinePrivateNetwork
-                  ? Icons.check_circle_rounded
-                  : (isHostMode
-                      ? Icons.wifi_tethering_rounded
-                      : Icons.login_rounded),
+              icon: orbIcon,
               subtitle: orbSubtitle,
               diameter: 220,
-              tone: hasOnlinePrivateNetwork
-                  ? _NetworkingOrbTone.success
-                  : (isBusy
-                      ? _NetworkingOrbTone.active
-                      : _NetworkingOrbTone.idle),
-              spinning: !hasOnlinePrivateNetwork && (isBusy || !isLocalReady),
-              onTap: isDisabled && !hasOnlinePrivateNetwork
+              tone: orbTone,
+              spinning: orbSpinning,
+              onTap: (isDisabled || isPrivateOrchestrating) &&
+                      !hasOnlinePrivateNetwork
                   ? null
                   : hasOnlinePrivateNetwork
-                      ? () => onLeavePressed(onlinePrivateNetwork)
+                      ? () => onLeavePressed(activeNetwork)
                       : (isHostMode ? onHostPressed : onJoinPressed),
             ),
           ),
           if (isHostMode &&
+              hostCodeReady &&
               inviteCode != null &&
               inviteCode.trim().isNotEmpty) ...<Widget>[
             const SizedBox(height: 16),
             _InlineCodePanel(
               title: '当前网络验证码',
               code: inviteCode,
-              message: '当前私有网络已在线，可将该验证码分享给其他设备。',
+              message: hostCreationReady
+                  ? '当前私有网络已在线，可将该验证码分享给其他设备。'
+                  : '当前私有网络已创建成功，正在等待本地虚拟 IP 就绪。',
               onCopy: () => onCopyValue(inviteCode, '已复制验证码'),
+            ),
+          ],
+          if (isHostMode &&
+              hostCodeReady &&
+              !hostCreationReady &&
+              addresses.isEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            const _InlineHint(
+              message: '验证码已生成，本地虚拟 IP 仍在同步，卡片会在地址就绪后自动出现。',
             ),
           ],
           if (hasOnlinePrivateNetwork && addresses.isNotEmpty) ...<Widget>[
@@ -1378,24 +1698,11 @@ class _PrivateNetworkingTab extends StatelessWidget {
           _InlineHint(
             message: isExternallyLocked
                 ? externalLockMessage
-                : (isHostMode ? '主持网络与默认网络互斥。' : '加入前会校验 6 位验证码。'),
+                : (isHostMode ? '主持网络与默认网络互斥。' : '加入前会校验 8 位验证码。'),
           ),
         ],
       ),
     );
-  }
-
-  String? _activeInviteCode(ManagedNetwork? network) {
-    if (network == null) {
-      return null;
-    }
-    for (final ManagedNetworkInviteCode inviteCode in network.inviteCodes) {
-      if (inviteCode.status.trim().toLowerCase() == 'active' &&
-          inviteCode.code.trim().isNotEmpty) {
-        return inviteCode.code.trim();
-      }
-    }
-    return network.inviteCodes.isEmpty ? null : network.inviteCodes.first.code;
   }
 
   ZeroTierNetworkState? _findLocal(
@@ -1737,12 +2044,14 @@ class _PrimaryTabSelector extends StatelessWidget {
     required this.labels,
     required this.onSelected,
     this.compact = false,
+    this.isLocked = false,
   });
 
   final int selectedIndex;
   final List<String> labels;
   final ValueChanged<int> onSelected;
   final bool compact;
+  final bool isLocked;
 
   @override
   Widget build(BuildContext context) {
@@ -1759,7 +2068,7 @@ class _PrimaryTabSelector extends StatelessWidget {
           return Expanded(
             child: InkWell(
               borderRadius: BorderRadius.circular(compact ? 18 : 22),
-              onTap: () => onSelected(index),
+              onTap: isLocked ? null : () => onSelected(index),
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 180),
                 padding: EdgeInsets.symmetric(
@@ -1770,15 +2079,18 @@ class _PrimaryTabSelector extends StatelessWidget {
                   borderRadius: BorderRadius.circular(compact ? 18 : 22),
                 ),
                 child: Center(
-                  child: Text(
-                    labels[index],
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                          fontWeight: FontWeight.w800,
-                          color: selected
-                              ? const Color(0xFFB45309)
-                              : const Color(0xFF6B7280),
-                        ),
+                  child: Opacity(
+                    opacity: isLocked && !selected ? 0.45 : 1,
+                    child: Text(
+                      labels[index],
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w800,
+                            color: selected
+                                ? const Color(0xFFB45309)
+                                : const Color(0xFF6B7280),
+                          ),
+                    ),
                   ),
                 ),
               ),
@@ -2254,7 +2566,7 @@ class _DefaultNetworkFlowPresentation {
   final bool usesLeaveAction;
 }
 
-class _NetworkingActionOrb extends StatelessWidget {
+class _NetworkingActionOrb extends StatefulWidget {
   const _NetworkingActionOrb({
     super.key,
     required this.label,
@@ -2275,10 +2587,51 @@ class _NetworkingActionOrb extends StatelessWidget {
   final bool spinning;
 
   @override
+  State<_NetworkingActionOrb> createState() => _NetworkingActionOrbState();
+}
+
+class _NetworkingActionOrbState extends State<_NetworkingActionOrb>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _rotationController;
+
+  @override
+  void initState() {
+    super.initState();
+    _rotationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    );
+    _syncRotation();
+  }
+
+  @override
+  void didUpdateWidget(covariant _NetworkingActionOrb oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.spinning != widget.spinning) {
+      _syncRotation();
+    }
+  }
+
+  void _syncRotation() {
+    if (widget.spinning) {
+      _rotationController.repeat();
+    } else {
+      _rotationController.stop();
+      _rotationController.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _rotationController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
-    final bool enabled = onTap != null;
-    final ({List<Color> colors, Color shadow}) palette = switch (tone) {
+    final bool enabled = widget.onTap != null;
+    final ({List<Color> colors, Color shadow}) palette = switch (widget.tone) {
       _NetworkingOrbTone.idle => (
           colors: const <Color>[Color(0xFFFFC36B), Color(0xFFF97316)],
           shadow: const Color(0x40F97316),
@@ -2299,13 +2652,13 @@ class _NetworkingActionOrb extends StatelessWidget {
 
     return Center(
       child: GestureDetector(
-        onTap: onTap,
+        onTap: widget.onTap,
         child: Opacity(
           opacity: enabled ? 1 : 0.82,
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 180),
-            width: diameter,
-            height: diameter,
+            width: widget.diameter,
+            height: widget.diameter,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               gradient: LinearGradient(
@@ -2339,23 +2692,25 @@ class _NetworkingActionOrb extends StatelessWidget {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: <Widget>[
-                  AnimatedRotation(
-                    turns: spinning ? 1 : 0,
-                    duration: const Duration(milliseconds: 1200),
-                    child:
-                        Icon(icon, size: diameter * 0.18, color: Colors.white),
+                  RotationTransition(
+                    turns: _rotationController,
+                    child: Icon(
+                      widget.icon,
+                      size: widget.diameter * 0.18,
+                      color: Colors.white,
+                    ),
                   ),
-                  SizedBox(height: diameter * 0.06),
+                  SizedBox(height: widget.diameter * 0.06),
                   Text(
-                    label,
+                    widget.label,
                     style: theme.textTheme.titleLarge?.copyWith(
                       color: Colors.white,
                       fontWeight: FontWeight.w800,
                     ),
                   ),
-                  SizedBox(height: diameter * 0.05),
+                  SizedBox(height: widget.diameter * 0.05),
                   Text(
-                    subtitle,
+                    widget.subtitle,
                     textAlign: TextAlign.center,
                     style: theme.textTheme.bodyMedium?.copyWith(
                       color: Colors.white.withValues(alpha: 0.92),
@@ -2477,6 +2832,79 @@ String _timeOrDash(DateTime? time) {
       '${local.hour.toString().padLeft(2, '0')}:'
       '${local.minute.toString().padLeft(2, '0')}:'
       '${local.second.toString().padLeft(2, '0')}';
+}
+
+String _buildDefaultPrivateNetworkName(AppConfig config) {
+  final String baseName =
+      config.deviceName.trim().isNotEmpty ? config.deviceName.trim() : '当前设备';
+  final DateTime now = DateTime.now();
+  final String stamp = '${now.year.toString().padLeft(4, '0')}'
+      '${now.month.toString().padLeft(2, '0')}'
+      '${now.day.toString().padLeft(2, '0')}-'
+      '${now.hour.toString().padLeft(2, '0')}'
+      '${now.minute.toString().padLeft(2, '0')}'
+      '${now.second.toString().padLeft(2, '0')}';
+  return '$baseName-私有网络-$stamp';
+}
+
+bool _networkContainsInviteCode(ManagedNetwork? network, String? code) {
+  final String targetCode = code?.trim() ?? '';
+  if (network == null || targetCode.isEmpty) {
+    return false;
+  }
+  return network.inviteCodes.any(
+    (ManagedNetworkInviteCode item) => item.code.trim() == targetCode,
+  );
+}
+
+ManagedNetwork? _findManagedNetworkByInviteCode(
+  List<ManagedNetwork> networks,
+  String? code,
+) {
+  return networks.cast<ManagedNetwork?>().firstWhere(
+        (ManagedNetwork? network) => _networkContainsInviteCode(network, code),
+        orElse: () => null,
+      );
+}
+
+ManagedNetwork? _findManagedNetworkById(
+  List<ManagedNetwork> networks,
+  String? networkId,
+) {
+  final String targetId = networkId?.trim() ?? '';
+  if (targetId.isEmpty) {
+    return null;
+  }
+  return networks.cast<ManagedNetwork?>().firstWhere(
+        (ManagedNetwork? network) => network?.id.trim() == targetId,
+        orElse: () => null,
+      );
+}
+
+ManagedNetworkMembership? _findCurrentMembership(
+  ManagedNetwork? network,
+  String currentDeviceId,
+) {
+  final String targetDeviceId = currentDeviceId.trim();
+  if (network == null || targetDeviceId.isEmpty) {
+    return null;
+  }
+  for (final ManagedNetworkMembership membership in network.memberships) {
+    if (membership.deviceId.trim() == targetDeviceId) {
+      return membership;
+    }
+  }
+  return null;
+}
+
+bool _isHostManagedNetwork(ManagedNetwork network, String currentDeviceId) {
+  final ManagedNetworkMembership? membership =
+      _findCurrentMembership(network, currentDeviceId);
+  if (membership == null) {
+    return false;
+  }
+  final String role = membership.role.trim().toLowerCase();
+  return role == 'owner' || role == 'host' || role == 'admin';
 }
 
 bool _isManagedNetworkOnline(
@@ -3128,7 +3556,7 @@ _DefaultNetworkFlowState _resolveDefaultNetworkFlowState({
   if (isAwaitingAuthorization && hasCurrentJoinIntent) {
     return _DefaultNetworkFlowState.awaitingAuthorization;
   }
-  if (hasActiveJoinSession &&
+  if (hasCurrentJoinIntent &&
       localState != null &&
       (localState.status == 'REQUESTING_CONFIGURATION' ||
           (localState.status == 'OK' &&
@@ -3136,7 +3564,7 @@ _DefaultNetworkFlowState _resolveDefaultNetworkFlowState({
           localState.status == 'UNKNOWN')) {
     return _DefaultNetworkFlowState.awaitingLocalConfig;
   }
-  if (hasActiveJoinSession && hasMembershipAccepted && localState == null) {
+  if (hasCurrentJoinIntent && hasMembershipAccepted && localState == null) {
     return _DefaultNetworkFlowState.awaitingLocalNetwork;
   }
   if (isSubmittingJoin) {
@@ -3157,7 +3585,7 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
     case _DefaultNetworkFlowState.initializing:
       return const _DefaultNetworkFlowPresentation(
         label: '环境未就绪',
-        subtitle: '本地环境尚未完成初始化。',
+        subtitle: '请等待本地环境初始化',
         hint: '初始化完成前，不允许开始默认网络编排。',
         icon: Icons.hourglass_top_rounded,
         tone: _NetworkingOrbTone.disabled,
@@ -3168,7 +3596,7 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
     case _DefaultNetworkFlowState.idle:
       return const _DefaultNetworkFlowPresentation(
         label: '开始组网',
-        subtitle: '本地准备完成后，点击开始接入默认网络。',
+        subtitle: '本地环境已就绪\n点击开始接入默认网络',
         hint: '点击开始组网后，应用会请求后端编排并等待本机 Agent 执行 join。',
         icon: Icons.flash_on_rounded,
         tone: _NetworkingOrbTone.idle,
@@ -3178,8 +3606,8 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
       );
     case _DefaultNetworkFlowState.orchestrating:
       return const _DefaultNetworkFlowPresentation(
-        label: '网络编排中',
-        subtitle: '正在请求服务端编排，等待本机 Agent 开始执行。',
+        label: '网络编排',
+        subtitle: '请求服务器网络编排中',
         hint: '当前处于服务端编排与本机执行之间，请继续等待。',
         icon: Icons.sync_rounded,
         tone: _NetworkingOrbTone.active,
@@ -3189,10 +3617,8 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
       );
     case _DefaultNetworkFlowState.awaitingLocalNetwork:
       return _DefaultNetworkFlowPresentation(
-        label: '网络编排中',
-        subtitle: hasServiceAssignedIp
-            ? '服务端已分配地址，等待本地建立网络映射。'
-            : '服务端已接受入网，等待本地看到该网络。',
+        label: '网络编排',
+        subtitle: '本地网络编排中',
         hint: '控制面已经推进，但本地 runtime 还没稳定看到默认网络。',
         icon: Icons.sync_rounded,
         tone: _NetworkingOrbTone.active,
@@ -3202,8 +3628,8 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
       );
     case _DefaultNetworkFlowState.awaitingLocalConfig:
       return const _DefaultNetworkFlowPresentation(
-        label: '网络编排中',
-        subtitle: '本地已看到默认网络，等待地址与路由收敛。',
+        label: '网络编排',
+        subtitle: '本地网络编排中',
         hint: '本地映射已经出现，正在等待地址和路由配置完成。',
         icon: Icons.sync_rounded,
         tone: _NetworkingOrbTone.active,
@@ -3213,8 +3639,8 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
       );
     case _DefaultNetworkFlowState.awaitingAuthorization:
       return const _DefaultNetworkFlowPresentation(
-        label: '网络编排中',
-        subtitle: '本地已看到该网络，等待控制面授权完成。',
+        label: '网络编排',
+        subtitle: '本地网络编排中',
         hint: '入网请求已发起，当前仍在等待授权。',
         icon: Icons.sync_rounded,
         tone: _NetworkingOrbTone.active,
@@ -3224,8 +3650,8 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
       );
     case _DefaultNetworkFlowState.online:
       return const _DefaultNetworkFlowPresentation(
-        label: '取消组网',
-        subtitle: '点击可取消组网。',
+        label: '组网成功',
+        subtitle: '点击可取消',
         hint: '绿色表示当前默认网络已经真实在线。',
         icon: Icons.check_circle_rounded,
         tone: _NetworkingOrbTone.success,
@@ -3239,7 +3665,7 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
         subtitle: transitionLabel ?? '正在回收相关网络链路。',
         hint: '回收完成前，按钮保持禁用，避免新旧链路相互干扰。',
         icon: Icons.sync_rounded,
-        tone: _NetworkingOrbTone.disabled,
+        tone: _NetworkingOrbTone.active,
         isInProgress: true,
         isDisabled: true,
         usesLeaveAction: false,
