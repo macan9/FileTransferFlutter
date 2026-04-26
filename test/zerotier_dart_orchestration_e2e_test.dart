@@ -217,6 +217,11 @@ class _FakeNetworkingService implements NetworkingService {
   int _sequence = 0;
 
   @override
+  Future<bool> probeServerReachability() async {
+    return true;
+  }
+
+  @override
   Future<NetworkDeviceIdentity> bootstrapDevice({
     required String deviceName,
     required String platform,
@@ -278,10 +283,11 @@ class _FakeNetworkingService implements NetworkingService {
   }) async {
     expect(deviceId, _currentDeviceId);
     expect(agentToken, _currentAgentToken);
-    final _PendingCommand? record = _commands.cast<_PendingCommand?>().firstWhere(
-          (_PendingCommand? item) => item?.command.id == commandId,
-          orElse: () => null,
-        );
+    final _PendingCommand? record =
+        _commands.cast<_PendingCommand?>().firstWhere(
+              (_PendingCommand? item) => item?.command.id == commandId,
+              orElse: () => null,
+            );
     if (record != null) {
       record.status = status;
       record.errorMessage = errorMessage;

@@ -41,6 +41,7 @@ final networkingAgentRuntimeProvider = NotifierProvider<
 class NetworkingAgentRuntimeState extends Equatable {
   const NetworkingAgentRuntimeState({
     required this.runtimeStatus,
+    this.isServerReachable = false,
     this.isActivated = false,
     this.isLocalInitializing = false,
     this.isBootstrapping = false,
@@ -63,6 +64,7 @@ class NetworkingAgentRuntimeState extends Equatable {
 
   const NetworkingAgentRuntimeState.initial()
       : runtimeStatus = const ZeroTierRuntimeStatus.unavailable(),
+        isServerReachable = false,
         isActivated = false,
         isLocalInitializing = false,
         isBootstrapping = false,
@@ -83,6 +85,7 @@ class NetworkingAgentRuntimeState extends Equatable {
         activeNetworkActionStartedAt = null;
 
   final ZeroTierRuntimeStatus runtimeStatus;
+  final bool isServerReachable;
   final bool isActivated;
   final bool isLocalInitializing;
   final bool isBootstrapping;
@@ -109,6 +112,7 @@ class NetworkingAgentRuntimeState extends Equatable {
 
   NetworkingAgentRuntimeState copyWith({
     ZeroTierRuntimeStatus? runtimeStatus,
+    bool? isServerReachable,
     bool? isActivated,
     bool? isLocalInitializing,
     bool? isBootstrapping,
@@ -140,6 +144,7 @@ class NetworkingAgentRuntimeState extends Equatable {
   }) {
     return NetworkingAgentRuntimeState(
       runtimeStatus: runtimeStatus ?? this.runtimeStatus,
+      isServerReachable: isServerReachable ?? this.isServerReachable,
       isActivated: isActivated ?? this.isActivated,
       isLocalInitializing: isLocalInitializing ?? this.isLocalInitializing,
       isBootstrapping: isBootstrapping ?? this.isBootstrapping,
@@ -182,6 +187,7 @@ class NetworkingAgentRuntimeState extends Equatable {
   @override
   List<Object?> get props => <Object?>[
         runtimeStatus,
+        isServerReachable,
         isActivated,
         isLocalInitializing,
         isBootstrapping,
@@ -229,6 +235,7 @@ class NetworkingAgentRuntimeController
   }
 
   Future<void> refreshNow() async {
+    await _refreshServerReachability();
     if (!_started) {
       await _refreshRuntimeStatus();
       return;
@@ -241,6 +248,19 @@ class NetworkingAgentRuntimeController
   Future<void> activate() async {
     await _ensureStarted();
     await refreshNow();
+  }
+
+  Future<void> _refreshServerReachability() async {
+    try {
+      final bool reachable = await _networkingService.probeServerReachability();
+      state = state.copyWith(
+        isServerReachable: reachable,
+      );
+    } catch (_) {
+      state = state.copyWith(
+        isServerReachable: false,
+      );
+    }
   }
 
   Future<void> initializeLocalRuntime() async {

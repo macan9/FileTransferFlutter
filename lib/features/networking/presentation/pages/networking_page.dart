@@ -340,9 +340,6 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         ref.watch(networkingAgentRuntimeProvider);
     final ZeroTierRuntimeStatus runtimeStatus = agentState.runtimeStatus;
     final bool isLocalReady = agentState.isLocalReady;
-    final bool isRegistered = config.agentToken.trim().isNotEmpty &&
-        config.zeroTierNodeId.trim().isNotEmpty &&
-        config.deviceId.trim().isNotEmpty;
     final bool isPrivateNetworkingBusy =
         dashboard.activeAction == 'create-private-network' ||
             dashboard.activeAction == 'join-by-invite-code';
@@ -360,28 +357,39 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
 
     return Column(
       children: <Widget>[
+        Container(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+          decoration: BoxDecoration(
+            color: Theme.of(context).scaffoldBackgroundColor,
+            boxShadow: const <BoxShadow>[
+              BoxShadow(
+                color: Color(0x120F172A),
+                blurRadius: 14,
+                offset: Offset(0, 4),
+              ),
+            ],
+          ),
+          child: _PrimaryTabSelector(
+            selectedIndex: _selectedPrimaryTab,
+            labels: const <String>['默认网络', '私有组网'],
+            onSelected: (int index) {
+              setState(() {
+                _selectedPrimaryTab = index;
+              });
+            },
+          ),
+        ),
         Expanded(
           child: RefreshIndicator(
             onRefresh: _refreshAll,
             child: ListView(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
               children: <Widget>[
-                _PrimaryTabSelector(
-                  selectedIndex: _selectedPrimaryTab,
-                  labels: const <String>['默认网络', '私有组网'],
-                  onSelected: (int index) {
-                    setState(() {
-                      _selectedPrimaryTab = index;
-                    });
-                  },
-                ),
-                const SizedBox(height: 16),
                 _TopStatusPills(
                   runtimeStatus: runtimeStatus,
-                  isRegistered: isRegistered,
                   agentState: agentState,
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 14),
                 AnimatedSwitcher(
                   duration: const Duration(milliseconds: 220),
                   child: _selectedPrimaryTab == 0
@@ -1329,10 +1337,6 @@ class _OneClickNetworkingTab extends StatelessWidget {
     final bool effectiveSubmittingJoin = isSubmittingJoin ||
         isOptimisticallyJoining ||
         shouldHoldJoinOrchestration;
-    final bool hasJoinIntentEvidence =
-        effectiveSubmittingJoin || hasActiveJoinSession;
-    final bool isActivelyJoining = hasActiveJoinSession ||
-        (effectiveSubmittingJoin && !hasActiveLeaveSession);
     final _DefaultNetworkFlowState resolvedFlowState =
         _resolveDefaultNetworkFlowState(
       isLocalReady: isLocalReady,
@@ -1370,23 +1374,15 @@ class _OneClickNetworkingTab extends StatelessWidget {
         flowPresentation.isDisabled ||
         agentState.isLocalInitializing ||
         !isLocalReady;
-    final _NetworkVisualState visualState = _resolveNetworkVisualState(
-      localState: localState,
-      managedStatus: currentMembershipStatus,
-      hasServiceAssignedIp: hasServiceAssignedIp,
-      hasJoinIntentEvidence: hasJoinIntentEvidence,
-      isBusy: isClosing || isActivelyJoining,
-      lastError: agentState.lastError,
-      runtimeServiceState: runtimeStatus.serviceState,
-    );
-
-    final String sectionSubtitle = flowState == _DefaultNetworkFlowState.online
-        ? visualState.message
-        : flowPresentation.subtitle;
-
+    final bool isConnected = flowState == _DefaultNetworkFlowState.online &&
+        localState != null &&
+        localState.assignedAddresses.isNotEmpty;
     return SectionCard(
       title: '默认网络编排',
-      subtitle: sectionSubtitle,
+      titleAction: _StatusChip(
+        label: isConnected ? '网络已连接' : '网络未连接',
+        color: isConnected ? const Color(0xFF2563EB) : const Color(0xFF64748B),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: <Widget>[
@@ -1403,22 +1399,15 @@ class _OneClickNetworkingTab extends StatelessWidget {
                     ? onLeave
                     : onJoin,
           ),
-          if (flowState == _DefaultNetworkFlowState.online &&
-              !isClosing &&
-              localState != null &&
-              localState.assignedAddresses.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 16),
-            _VirtualIpPanel(
-              addresses: localState.assignedAddresses,
-              onCopy: onCopyIp,
-            ),
-          ],
-          const SizedBox(height: 20),
-          _InlineHint(
-            message: isExternallyLocked
-                ? externalLockMessage
-                : flowPresentation.hint,
+          const SizedBox(height: 16),
+          _VirtualIpPanel(
+            addresses: localState?.assignedAddresses ?? const <String>[],
+            onCopy: onCopyIp,
           ),
+          if (isExternallyLocked) ...<Widget>[
+            const SizedBox(height: 16),
+            _InlineHint(message: externalLockMessage),
+          ],
         ],
       ),
     );
@@ -1622,29 +1611,113 @@ class _PrivateNetworkingTab extends StatelessWidget {
 
     return SectionCard(
       title: '私有网络编排',
-      subtitle: isHostMode ? '主持私有网络。' : '通过验证码加入私有网络。',
+      titleAction: _StatusChip(
+        label: hasOnlinePrivateNetwork ? '网络已连接' : '网络未连接',
+        color: hasOnlinePrivateNetwork
+            ? const Color(0xFF2563EB)
+            : const Color(0xFF64748B),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          _PrimaryTabSelector(
-            selectedIndex: selectedMode,
-            labels: const <String>['主持网络', '加入网络'],
-            compact: true,
-            isLocked: isModeSwitchLocked,
-            onSelected: onModeChanged,
+          Center(
+            child: _PrimaryTabSelector(
+              selectedIndex: selectedMode,
+              labels: const <String>['主持网络', '加入网络'],
+              compact: true,
+              useExpanded: false,
+              isLocked: isModeSwitchLocked,
+              onSelected: onModeChanged,
+            ),
           ),
           const SizedBox(height: 16),
           if (!isHostMode)
-            TextField(
-              controller: codeController,
-              enabled: !isBusy && !isDisabled && !isPrivateOrchestrating,
-              textInputAction: TextInputAction.done,
-              maxLength: 8,
-              decoration: const InputDecoration(
-                labelText: '验证码',
-                hintText: '输入 8 位验证码',
-                prefixIcon: Icon(Icons.password_rounded),
-              ),
+            ValueListenableBuilder<TextEditingValue>(
+              valueListenable: codeController,
+              builder: (
+                BuildContext context,
+                TextEditingValue value,
+                Widget? child,
+              ) {
+                return Container(
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF8FAFC),
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(
+                      color: const Color(0xFFCBD5E1),
+                    ),
+                    boxShadow: const <BoxShadow>[
+                      BoxShadow(
+                        color: Color(0x0F0F172A),
+                        blurRadius: 10,
+                        offset: Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: TextField(
+                    controller: codeController,
+                    enabled: !isBusy && !isDisabled && !isPrivateOrchestrating,
+                    textInputAction: TextInputAction.done,
+                    maxLength: 8,
+                    maxLengthEnforcement: MaxLengthEnforcement.enforced,
+                    inputFormatters: <TextInputFormatter>[
+                      FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z0-9]')),
+                      TextInputFormatter.withFunction(
+                        (TextEditingValue oldValue, TextEditingValue newValue) {
+                          return newValue.copyWith(
+                            text: newValue.text.toUpperCase(),
+                            selection: newValue.selection,
+                          );
+                        },
+                      ),
+                    ],
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                          letterSpacing: 3.2,
+                          fontWeight: FontWeight.w800,
+                        ),
+                    decoration: InputDecoration(
+                      counterText: '',
+                      hintText: '请输入 8 位验证码',
+                      hintStyle:
+                          Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                color: const Color(0xFF94A3B8),
+                              ),
+                      prefixIcon: Container(
+                        margin: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFE0F2FE),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Icon(
+                          Icons.shield_outlined,
+                          color: Color(0xFF0F766E),
+                        ),
+                      ),
+                      suffixIcon: Padding(
+                        padding: const EdgeInsets.only(right: 14),
+                        child: Center(
+                          widthFactor: 1,
+                          child: Text(
+                            '${value.text.trim().length}/8',
+                            style: Theme.of(context)
+                                .textTheme
+                                .labelMedium
+                                ?.copyWith(
+                                  color: const Color(0xFF64748B),
+                                  fontWeight: FontWeight.w700,
+                                ),
+                          ),
+                        ),
+                      ),
+                      border: InputBorder.none,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 18,
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
           const SizedBox(height: 18),
           Center(
@@ -1687,19 +1760,15 @@ class _PrivateNetworkingTab extends StatelessWidget {
               message: '验证码已生成，本地虚拟 IP 仍在同步，卡片会在地址就绪后自动出现。',
             ),
           ],
-          if (hasOnlinePrivateNetwork && addresses.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 16),
-            _VirtualIpPanel(
-              addresses: addresses,
-              onCopy: (String value) => onCopyValue(value, '已复制虚拟 IP'),
-            ),
-          ],
-          const SizedBox(height: 20),
-          _InlineHint(
-            message: isExternallyLocked
-                ? externalLockMessage
-                : (isHostMode ? '主持网络与默认网络互斥。' : '加入前会校验 8 位验证码。'),
+          const SizedBox(height: 16),
+          _VirtualIpPanel(
+            addresses: addresses,
+            onCopy: (String value) => onCopyValue(value, '已复制虚拟 IP'),
           ),
+          if (isExternallyLocked) ...<Widget>[
+            const SizedBox(height: 16),
+            _InlineHint(message: externalLockMessage),
+          ],
         ],
       ),
     );
@@ -2045,6 +2114,7 @@ class _PrimaryTabSelector extends StatelessWidget {
     required this.onSelected,
     this.compact = false,
     this.isLocked = false,
+    this.useExpanded = true,
   });
 
   final int selectedIndex;
@@ -2052,50 +2122,75 @@ class _PrimaryTabSelector extends StatelessWidget {
   final ValueChanged<int> onSelected;
   final bool compact;
   final bool isLocked;
+  final bool useExpanded;
 
   @override
   Widget build(BuildContext context) {
+    final bool isCompact = compact;
+    final Color selectedBackground =
+        isCompact ? const Color(0xFFE0F2FE) : const Color(0xFFFFE9D6);
+    final Color selectedForeground =
+        isCompact ? const Color(0xFF0F766E) : const Color(0xFFB45309);
     return Container(
-      padding: const EdgeInsets.all(6),
+      padding: EdgeInsets.all(isCompact ? 4 : 5),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(compact ? 20 : 28),
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(isCompact ? 16 : 18),
         border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
       ),
       child: Row(
+        mainAxisSize: useExpanded ? MainAxisSize.max : MainAxisSize.min,
         children: List<Widget>.generate(labels.length, (int index) {
           final bool selected = index == selectedIndex;
-          return Expanded(
-            child: InkWell(
-              borderRadius: BorderRadius.circular(compact ? 18 : 22),
-              onTap: isLocked ? null : () => onSelected(index),
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 180),
-                padding: EdgeInsets.symmetric(
-                    horizontal: 12, vertical: compact ? 14 : 18),
-                decoration: BoxDecoration(
-                  color:
-                      selected ? const Color(0xFFFFE9D6) : Colors.transparent,
-                  borderRadius: BorderRadius.circular(compact ? 18 : 22),
-                ),
-                child: Center(
-                  child: Opacity(
-                    opacity: isLocked && !selected ? 0.45 : 1,
-                    child: Text(
-                      labels[index],
-                      textAlign: TextAlign.center,
-                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                            fontWeight: FontWeight.w800,
-                            color: selected
-                                ? const Color(0xFFB45309)
-                                : const Color(0xFF6B7280),
-                          ),
-                    ),
+          final Widget item = AnimatedContainer(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            padding: EdgeInsets.symmetric(
+              horizontal: isCompact ? 14 : 18,
+              vertical: isCompact ? 9 : 11,
+            ),
+            decoration: BoxDecoration(
+              color: selected ? selectedBackground : Colors.transparent,
+              borderRadius: BorderRadius.circular(isCompact ? 12 : 14),
+            ),
+            child: Center(
+              child: Opacity(
+                opacity: isLocked && !selected ? 0.45 : 1,
+                child: AnimatedDefaultTextStyle(
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeOutCubic,
+                  style: (isCompact
+                              ? Theme.of(context).textTheme.titleSmall
+                              : Theme.of(context).textTheme.titleMedium)
+                          ?.copyWith(
+                        fontWeight: FontWeight.w800,
+                        color: selected
+                            ? selectedForeground
+                            : const Color(0xFF6B7280),
+                      ) ??
+                      const TextStyle(),
+                  child: Text(
+                    labels[index],
+                    textAlign: TextAlign.center,
                   ),
                 ),
               ),
             ),
           );
+          final Widget tappable = InkWell(
+            borderRadius: BorderRadius.circular(isCompact ? 12 : 14),
+            onTap: isLocked ? null : () => onSelected(index),
+            child: item,
+          );
+          return useExpanded
+              ? Expanded(
+                  child: tappable,
+                )
+              : Padding(
+                  padding: EdgeInsets.only(
+                      right: index == labels.length - 1 ? 0 : 8),
+                  child: tappable,
+                );
         }),
       ),
     );
@@ -2105,37 +2200,54 @@ class _PrimaryTabSelector extends StatelessWidget {
 class _TopStatusPills extends StatelessWidget {
   const _TopStatusPills({
     required this.runtimeStatus,
-    required this.isRegistered,
     required this.agentState,
   });
 
   final ZeroTierRuntimeStatus runtimeStatus;
-  final bool isRegistered;
   final NetworkingAgentRuntimeState agentState;
 
   @override
   Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 12,
-      runSpacing: 12,
-      children: <Widget>[
-        _SummaryPill(
-            label: '运行时',
-            value: _serviceStateLabel(runtimeStatus),
-            isReady: runtimeStatus.serviceState == 'running'),
-        _SummaryPill(
-            label: '节点',
-            value: _nodeStateLabel(runtimeStatus),
-            isReady: _isNodeOperational(runtimeStatus)),
-        _SummaryPill(
-            label: '注册',
-            value: isRegistered ? '已注册' : '待注册',
-            isReady: isRegistered),
-        _SummaryPill(
-            label: '状态',
-            value: agentState.isNetworkTransitioning ? '编排中' : '待命',
-            isReady: !agentState.isNetworkTransitioning),
-      ],
+    final List<Widget> pills = <Widget>[
+      _SummaryPill(
+        label: '服务器状态',
+        value: agentState.isServerReachable ? '就绪' : '未就绪',
+        isReady: agentState.isServerReachable,
+      ),
+      _SummaryPill(
+        label: '本地网络轮巡',
+        value: _serviceStateLabel(runtimeStatus),
+        isReady: runtimeStatus.serviceState == 'running',
+      ),
+      _SummaryPill(
+        label: '本地节点',
+        value: _compactNodeStateLabel(runtimeStatus),
+        isReady: _isNodeOperational(runtimeStatus),
+      ),
+    ];
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        if (constraints.maxWidth >= 720) {
+          return Row(
+            children: pills
+                .map((Widget pill) => Expanded(child: pill))
+                .toList(growable: false)
+                .expand(
+                  (Widget pill) => <Widget>[
+                    pill,
+                    if (pill != pills.last) const SizedBox(width: 8),
+                  ],
+                )
+                .toList(growable: false),
+          );
+        }
+        return Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: pills,
+        );
+      },
     );
   }
 }
@@ -2155,18 +2267,19 @@ class _SummaryPill extends StatelessWidget {
     final Color foreground =
         isReady ? const Color(0xFF15803D) : const Color(0xFF1D4ED8);
     return Container(
-      constraints: const BoxConstraints(minWidth: 180),
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+      constraints: const BoxConstraints(minWidth: 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
           color: background,
           borderRadius: BorderRadius.circular(999),
           border: Border.all(color: border)),
       child: Text('$label: $value',
           textAlign: TextAlign.center,
-          style: Theme.of(context)
-              .textTheme
-              .titleSmall
-              ?.copyWith(color: foreground, fontWeight: FontWeight.w800)),
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: foreground,
+                fontWeight: FontWeight.w800,
+                fontSize: 12,
+              )),
     );
   }
 }
@@ -2397,7 +2510,12 @@ class _VirtualIpPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final List<String> segments = _derivedSegmentsFromAddresses(addresses);
+    final List<String> ipv4Addresses = addresses
+        .where((String address) => address.trim().contains('.'))
+        .toList(growable: false);
+    final List<String> ipv6Addresses = addresses
+        .where((String address) => address.trim().contains(':'))
+        .toList(growable: false);
 
     return Container(
       width: double.infinity,
@@ -2417,51 +2535,99 @@ class _VirtualIpPanel extends StatelessWidget {
                   fontWeight: FontWeight.w800,
                 ),
           ),
-          if (segments.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 8),
-            Text(
-              '共享网段：${segments.join(' / ')}',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: const Color(0xFF166534),
-                    fontWeight: FontWeight.w600,
-                  ),
+          const SizedBox(height: 12),
+          if (ipv4Addresses.isEmpty && ipv6Addresses.isEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Text(
+                '当前暂无虚拟 IP',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFF166534),
+                      fontWeight: FontWeight.w600,
+                    ),
+              ),
+            ),
+          if (ipv4Addresses.isNotEmpty)
+            _VirtualIpGroup(
+              title: 'IPv4 虚拟地址',
+              addresses: ipv4Addresses,
+              onCopy: onCopy,
+            ),
+          if (ipv6Addresses.isNotEmpty) ...<Widget>[
+            if (ipv4Addresses.isNotEmpty) const SizedBox(height: 12),
+            _VirtualIpGroup(
+              title: 'IPv6 虚拟地址',
+              addresses: ipv6Addresses,
+              onCopy: onCopy,
             ),
           ],
-          const SizedBox(height: 12),
-          ...addresses.map(
-            (String address) => Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: SelectableText(
-                        address,
-                        style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                              fontWeight: FontWeight.w700,
-                              color: const Color(0xFF166534),
-                            ),
-                      ),
+        ],
+      ),
+    );
+  }
+}
+
+class _VirtualIpGroup extends StatelessWidget {
+  const _VirtualIpGroup({
+    required this.title,
+    required this.addresses,
+    required this.onCopy,
+  });
+
+  final String title;
+  final List<String> addresses;
+  final ValueChanged<String> onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          title,
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: const Color(0xFF166534),
+                fontWeight: FontWeight.w800,
+              ),
+        ),
+        const SizedBox(height: 8),
+        ...addresses.map(
+          (String address) => Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Row(
+                children: <Widget>[
+                  Expanded(
+                    child: SelectableText(
+                      address,
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                            fontWeight: FontWeight.w700,
+                            color: const Color(0xFF166534),
+                          ),
                     ),
-                    IconButton(
-                      tooltip: '复制虚拟 IP',
-                      onPressed: () => onCopy(address),
-                      icon: const Icon(Icons.copy_rounded),
-                      color: const Color(0xFF166534),
-                    ),
-                  ],
-                ),
+                  ),
+                  IconButton(
+                    tooltip: '复制虚拟 IP',
+                    onPressed: () => onCopy(address),
+                    icon: const Icon(Icons.copy_rounded),
+                    color: const Color(0xFF166534),
+                  ),
+                ],
               ),
             ),
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }
@@ -3046,6 +3212,16 @@ String _nodeStateLabel(ZeroTierRuntimeStatus status) {
     return '未启动';
   }
   return status.serviceState;
+}
+
+String _compactNodeStateLabel(ZeroTierRuntimeStatus status) {
+  if (_isNodeOperational(status)) {
+    return '就绪';
+  }
+  if (status.isNodeOffline) {
+    return '掉线';
+  }
+  return '启动中';
 }
 
 _RuntimeSignal _resolveRuntimeSignal({

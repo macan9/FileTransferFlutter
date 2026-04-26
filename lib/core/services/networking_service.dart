@@ -10,6 +10,7 @@ import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:http/http.dart' as http;
 
 abstract class NetworkingService {
+  Future<bool> probeServerReachability();
   Future<NetworkDeviceIdentity> bootstrapDevice({
     required String deviceName,
     required String platform,
@@ -92,6 +93,22 @@ class HttpNetworkingService implements NetworkingService {
 
   final Uri _baseUri;
   final http.Client _client;
+
+  @override
+  Future<bool> probeServerReachability() async {
+    try {
+      final http.Response response = await _client
+          .get(
+            _baseUri.replace(
+              path: _baseUri.path.isEmpty ? '/' : _baseUri.path,
+            ),
+          )
+          .timeout(const Duration(seconds: 3));
+      return response.statusCode > 0;
+    } catch (_) {
+      return false;
+    }
+  }
 
   @override
   Future<NetworkDeviceIdentity> bootstrapDevice({
