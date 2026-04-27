@@ -1,6 +1,6 @@
 {
-    "name": "传输助手",
-    "short_name": "传输助手",
+    "name": "小马工具箱",
+    "short_name": "小马工具箱",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
