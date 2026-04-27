@@ -90,12 +90,27 @@ target_include_directories(zt_mount_service PRIVATE
   "${CMAKE_SOURCE_DIR}"
 )
 
+set(WINTUN_DLL_PATH
+  "${CMAKE_SOURCE_DIR}/../third_party/wintun/0.14.1/extract/wintun/bin/amd64/wintun.dll"
+)
+
 add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:zt-shared>
     $<TARGET_FILE_DIR:${BINARY_NAME}>
   VERBATIM
 )
+
+if(EXISTS "${WINTUN_DLL_PATH}")
+  add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${WINTUN_DLL_PATH}"
+      "$<TARGET_FILE_DIR:${BINARY_NAME}>/wintun.dll"
+    VERBATIM
+  )
+else()
+  message(WARNING "wintun.dll not found at ${WINTUN_DLL_PATH}; Wintun adapter bootstrap may fail.")
+endif()
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)

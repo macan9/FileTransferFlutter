@@ -140,12 +140,17 @@ enum _DefaultNetworkingUiState {
   serverOrchestrating,
   localOrchestrating,
   awaitingAuthorization,
+  localMountFailed,
   success,
   closing,
 }
 
 class _NetworkingPageState extends ConsumerState<NetworkingPage> {
+  static const Duration _defaultMountStallTimeout = Duration(seconds: 25);
+  static const bool _debugHoldDefaultNetworkOrchestrating = false;
+
   late final TextEditingController _networkCodeController;
+  Timer? _defaultMountStallTimer;
   ManagedNetwork? _createdPrivateNetwork;
   String? _generatedNetworkCode;
   String? _lastJoinedPrivateCode;
@@ -163,10 +168,17 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   void initState() {
     super.initState();
     _networkCodeController = TextEditingController();
+    if (_debugHoldDefaultNetworkOrchestrating) {
+      _hasDefaultNetworkingIntent = true;
+      _defaultFlowState = _DefaultNetworkingUiState.localOrchestrating;
+      _defaultJoinTransitionStartedAt = DateTime.now();
+      _scheduleDefaultMountStallCheck();
+    }
   }
 
   @override
   void dispose() {
+    _defaultMountStallTimer?.cancel();
     _networkCodeController.dispose();
     super.dispose();
   }
@@ -236,9 +248,31 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         if (_hasDefaultNetworkingIntent &&
             _defaultFlowState != _DefaultNetworkingUiState.closing &&
             mounted) {
+          if (_debugHoldDefaultNetworkOrchestrating) {
+            if (_defaultFlowState !=
+                _DefaultNetworkingUiState.localMountFailed) {
+              setState(() {
+                _defaultFlowState =
+                    _DefaultNetworkingUiState.localOrchestrating;
+                _isDefaultJoinTransitioning = false;
+              });
+            }
+            return;
+          }
+          final bool defaultMountStalled = _isProblematicLocalMountState(
+                currentDefaultLocalState,
+              ) &&
+              _defaultJoinTransitionStartedAt != null &&
+              DateTime.now().difference(_defaultJoinTransitionStartedAt!) >=
+                  _defaultMountStallTimeout;
           if (currentDefaultOnline) {
             setState(() {
               _defaultFlowState = _DefaultNetworkingUiState.success;
+            });
+          } else if (defaultMountStalled) {
+            setState(() {
+              _defaultFlowState = _DefaultNetworkingUiState.localMountFailed;
+              _isDefaultJoinTransitioning = false;
             });
           } else if (_isAuthorizationPendingLocalNetwork(
               currentDefaultLocalState)) {
@@ -498,6 +532,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
           _defaultFlowState = _DefaultNetworkingUiState.serverOrchestrating;
           _defaultJoinTransitionStartedAt = DateTime.now();
         });
+        _scheduleDefaultMountStallCheck();
       }
       await ref
           .read(networkingProvider.notifier)
@@ -519,6 +554,51 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       });
       _showPageMessage(error.message);
     }
+  }
+
+  void _scheduleDefaultMountStallCheck() {
+    _defaultMountStallTimer?.cancel();
+    _defaultMountStallTimer = Timer(_defaultMountStallTimeout, () {
+      if (!mounted ||
+          !_hasDefaultNetworkingIntent ||
+          (!_debugHoldDefaultNetworkOrchestrating &&
+              _defaultFlowState == _DefaultNetworkingUiState.success) ||
+          _defaultFlowState == _DefaultNetworkingUiState.closing) {
+        return;
+      }
+
+      final NetworkingDashboardState currentDashboard =
+          ref.read(networkingProvider).valueOrNull ??
+              const NetworkingDashboardState.initial();
+      final ManagedNetwork? currentDefaultNetwork =
+          currentDashboard.defaultNetwork;
+      final String currentDefaultNetworkId =
+          currentDefaultNetwork?.zeroTierNetworkId?.trim().toLowerCase() ?? '';
+      ZeroTierNetworkState? currentDefaultLocalState;
+      if (currentDefaultNetworkId.isNotEmpty) {
+        final ZeroTierRuntimeStatus runtimeStatus =
+            ref.read(networkingAgentRuntimeProvider).runtimeStatus;
+        for (final ZeroTierNetworkState state in runtimeStatus.joinedNetworks) {
+          if (state.networkId.trim().toLowerCase() == currentDefaultNetworkId) {
+            currentDefaultLocalState = state;
+            break;
+          }
+        }
+      }
+
+      final bool shouldShowMountFailure =
+          _debugHoldDefaultNetworkOrchestrating ||
+              _isProblematicLocalMountState(currentDefaultLocalState);
+      if (!shouldShowMountFailure) {
+        return;
+      }
+
+      setState(() {
+        _defaultFlowState = _DefaultNetworkingUiState.localMountFailed;
+        _isDefaultJoinTransitioning = false;
+      });
+      _showPageMessage('本地挂载超时，可重新挂载或离开网络。');
+    });
   }
 
   Future<void> _leaveDefaultNetwork(
@@ -785,16 +865,91 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     if (!mounted) {
       return;
     }
+    final String normalizedMessage = _normalizePageMessage(message);
+    final bool isError = _isErrorPageMessage(normalizedMessage);
+    final Color accentColor =
+        isError ? const Color(0xFFDC2626) : const Color(0xFF0F766E);
+    final Color accentBackground =
+        isError ? const Color(0xFFFEE2E2) : const Color(0xFFCCFBF1);
     final ScaffoldMessengerState messenger = ScaffoldMessenger.of(context);
     messenger
       ..hideCurrentSnackBar()
       ..showSnackBar(
         SnackBar(
-          content: Text(message),
           behavior: SnackBarBehavior.floating,
+          elevation: 14,
+          backgroundColor: Colors.white,
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 82),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          duration: const Duration(seconds: 3),
+          dismissDirection: DismissDirection.horizontal,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: BorderSide(
+              color:
+                  isError ? const Color(0xFFFECACA) : const Color(0xFF99F6E4),
+            ),
+          ),
+          content: Row(
+            children: <Widget>[
+              Container(
+                width: 30,
+                height: 30,
+                decoration: BoxDecoration(
+                  color: accentBackground,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(
+                  isError
+                      ? Icons.error_outline_rounded
+                      : Icons.check_circle_outline_rounded,
+                  color: accentColor,
+                  size: 18,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  normalizedMessage,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF0F172A),
+                        fontWeight: FontWeight.w600,
+                        height: 1.35,
+                      ),
+                ),
+              ),
+            ],
+          ),
         ),
       );
   }
+}
+
+String _normalizePageMessage(String message) {
+  final String trimmed = message.trim();
+  final String lower = trimmed.toLowerCase();
+  if ((lower.contains('invite') || lower.contains('code')) &&
+      (lower.contains('not found') ||
+          lower.contains('does not exist') ||
+          lower.contains('invalid') ||
+          lower.contains('expired') ||
+          lower.contains('revoked'))) {
+    return '验证码不存在或已失效，请确认后重新输入。';
+  }
+  return trimmed.isEmpty ? '操作已完成。' : trimmed;
+}
+
+bool _isErrorPageMessage(String message) {
+  return message.contains('失败') ||
+      message.contains('错误') ||
+      message.contains('无法') ||
+      message.contains('不存在') ||
+      message.contains('失效') ||
+      message.contains('超时') ||
+      message.contains('请输入') ||
+      message.contains('请先') ||
+      message.toLowerCase().contains('error') ||
+      message.toLowerCase().contains('failed');
 }
 
 class _HeroStatusCard extends StatelessWidget {
@@ -1347,6 +1502,12 @@ class _OneClickNetworkingTab extends StatelessWidget {
     final bool effectiveSubmittingJoin = isSubmittingJoin ||
         isOptimisticallyJoining ||
         shouldHoldJoinOrchestration;
+    final bool isLocalMountStalled =
+        _isProblematicLocalMountState(localState) &&
+            hasSessionJoinIntent &&
+            defaultJoinTransitionStartedAt != null &&
+            DateTime.now().difference(defaultJoinTransitionStartedAt!) >=
+                _NetworkingPageState._defaultMountStallTimeout;
     final _DefaultNetworkFlowState resolvedFlowState =
         _resolveDefaultNetworkFlowState(
       isLocalReady: isLocalReady,
@@ -1361,17 +1522,35 @@ class _OneClickNetworkingTab extends StatelessWidget {
       managedStatus: currentMembershipStatus,
       hasServiceAssignedIp: hasServiceAssignedIp,
       hasMembershipAccepted: isMembershipAccepted,
+      isLocalMountStalled: isLocalMountStalled,
       hasLastError: agentState.lastError?.trim().isNotEmpty == true,
     );
+    final _DefaultNetworkFlowState debugFlowState =
+        _NetworkingPageState._debugHoldDefaultNetworkOrchestrating
+            ? (uiFlowState == _DefaultNetworkingUiState.localMountFailed
+                ? _DefaultNetworkFlowState.localMountFailed
+                : _DefaultNetworkFlowState.awaitingLocalConfig)
+            : resolvedFlowState;
     final _DefaultNetworkFlowState flowState = switch (uiFlowState) {
-      _DefaultNetworkingUiState.idle => resolvedFlowState,
+      _DefaultNetworkingUiState.idle => debugFlowState,
       _DefaultNetworkingUiState.serverOrchestrating =>
-        _DefaultNetworkFlowState.orchestrating,
+        _NetworkingPageState._debugHoldDefaultNetworkOrchestrating
+            ? debugFlowState
+            : _DefaultNetworkFlowState.orchestrating,
       _DefaultNetworkingUiState.localOrchestrating =>
-        _DefaultNetworkFlowState.awaitingLocalConfig,
+        _NetworkingPageState._debugHoldDefaultNetworkOrchestrating
+            ? debugFlowState
+            : _DefaultNetworkFlowState.awaitingLocalConfig,
       _DefaultNetworkingUiState.awaitingAuthorization =>
-        _DefaultNetworkFlowState.awaitingAuthorization,
-      _DefaultNetworkingUiState.success => _DefaultNetworkFlowState.online,
+        _NetworkingPageState._debugHoldDefaultNetworkOrchestrating
+            ? debugFlowState
+            : _DefaultNetworkFlowState.awaitingAuthorization,
+      _DefaultNetworkingUiState.localMountFailed =>
+        _DefaultNetworkFlowState.localMountFailed,
+      _DefaultNetworkingUiState.success =>
+        _NetworkingPageState._debugHoldDefaultNetworkOrchestrating
+            ? debugFlowState
+            : _DefaultNetworkFlowState.online,
       _DefaultNetworkingUiState.closing => _DefaultNetworkFlowState.closing,
     };
     final _DefaultNetworkFlowPresentation flowPresentation =
@@ -1417,6 +1596,15 @@ class _OneClickNetworkingTab extends StatelessWidget {
           if (isExternallyLocked) ...<Widget>[
             const SizedBox(height: 16),
             _InlineHint(message: externalLockMessage),
+          ],
+          if (flowState == _DefaultNetworkFlowState.localMountFailed &&
+              localState != null) ...<Widget>[
+            const SizedBox(height: 12),
+            TextButton.icon(
+              onPressed: onLeave,
+              icon: const Icon(Icons.link_off_rounded),
+              label: const Text('离开网络'),
+            ),
           ],
         ],
       ),
@@ -1553,17 +1741,21 @@ class _PrivateNetworkingTab extends StatelessWidget {
         : _findLocal(runtimeStatus, displayNetwork);
     final _PrivateNetworkingFlowState activeFlowState =
         isHostMode ? hostFlowState : joinFlowState;
-    final bool hostCodeReady = generatedCode?.trim().isNotEmpty == true;
+    final String? hostInviteCode = isHostMode
+        ? _resolveHostInviteCode(
+            generatedCode: generatedCode,
+            displayNetwork: displayNetwork,
+          )
+        : null;
+    final bool hostCodeReady = hostInviteCode?.trim().isNotEmpty == true;
     final bool hostCreationReady =
         hostFlowState == _PrivateNetworkingFlowState.success;
     final bool hasOnlinePrivateNetwork =
         activeFlowState == _PrivateNetworkingFlowState.success;
     final ManagedNetwork? activeNetwork =
         isHostMode ? displayNetwork : (joinNetworkByCode ?? onlineJoinNetwork);
-    final String? inviteCode =
-        isHostMode ? (hostCodeReady ? generatedCode : null) : null;
     final String? copyableInviteCode =
-        hostCreationReady && inviteCode != null ? inviteCode : null;
+        hostCreationReady && hostCodeReady ? hostInviteCode : null;
     final List<String> addresses =
         localState?.assignedAddresses ?? const <String>[];
     final bool isClosing =
@@ -2857,6 +3049,7 @@ enum _DefaultNetworkFlowState {
   awaitingLocalNetwork,
   awaitingLocalConfig,
   awaitingAuthorization,
+  localMountFailed,
   online,
   closing,
   retryableError,
@@ -3208,6 +3401,51 @@ bool _networkContainsInviteCode(ManagedNetwork? network, String? code) {
   return network.inviteCodes.any(
     (ManagedNetworkInviteCode item) => item.code.trim() == targetCode,
   );
+}
+
+String? _resolveHostInviteCode({
+  required String? generatedCode,
+  required ManagedNetwork? displayNetwork,
+}) {
+  final String localCode = generatedCode?.trim() ?? '';
+  if (localCode.isNotEmpty) {
+    return localCode;
+  }
+  if (displayNetwork == null) {
+    return null;
+  }
+
+  final List<ManagedNetworkInviteCode> usableCodes =
+      displayNetwork.inviteCodes.where((ManagedNetworkInviteCode item) {
+    if (item.code.trim().isEmpty) {
+      return false;
+    }
+    final String status = item.status.trim().toLowerCase();
+    if (status == 'revoked' || status == 'expired') {
+      return false;
+    }
+    if (item.revokedAt != null) {
+      return false;
+    }
+    if (item.expiresAt != null && item.expiresAt!.isBefore(DateTime.now())) {
+      return false;
+    }
+    return true;
+  }).toList(growable: false);
+  if (usableCodes.isEmpty) {
+    return null;
+  }
+
+  final List<ManagedNetworkInviteCode> sorted =
+      List<ManagedNetworkInviteCode>.from(usableCodes)
+        ..sort((ManagedNetworkInviteCode left, ManagedNetworkInviteCode right) {
+          final DateTime leftCreated =
+              left.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+          final DateTime rightCreated =
+              right.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+          return rightCreated.compareTo(leftCreated);
+        });
+  return sorted.first.code.trim();
 }
 
 ManagedNetwork? _findManagedNetworkByInviteCode(
@@ -3833,6 +4071,20 @@ bool _isLocalNetworkMounted(
       localState.localMountState == 'ready';
 }
 
+bool _isProblematicLocalMountState(ZeroTierNetworkState? localState) {
+  if (localState == null || !localState.isAuthorized) {
+    return false;
+  }
+  switch (localState.localMountState) {
+    case 'ip_not_bound':
+    case 'route_not_bound':
+    case 'missing_adapter':
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool _isLocalNetworkNegotiating(
   ZeroTierNetworkState localState,
   bool hasServiceAssignedIp,
@@ -3904,6 +4156,7 @@ _DefaultNetworkFlowState _resolveDefaultNetworkFlowState({
   required String? managedStatus,
   required bool hasServiceAssignedIp,
   required bool hasMembershipAccepted,
+  required bool isLocalMountStalled,
   required bool hasLastError,
 }) {
   final bool hasCurrentJoinIntent = isSubmittingJoin || hasActiveJoinSession;
@@ -3918,6 +4171,9 @@ _DefaultNetworkFlowState _resolveDefaultNetworkFlowState({
   }
   if (isAwaitingAuthorization && hasCurrentJoinIntent) {
     return _DefaultNetworkFlowState.awaitingAuthorization;
+  }
+  if (isLocalMountStalled) {
+    return _DefaultNetworkFlowState.localMountFailed;
   }
   if (hasCurrentJoinIntent &&
       localState != null &&
@@ -4009,6 +4265,17 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
         tone: _NetworkingOrbTone.active,
         isInProgress: true,
         isDisabled: true,
+        usesLeaveAction: false,
+      );
+    case _DefaultNetworkFlowState.localMountFailed:
+      return const _DefaultNetworkFlowPresentation(
+        label: '本地挂载失败\n可重试或者离开网络',
+        subtitle: '点击重试挂载，或选择离开网络',
+        hint: 'ZeroTier 已加入网络，但 Windows IP 或路由长时间没有挂载完成。',
+        icon: Icons.refresh_rounded,
+        tone: _NetworkingOrbTone.idle,
+        isInProgress: false,
+        isDisabled: false,
         usesLeaveAction: false,
       );
     case _DefaultNetworkFlowState.online:
