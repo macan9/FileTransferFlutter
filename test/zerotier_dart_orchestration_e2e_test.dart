@@ -396,6 +396,15 @@ class _FakeNetworkingService implements NetworkingService {
   }
 
   @override
+  Future<PairingSession> closePairingSession({
+    required String sessionId,
+    required String deviceId,
+    String? reason,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<PrivateNetworkCreationResult> createPrivateNetwork({
     required String ownerDeviceId,
     required String name,

@@ -201,6 +201,25 @@ class NetworkingController extends AsyncNotifier<NetworkingDashboardState> {
     return result;
   }
 
+  Future<PairingSession> closePairingSession({
+    required String sessionId,
+    required String deviceId,
+    String? reason,
+  }) async {
+    late final PairingSession result;
+    await _runAction(
+      action: 'close-pairing-session',
+      run: () async {
+        result = await _service.closePairingSession(
+          sessionId: sessionId,
+          deviceId: deviceId,
+          reason: reason,
+        );
+      },
+    );
+    return result;
+  }
+
   Future<PrivateNetworkCreationResult> createPrivateNetwork({
     required String ownerDeviceId,
     required String name,

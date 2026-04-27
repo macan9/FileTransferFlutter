@@ -18,6 +18,8 @@ class PairingSession extends Equatable {
     this.activatedAt,
     this.revokedAt,
     this.closedReason,
+    this.firewallScopeStatus,
+    this.firewallScopeClosedAt,
     this.zeroTierNetworkId,
     this.zeroTierNetworkName,
   });
@@ -51,6 +53,8 @@ class PairingSession extends Equatable {
       activatedAt: _parseDateTime(json['activatedAt']),
       revokedAt: _parseDateTime(json['revokedAt']),
       closedReason: json['closedReason']?.toString(),
+      firewallScopeStatus: json['firewallScopeStatus']?.toString(),
+      firewallScopeClosedAt: _parseDateTime(json['firewallScopeClosedAt']),
       zeroTierNetworkId: json['zeroTierNetworkId']?.toString(),
       zeroTierNetworkName: json['zeroTierNetworkName']?.toString(),
     );
@@ -71,6 +75,8 @@ class PairingSession extends Equatable {
   final DateTime? activatedAt;
   final DateTime? revokedAt;
   final String? closedReason;
+  final String? firewallScopeStatus;
+  final DateTime? firewallScopeClosedAt;
   final String? zeroTierNetworkId;
   final String? zeroTierNetworkName;
 
@@ -93,6 +99,8 @@ class PairingSession extends Equatable {
         activatedAt,
         revokedAt,
         closedReason,
+        firewallScopeStatus,
+        firewallScopeClosedAt,
         zeroTierNetworkId,
         zeroTierNetworkName,
       ];

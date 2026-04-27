@@ -719,10 +719,10 @@ class NetworkingAgentRuntimeController
       }
 
       for (final NetworkAgentCommand command in commands) {
-        if (command.isCancelled) {
+        if (command.isSkipped) {
           state = state.copyWith(
             lastCommandAt: DateTime.now(),
-            lastCommandSummary: 'Skipped cancelled ${command.type}',
+            lastCommandSummary: 'Skipped ${command.status} ${command.type}',
             clearLastError: true,
           );
           continue;
@@ -1078,7 +1078,7 @@ class NetworkingAgentRuntimeController
         command.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
     for (final NetworkAgentCommand candidate in latestCommands) {
       if (candidate.type != 'join_zerotier_network' ||
-          candidate.isCancelled ||
+          candidate.isSkipped ||
           candidate.isFinal) {
         continue;
       }

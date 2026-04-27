@@ -85,6 +85,8 @@ void main() {
                   'id': 'ps-1',
                   'status': 'cancelled',
                   'createdAt': '2026-04-19T10:00:00.000Z',
+                  'firewallScopeStatus': 'closed',
+                  'firewallScopeClosedAt': '2026-04-19T10:05:00.000Z',
                   'initiatorDevice': <String, dynamic>{
                     'id': 'cm-device-a',
                     'deviceName': 'Alpha',
@@ -120,7 +122,7 @@ void main() {
                       'id': 'cmd-1',
                       'deviceId': 'cm-device-a',
                       'type': 'join_zerotier_network',
-                      'status': 'cancelled',
+                      'status': 'superseded',
                       'payload': <String, dynamic>{
                         'networkId': '8056c2e21c000001'
                       },
@@ -142,8 +144,14 @@ void main() {
       expect(sessions, hasLength(1));
       expect(sessions.single.id, 'ps-1');
       expect(sessions.single.isCancelled, isTrue);
+      expect(sessions.single.firewallScopeStatus, 'closed');
+      expect(
+        sessions.single.firewallScopeClosedAt,
+        DateTime.parse('2026-04-19T10:05:00.000Z'),
+      );
       expect(sessions.single.allowedPorts.single.port, 3389);
-      expect(sessions.single.commands.single.isCancelled, isTrue);
+      expect(sessions.single.commands.single.isSuperseded, isTrue);
+      expect(sessions.single.commands.single.isFinal, isTrue);
       expect(
         sessions.single.commands.single.createdAt,
         DateTime.parse('2026-04-19T10:01:00.000Z'),
@@ -203,20 +211,79 @@ void main() {
       );
       expect(session.status, 'cancelled');
     });
+
+    test('closePairingSession posts to close endpoint for normal shutdown',
+        () async {
+      late http.Request capturedRequest;
+      final HttpNetworkingService service = HttpNetworkingService(
+        baseUri: Uri.parse('http://localhost:3000'),
+        client: MockClient((http.Request request) async {
+          capturedRequest = request;
+          return http.Response(
+            jsonEncode(<String, dynamic>{
+              'session': <String, dynamic>{
+                'id': 'ps-3',
+                'status': 'closed',
+                'firewallScopeStatus': 'closed',
+                'firewallScopeClosedAt': '2026-04-19T11:05:00.000Z',
+                'initiatorDevice': <String, dynamic>{
+                  'id': 'cm-device-a',
+                  'deviceName': 'Alpha',
+                  'platform': 'windows',
+                  'zeroTierNodeId': 'zt-a',
+                  'status': 'online',
+                },
+                'targetDevice': <String, dynamic>{
+                  'id': 'cm-device-b',
+                  'deviceName': 'Beta',
+                  'platform': 'android',
+                  'zeroTierNodeId': 'zt-b',
+                  'status': 'online',
+                },
+                'allowedPorts': const <Map<String, dynamic>>[],
+                'zeroTierBindings': const <Map<String, dynamic>>[],
+                'commands': const <Map<String, dynamic>>[],
+              },
+            }),
+            200,
+            headers: <String, String>{'content-type': 'application/json'},
+          );
+        }),
+      );
+
+      final session = await service.closePairingSession(
+        sessionId: 'ps-3',
+        deviceId: 'cm-device-a',
+        reason: 'Transfer completed',
+      );
+
+      expect(capturedRequest.method, 'POST');
+      expect(capturedRequest.url.path, '/networking/sessions/ps-3/close');
+      expect(
+        jsonDecode(capturedRequest.body),
+        <String, dynamic>{
+          'deviceId': 'cm-device-a',
+          'reason': 'Transfer completed',
+        },
+      );
+      expect(session.status, 'closed');
+      expect(session.firewallScopeStatus, 'closed');
+    });
   });
 
   group('NetworkAgentCommand', () {
-    test('marks cancelled and final statuses correctly', () {
+    test('marks skipped and final statuses correctly', () {
       final NetworkAgentCommand command = NetworkAgentCommand.fromJson(
         <String, dynamic>{
           'id': 'cmd-2',
           'type': 'leave_zerotier_network',
-          'status': 'cancelled',
+          'status': 'expired',
           'payload': <String, dynamic>{},
         },
       );
 
-      expect(command.isCancelled, isTrue);
+      expect(command.isExpired, isTrue);
+      expect(command.isSkipped, isTrue);
       expect(command.isFinal, isTrue);
     });
   });

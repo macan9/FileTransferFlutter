@@ -45,8 +45,15 @@ class NetworkAgentCommand extends Equatable {
   final DateTime? acknowledgedAt;
 
   bool get isCancelled => status == 'cancelled';
+  bool get isSuperseded => status == 'superseded';
+  bool get isExpired => status == 'expired';
   bool get isFinal =>
-      status == 'acknowledged' || status == 'failed' || status == 'cancelled';
+      status == 'acknowledged' ||
+      status == 'failed' ||
+      status == 'cancelled' ||
+      isSuperseded ||
+      isExpired;
+  bool get isSkipped => isCancelled || isSuperseded || isExpired;
 
   @override
   List<Object?> get props => <Object?>[

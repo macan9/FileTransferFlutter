@@ -66,6 +66,11 @@ abstract class NetworkingService {
     required String deviceId,
     String? reason,
   });
+  Future<PairingSession> closePairingSession({
+    required String sessionId,
+    required String deviceId,
+    String? reason,
+  });
   Future<PrivateNetworkCreationResult> createPrivateNetwork({
     required String ownerDeviceId,
     required String name,
@@ -357,6 +362,24 @@ class HttpNetworkingService implements NetworkingService {
   }) async {
     final http.Response response = await _client.post(
       _buildUri('/networking/sessions/$sessionId/cancel'),
+      headers: _jsonHeaders,
+      body: jsonEncode(<String, dynamic>{
+        'deviceId': deviceId,
+        if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
+      }),
+    );
+    final dynamic decoded = _decodeResponse(response);
+    return _extractPairingSession(decoded);
+  }
+
+  @override
+  Future<PairingSession> closePairingSession({
+    required String sessionId,
+    required String deviceId,
+    String? reason,
+  }) async {
+    final http.Response response = await _client.post(
+      _buildUri('/networking/sessions/$sessionId/close'),
       headers: _jsonHeaders,
       body: jsonEncode(<String, dynamic>{
         'deviceId': deviceId,
