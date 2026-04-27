@@ -358,7 +358,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     return Column(
       children: <Widget>[
         Container(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
           decoration: BoxDecoration(
             color: Theme.of(context).scaffoldBackgroundColor,
             boxShadow: const <BoxShadow>[
@@ -369,14 +369,21 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
               ),
             ],
           ),
-          child: _PrimaryTabSelector(
-            selectedIndex: _selectedPrimaryTab,
-            labels: const <String>['默认网络', '私有组网'],
-            onSelected: (int index) {
-              setState(() {
-                _selectedPrimaryTab = index;
-              });
-            },
+          child: Align(
+            alignment: Alignment.center,
+            child: FractionallySizedBox(
+              widthFactor: 5 / 6,
+              child: _PrimaryTabSelector(
+                selectedIndex: _selectedPrimaryTab,
+                labels: const <String>['默认网络', '私有组网'],
+                dense: true,
+                onSelected: (int index) {
+                  setState(() {
+                    _selectedPrimaryTab = index;
+                  });
+                },
+              ),
+            ),
           ),
         ),
         Expanded(
@@ -1315,8 +1322,11 @@ class _OneClickNetworkingTab extends StatelessWidget {
         _isLocalNetworkMounted(localState, hasServiceAssignedIp);
     final bool isClosing =
         isTransitionLocked || (isMembershipRevoked && localState != null);
-    final bool isGrouped =
-        !isMembershipRevoked && hasLocalMapping && hasSessionJoinIntent;
+    final bool isGrouped = !isMembershipRevoked &&
+        hasLocalMapping &&
+        (hasSessionJoinIntent ||
+            isMembershipAccepted ||
+            currentMembershipStatus?.trim().isNotEmpty == true);
     final bool shouldHoldJoinOrchestration = hasSessionJoinIntent &&
         defaultJoinTransitionStartedAt != null &&
         DateTime.now()
@@ -1552,6 +1562,8 @@ class _PrivateNetworkingTab extends StatelessWidget {
         isHostMode ? displayNetwork : (joinNetworkByCode ?? onlineJoinNetwork);
     final String? inviteCode =
         isHostMode ? (hostCodeReady ? generatedCode : null) : null;
+    final String? copyableInviteCode =
+        hostCreationReady && inviteCode != null ? inviteCode : null;
     final List<String> addresses =
         localState?.assignedAddresses ?? const <String>[];
     final bool isClosing =
@@ -1610,115 +1622,76 @@ class _PrivateNetworkingTab extends StatelessWidget {
     }
 
     return SectionCard(
-      title: '私有网络编排',
-      titleAction: _StatusChip(
-        label: hasOnlinePrivateNetwork ? '网络已连接' : '网络未连接',
-        color: hasOnlinePrivateNetwork
-            ? const Color(0xFF2563EB)
-            : const Color(0xFF64748B),
+      title: '',
+      header: LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          final double modeTabsWidth =
+              constraints.maxWidth < 300 ? constraints.maxWidth : 280;
+          final Widget modeTabs = _PrimaryTabSelector(
+            selectedIndex: selectedMode,
+            labels: const <String>['主持网络', '加入网络'],
+            compact: true,
+            isLocked: isModeSwitchLocked,
+            onSelected: onModeChanged,
+          );
+          final Widget statusChip = _StatusChip(
+            label: hasOnlinePrivateNetwork ? '网络已连接' : '网络未连接',
+            color: hasOnlinePrivateNetwork
+                ? const Color(0xFF2563EB)
+                : const Color(0xFF64748B),
+          );
+
+          if (constraints.maxWidth < 420) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                SizedBox(
+                  width: modeTabsWidth,
+                  child: modeTabs,
+                ),
+                const SizedBox(height: 10),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: statusChip,
+                ),
+              ],
+            );
+          }
+
+          return Row(
+            children: <Widget>[
+              SizedBox(
+                width: modeTabsWidth,
+                child: modeTabs,
+              ),
+              const SizedBox(width: 12),
+              const Spacer(),
+              statusChip,
+            ],
+          );
+        },
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Center(
-            child: _PrimaryTabSelector(
-              selectedIndex: selectedMode,
-              labels: const <String>['主持网络', '加入网络'],
-              compact: true,
-              useExpanded: false,
-              isLocked: isModeSwitchLocked,
-              onSelected: onModeChanged,
+          Align(
+            alignment: Alignment.center,
+            child: FractionallySizedBox(
+              widthFactor: 2 / 3,
+              child: isHostMode
+                  ? _InviteCodeDisplayBox(
+                      code: copyableInviteCode,
+                      onCopy: copyableInviteCode != null
+                          ? () => onCopyValue(copyableInviteCode, '已复制验证码')
+                          : null,
+                    )
+                  : _InviteCodeInputBox(
+                      controller: codeController,
+                      enabled:
+                          !isBusy && !isDisabled && !isPrivateOrchestrating,
+                    ),
             ),
           ),
-          const SizedBox(height: 16),
-          if (!isHostMode)
-            ValueListenableBuilder<TextEditingValue>(
-              valueListenable: codeController,
-              builder: (
-                BuildContext context,
-                TextEditingValue value,
-                Widget? child,
-              ) {
-                return Container(
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF8FAFC),
-                    borderRadius: BorderRadius.circular(18),
-                    border: Border.all(
-                      color: const Color(0xFFCBD5E1),
-                    ),
-                    boxShadow: const <BoxShadow>[
-                      BoxShadow(
-                        color: Color(0x0F0F172A),
-                        blurRadius: 10,
-                        offset: Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: TextField(
-                    controller: codeController,
-                    enabled: !isBusy && !isDisabled && !isPrivateOrchestrating,
-                    textInputAction: TextInputAction.done,
-                    maxLength: 8,
-                    maxLengthEnforcement: MaxLengthEnforcement.enforced,
-                    inputFormatters: <TextInputFormatter>[
-                      FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z0-9]')),
-                      TextInputFormatter.withFunction(
-                        (TextEditingValue oldValue, TextEditingValue newValue) {
-                          return newValue.copyWith(
-                            text: newValue.text.toUpperCase(),
-                            selection: newValue.selection,
-                          );
-                        },
-                      ),
-                    ],
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                          letterSpacing: 3.2,
-                          fontWeight: FontWeight.w800,
-                        ),
-                    decoration: InputDecoration(
-                      counterText: '',
-                      hintText: '请输入 8 位验证码',
-                      hintStyle:
-                          Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                color: const Color(0xFF94A3B8),
-                              ),
-                      prefixIcon: Container(
-                        margin: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFE0F2FE),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: const Icon(
-                          Icons.shield_outlined,
-                          color: Color(0xFF0F766E),
-                        ),
-                      ),
-                      suffixIcon: Padding(
-                        padding: const EdgeInsets.only(right: 14),
-                        child: Center(
-                          widthFactor: 1,
-                          child: Text(
-                            '${value.text.trim().length}/8',
-                            style: Theme.of(context)
-                                .textTheme
-                                .labelMedium
-                                ?.copyWith(
-                                  color: const Color(0xFF64748B),
-                                  fontWeight: FontWeight.w700,
-                                ),
-                          ),
-                        ),
-                      ),
-                      border: InputBorder.none,
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 18,
-                      ),
-                    ),
-                  ),
-                );
-              },
-            ),
           const SizedBox(height: 18),
           Center(
             child: _NetworkingActionOrb(
@@ -1737,20 +1710,6 @@ class _PrivateNetworkingTab extends StatelessWidget {
                       : (isHostMode ? onHostPressed : onJoinPressed),
             ),
           ),
-          if (isHostMode &&
-              hostCodeReady &&
-              inviteCode != null &&
-              inviteCode.trim().isNotEmpty) ...<Widget>[
-            const SizedBox(height: 16),
-            _InlineCodePanel(
-              title: '当前网络验证码',
-              code: inviteCode,
-              message: hostCreationReady
-                  ? '当前私有网络已在线，可将该验证码分享给其他设备。'
-                  : '当前私有网络已创建成功，正在等待本地虚拟 IP 就绪。',
-              onCopy: () => onCopyValue(inviteCode, '已复制验证码'),
-            ),
-          ],
           if (isHostMode &&
               hostCodeReady &&
               !hostCreationReady &&
@@ -2113,85 +2072,129 @@ class _PrimaryTabSelector extends StatelessWidget {
     required this.labels,
     required this.onSelected,
     this.compact = false,
+    this.dense = false,
     this.isLocked = false,
-    this.useExpanded = true,
   });
 
   final int selectedIndex;
   final List<String> labels;
   final ValueChanged<int> onSelected;
   final bool compact;
+  final bool dense;
   final bool isLocked;
-  final bool useExpanded;
 
   @override
   Widget build(BuildContext context) {
     final bool isCompact = compact;
+    final bool isDense = dense && !isCompact;
     final Color selectedBackground =
         isCompact ? const Color(0xFFE0F2FE) : const Color(0xFFFFE9D6);
     final Color selectedForeground =
         isCompact ? const Color(0xFF0F766E) : const Color(0xFFB45309);
     return Container(
-      padding: EdgeInsets.all(isCompact ? 4 : 5),
+      padding: EdgeInsets.all(isCompact ? 4 : (isDense ? 4 : 5)),
       decoration: BoxDecoration(
         color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(isCompact ? 16 : 18),
+        borderRadius:
+            BorderRadius.circular(isCompact ? 16 : (isDense ? 16 : 18)),
         border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
       ),
-      child: Row(
-        mainAxisSize: useExpanded ? MainAxisSize.max : MainAxisSize.min,
-        children: List<Widget>.generate(labels.length, (int index) {
-          final bool selected = index == selectedIndex;
-          final Widget item = AnimatedContainer(
-            duration: const Duration(milliseconds: 220),
-            curve: Curves.easeOutCubic,
-            padding: EdgeInsets.symmetric(
-              horizontal: isCompact ? 14 : 18,
-              vertical: isCompact ? 9 : 11,
-            ),
-            decoration: BoxDecoration(
-              color: selected ? selectedBackground : Colors.transparent,
-              borderRadius: BorderRadius.circular(isCompact ? 12 : 14),
-            ),
-            child: Center(
-              child: Opacity(
-                opacity: isLocked && !selected ? 0.45 : 1,
-                child: AnimatedDefaultTextStyle(
-                  duration: const Duration(milliseconds: 220),
-                  curve: Curves.easeOutCubic,
-                  style: (isCompact
-                              ? Theme.of(context).textTheme.titleSmall
-                              : Theme.of(context).textTheme.titleMedium)
-                          ?.copyWith(
-                        fontWeight: FontWeight.w800,
-                        color: selected
-                            ? selectedForeground
-                            : const Color(0xFF6B7280),
-                      ) ??
-                      const TextStyle(),
-                  child: Text(
-                    labels[index],
-                    textAlign: TextAlign.center,
+      child: LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          final bool usesSlidingIndicator =
+              labels.isNotEmpty && constraints.hasBoundedWidth;
+          final int safeSelectedIndex = labels.isEmpty
+              ? 0
+              : selectedIndex.clamp(0, labels.length - 1).toInt();
+          final Widget tabs = Row(
+            mainAxisSize: MainAxisSize.max,
+            children: List<Widget>.generate(labels.length, (int index) {
+              final bool selected = index == safeSelectedIndex;
+              final Widget item = AnimatedContainer(
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeOutCubic,
+                padding: EdgeInsets.symmetric(
+                  horizontal: isCompact ? 14 : (isDense ? 16 : 18),
+                  vertical: isCompact ? 9 : (isDense ? 8 : 11),
+                ),
+                decoration: BoxDecoration(
+                  color: selected && !usesSlidingIndicator
+                      ? selectedBackground
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(
+                      isCompact ? 12 : (isDense ? 12 : 14)),
+                ),
+                child: Center(
+                  child: Opacity(
+                    opacity: isLocked && !selected ? 0.45 : 1,
+                    child: AnimatedDefaultTextStyle(
+                      duration: const Duration(milliseconds: 220),
+                      curve: Curves.easeOutCubic,
+                      style: (isCompact
+                                  ? Theme.of(context).textTheme.titleSmall
+                                  : isDense
+                                      ? Theme.of(context).textTheme.titleSmall
+                                      : Theme.of(context).textTheme.titleMedium)
+                              ?.copyWith(
+                            fontWeight: FontWeight.w800,
+                            color: selected
+                                ? selectedForeground
+                                : const Color(0xFF6B7280),
+                          ) ??
+                          const TextStyle(),
+                      child: Text(
+                        labels[index],
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                ),
+              );
+              final Widget tappable = InkWell(
+                borderRadius:
+                    BorderRadius.circular(isCompact ? 12 : (isDense ? 12 : 14)),
+                onTap: isLocked ? null : () => onSelected(index),
+                child: item,
+              );
+              return Expanded(
+                child: tappable,
+              );
+            }),
+          );
+
+          if (!usesSlidingIndicator) {
+            return tabs;
+          }
+
+          final double indicatorWidth = constraints.maxWidth / labels.length;
+          return Stack(
+            children: <Widget>[
+              AnimatedPositioned(
+                duration: const Duration(milliseconds: 260),
+                curve: Curves.easeOutCubic,
+                left: indicatorWidth * safeSelectedIndex,
+                top: 0,
+                bottom: 0,
+                width: indicatorWidth,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: selectedBackground,
+                    borderRadius: BorderRadius.circular(
+                        isCompact ? 12 : (isDense ? 12 : 14)),
+                    boxShadow: const <BoxShadow>[
+                      BoxShadow(
+                        color: Color(0x120F172A),
+                        blurRadius: 10,
+                        offset: Offset(0, 3),
+                      ),
+                    ],
                   ),
                 ),
               ),
-            ),
+              tabs,
+            ],
           );
-          final Widget tappable = InkWell(
-            borderRadius: BorderRadius.circular(isCompact ? 12 : 14),
-            onTap: isLocked ? null : () => onSelected(index),
-            child: item,
-          );
-          return useExpanded
-              ? Expanded(
-                  child: tappable,
-                )
-              : Padding(
-                  padding: EdgeInsets.only(
-                      right: index == labels.length - 1 ? 0 : 8),
-                  child: tappable,
-                );
-        }),
+        },
       ),
     );
   }
@@ -2228,18 +2231,33 @@ class _TopStatusPills extends StatelessWidget {
 
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
-        if (constraints.maxWidth >= 720) {
-          return Row(
-            children: pills
-                .map((Widget pill) => Expanded(child: pill))
-                .toList(growable: false)
-                .expand(
-                  (Widget pill) => <Widget>[
-                    pill,
-                    if (pill != pills.last) const SizedBox(width: 8),
-                  ],
-                )
-                .toList(growable: false),
+        if (constraints.maxWidth >= 520) {
+          return Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: constraints.maxWidth >= 760 ? 28 : 16,
+            ),
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  child: Align(
+                    alignment: const Alignment(-0.72, 0),
+                    child: pills[0],
+                  ),
+                ),
+                Expanded(
+                  child: Align(
+                    alignment: Alignment.center,
+                    child: pills[1],
+                  ),
+                ),
+                Expanded(
+                  child: Align(
+                    alignment: const Alignment(0.72, 0),
+                    child: pills[2],
+                  ),
+                ),
+              ],
+            ),
           );
         }
         return Wrap(
@@ -2284,56 +2302,176 @@ class _SummaryPill extends StatelessWidget {
   }
 }
 
-class _InlineCodePanel extends StatelessWidget {
-  const _InlineCodePanel(
-      {required this.title,
-      required this.code,
-      required this.message,
-      required this.onCopy});
-  final String title;
-  final String code;
-  final String message;
-  final VoidCallback onCopy;
+class _InviteCodeInputBox extends StatelessWidget {
+  const _InviteCodeInputBox({
+    required this.controller,
+    required this.enabled,
+  });
+
+  final TextEditingController controller;
+  final bool enabled;
+
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-          color: const Color(0xFFFFF7ED),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: const Color(0xFFF59E0B))),
-      child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Text(title,
-                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w800,
-                    color: const Color(0xFF9A3412))),
-            const SizedBox(height: 6),
-            Text(message),
-            const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-              decoration: BoxDecoration(
-                  color: Colors.white, borderRadius: BorderRadius.circular(16)),
-              child: Row(children: <Widget>[
-                Expanded(
-                    child: Text(code,
-                        style: Theme.of(context)
-                            .textTheme
-                            .headlineSmall
-                            ?.copyWith(
-                                letterSpacing: 4,
-                                fontWeight: FontWeight.w800,
-                                color: const Color(0xFF9A3412)))),
-                IconButton(
-                    onPressed: onCopy,
-                    icon: const Icon(Icons.copy_rounded),
-                    tooltip: '复制验证码'),
-              ]),
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: controller,
+      builder: (
+        BuildContext context,
+        TextEditingValue value,
+        Widget? child,
+      ) {
+        return _InviteCodeShell(
+          child: TextField(
+            controller: controller,
+            enabled: enabled,
+            textInputAction: TextInputAction.done,
+            maxLength: 8,
+            maxLengthEnforcement: MaxLengthEnforcement.enforced,
+            inputFormatters: <TextInputFormatter>[
+              FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z0-9]')),
+              TextInputFormatter.withFunction(
+                (TextEditingValue oldValue, TextEditingValue newValue) {
+                  return newValue.copyWith(
+                    text: newValue.text.toUpperCase(),
+                    selection: newValue.selection,
+                  );
+                },
+              ),
+            ],
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  letterSpacing: 2.4,
+                  fontWeight: FontWeight.w800,
+                ),
+            decoration: InputDecoration(
+              counterText: '',
+              hintText: '请输入 8 位验证码',
+              hintStyle: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    color: const Color(0xFF94A3B8),
+                  ),
+              prefixIcon: const Icon(
+                Icons.shield_outlined,
+                color: Color(0xFF0F766E),
+                size: 20,
+              ),
+              prefixIconConstraints: const BoxConstraints.tightFor(
+                width: 46,
+                height: 54,
+              ),
+              suffixIcon: Center(
+                widthFactor: 1,
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 12),
+                  child: Text(
+                    '${value.text.trim().length}/8',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: const Color(0xFF64748B),
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                ),
+              ),
+              suffixIconConstraints: const BoxConstraints.tightFor(
+                width: 46,
+                height: 54,
+              ),
+              isDense: true,
+              border: InputBorder.none,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 8,
+                vertical: 18,
+              ),
             ),
-          ]),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _InviteCodeDisplayBox extends StatelessWidget {
+  const _InviteCodeDisplayBox({
+    required this.code,
+    required this.onCopy,
+  });
+
+  final String? code;
+  final VoidCallback? onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    final String displayCode =
+        code?.trim().isNotEmpty == true ? code!.trim() : '--------';
+    final bool canCopy = onCopy != null;
+    return _InviteCodeShell(
+      child: Row(
+        children: <Widget>[
+          const SizedBox(width: 14),
+          const Icon(
+            Icons.key_rounded,
+            color: Color(0xFF0F766E),
+            size: 20,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              displayCode,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    color: canCopy
+                        ? const Color(0xFF0F766E)
+                        : const Color(0xFF94A3B8),
+                    letterSpacing: 2.8,
+                    fontWeight: FontWeight.w800,
+                  ),
+            ),
+          ),
+          IconButton(
+            tooltip: '复制验证码',
+            onPressed: onCopy,
+            icon: const Icon(Icons.copy_rounded),
+            color: const Color(0xFF0F766E),
+            disabledColor: const Color(0xFFCBD5E1),
+            visualDensity: VisualDensity.compact,
+            constraints: const BoxConstraints.tightFor(
+              width: 42,
+              height: 42,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InviteCodeShell extends StatelessWidget {
+  const _InviteCodeShell({
+    required this.child,
+  });
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 54,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: const Color(0xFFF8FAFC),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFFCBD5E1)),
+          boxShadow: const <BoxShadow>[
+            BoxShadow(
+              color: Color(0x0F0F172A),
+              blurRadius: 10,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(16),
+          child: child,
+        ),
+      ),
     );
   }
 }
@@ -2516,22 +2654,30 @@ class _VirtualIpPanel extends StatelessWidget {
     final List<String> ipv6Addresses = addresses
         .where((String address) => address.trim().contains(':'))
         .toList(growable: false);
+    final bool hasVirtualIp =
+        ipv4Addresses.isNotEmpty || ipv6Addresses.isNotEmpty;
+    final Color panelBackground =
+        hasVirtualIp ? const Color(0xFFEAF8EF) : const Color(0xFFF8FAFC);
+    final Color panelBorder =
+        hasVirtualIp ? const Color(0xFF86EFAC) : const Color(0xFFCBD5E1);
+    final Color panelForeground =
+        hasVirtualIp ? const Color(0xFF166534) : const Color(0xFF475569);
 
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFFEAF8EF),
+        color: panelBackground,
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFF86EFAC)),
+        border: Border.all(color: panelBorder),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           Text(
-            '已分配虚拟 IP',
+            hasVirtualIp ? '已分配虚拟 IP' : '虚拟 IP 未就绪',
             style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                  color: const Color(0xFF166534),
+                  color: panelForeground,
                   fontWeight: FontWeight.w800,
                 ),
           ),
@@ -2547,7 +2693,7 @@ class _VirtualIpPanel extends StatelessWidget {
               child: Text(
                 '当前暂无虚拟 IP',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: const Color(0xFF166534),
+                      color: panelForeground,
                       fontWeight: FontWeight.w600,
                     ),
               ),
@@ -2598,9 +2744,9 @@ class _VirtualIpGroup extends StatelessWidget {
         const SizedBox(height: 8),
         ...addresses.map(
           (String address) => Padding(
-            padding: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.only(bottom: 7),
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               decoration: BoxDecoration(
                 color: Colors.white,
                 borderRadius: BorderRadius.circular(14),
@@ -2621,6 +2767,12 @@ class _VirtualIpGroup extends StatelessWidget {
                     onPressed: () => onCopy(address),
                     icon: const Icon(Icons.copy_rounded),
                     color: const Color(0xFF166534),
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints.tightFor(
+                      width: 36,
+                      height: 36,
+                    ),
+                    padding: EdgeInsets.zero,
                   ),
                 ],
               ),
@@ -2759,6 +2911,7 @@ class _NetworkingActionOrb extends StatefulWidget {
 class _NetworkingActionOrbState extends State<_NetworkingActionOrb>
     with SingleTickerProviderStateMixin {
   late final AnimationController _rotationController;
+  bool _isHovered = false;
 
   @override
   void initState() {
@@ -2797,6 +2950,7 @@ class _NetworkingActionOrbState extends State<_NetworkingActionOrb>
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
     final bool enabled = widget.onTap != null;
+    final bool isHovered = enabled && _isHovered;
     final ({List<Color> colors, Color shadow}) palette = switch (widget.tone) {
       _NetworkingOrbTone.idle => (
           colors: const <Color>[Color(0xFFFFC36B), Color(0xFFF97316)],
@@ -2817,73 +2971,106 @@ class _NetworkingActionOrbState extends State<_NetworkingActionOrb>
     };
 
     return Center(
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: Opacity(
-          opacity: enabled ? 1 : 0.82,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 180),
-            width: widget.diameter,
-            height: widget.diameter,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: LinearGradient(
-                colors: palette.colors,
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              boxShadow: <BoxShadow>[
-                BoxShadow(
-                  color: palette.shadow,
-                  blurRadius: 28,
-                  offset: const Offset(0, 16),
+      child: MouseRegion(
+        cursor: enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+        onEnter: (_) {
+          if (!enabled) {
+            return;
+          }
+          setState(() {
+            _isHovered = true;
+          });
+        },
+        onExit: (_) {
+          if (!_isHovered) {
+            return;
+          }
+          setState(() {
+            _isHovered = false;
+          });
+        },
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: Opacity(
+            opacity: enabled ? 1 : 0.82,
+            child: AnimatedScale(
+              duration: const Duration(milliseconds: 160),
+              curve: Curves.easeOutCubic,
+              scale: isHovered ? 1.025 : 1,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOutCubic,
+                width: widget.diameter,
+                height: widget.diameter,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: LinearGradient(
+                    colors: palette.colors,
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  boxShadow: <BoxShadow>[
+                    BoxShadow(
+                      color: palette.shadow,
+                      blurRadius: isHovered ? 34 : 28,
+                      offset: Offset(0, isHovered ? 18 : 16),
+                    ),
+                    if (isHovered)
+                      BoxShadow(
+                        color: Colors.white.withValues(alpha: 0.35),
+                        blurRadius: 18,
+                        spreadRadius: -4,
+                      ),
+                    const BoxShadow(
+                      color: Color(0x80FFFFFF),
+                      blurRadius: 18,
+                      offset: Offset(-8, -8),
+                      spreadRadius: -10,
+                    ),
+                  ],
                 ),
-                const BoxShadow(
-                  color: Color(0x80FFFFFF),
-                  blurRadius: 18,
-                  offset: Offset(-8, -8),
-                  spreadRadius: -10,
-                ),
-              ],
-            ),
-            child: Container(
-              margin: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(
-                  color: Colors.white.withValues(alpha: 0.30),
-                  width: 1.6,
-                ),
-              ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: <Widget>[
-                  RotationTransition(
-                    turns: _rotationController,
-                    child: Icon(
-                      widget.icon,
-                      size: widget.diameter * 0.18,
-                      color: Colors.white,
+                child: Container(
+                  margin: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: Colors.white.withValues(
+                        alpha: isHovered ? 0.46 : 0.30,
+                      ),
+                      width: isHovered ? 2 : 1.6,
                     ),
                   ),
-                  SizedBox(height: widget.diameter * 0.06),
-                  Text(
-                    widget.label,
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w800,
-                    ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: <Widget>[
+                      RotationTransition(
+                        turns: _rotationController,
+                        child: Icon(
+                          widget.icon,
+                          size: widget.diameter * 0.18,
+                          color: Colors.white,
+                        ),
+                      ),
+                      SizedBox(height: widget.diameter * 0.06),
+                      Text(
+                        widget.label,
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      SizedBox(height: widget.diameter * 0.05),
+                      Text(
+                        widget.subtitle,
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: Colors.white.withValues(alpha: 0.92),
+                          height: 1.45,
+                        ),
+                      ),
+                    ],
                   ),
-                  SizedBox(height: widget.diameter * 0.05),
-                  Text(
-                    widget.subtitle,
-                    textAlign: TextAlign.center,
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: Colors.white.withValues(alpha: 0.92),
-                      height: 1.45,
-                    ),
-                  ),
-                ],
+                ),
               ),
             ),
           ),

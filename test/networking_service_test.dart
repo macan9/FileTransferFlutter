@@ -8,6 +8,67 @@ import 'package:http/testing.dart';
 
 void main() {
   group('HttpNetworkingService', () {
+    test('probeServerReachability only treats successful responses as ready',
+        () async {
+      final HttpNetworkingService service = HttpNetworkingService(
+        baseUri: Uri.parse('http://localhost:3000'),
+        client: MockClient((http.Request request) async {
+          expect(request.method, 'GET');
+          return http.Response('server error', 500);
+        }),
+      );
+
+      expect(await service.probeServerReachability(), isFalse);
+    });
+
+    test('fetchAgentCommands closes stale connections and retries once',
+        () async {
+      int requestCount = 0;
+      final HttpNetworkingService service = HttpNetworkingService(
+        baseUri: Uri.parse('http://localhost:3000'),
+        client: MockClient((http.Request request) async {
+          requestCount += 1;
+          expect(request.method, 'GET');
+          expect(request.url.path,
+              '/networking/agent/devices/cm-device-a/commands');
+          expect(request.url.queryParameters['limit'], '20');
+          expect(request.headers['x-device-token'], 'token-a');
+          expect(request.headers['Connection'], 'close');
+          if (requestCount == 1) {
+            throw http.ClientException(
+              'Connection closed before full header was received',
+              request.url,
+            );
+          }
+          return http.Response(
+            jsonEncode(<Map<String, dynamic>>[
+              <String, dynamic>{
+                'id': 'cmd-3',
+                'deviceId': 'cm-device-a',
+                'type': 'join_zerotier_network',
+                'status': 'pending',
+                'payload': <String, dynamic>{
+                  'networkId': '8056c2e21c000001',
+                },
+              },
+            ]),
+            200,
+            headers: <String, String>{'content-type': 'application/json'},
+          );
+        }),
+      );
+
+      final List<NetworkAgentCommand> commands =
+          await service.fetchAgentCommands(
+        deviceId: 'cm-device-a',
+        agentToken: 'token-a',
+      );
+
+      expect(requestCount, 2);
+      expect(commands, hasLength(1));
+      expect(commands.single.id, 'cmd-3');
+    });
+
     test(
         'fetchPairingSessions parses temporary sessions and cancelled commands',
         () async {

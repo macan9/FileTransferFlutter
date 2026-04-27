@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:file_transfer_flutter/core/models/managed_network.dart';
@@ -93,6 +94,7 @@ class HttpNetworkingService implements NetworkingService {
 
   final Uri _baseUri;
   final http.Client _client;
+  static const Duration _agentCommandPollTimeout = Duration(seconds: 8);
 
   @override
   Future<bool> probeServerReachability() async {
@@ -104,7 +106,7 @@ class HttpNetworkingService implements NetworkingService {
             ),
           )
           .timeout(const Duration(seconds: 3));
-      return response.statusCode > 0;
+      return response.statusCode >= 200 && response.statusCode < 400;
     } catch (_) {
       return false;
     }
@@ -156,16 +158,37 @@ class HttpNetworkingService implements NetworkingService {
     required String agentToken,
     int limit = 20,
   }) async {
-    final http.Response response = await _client.get(
-      _buildUri(
-        '/networking/agent/devices/$deviceId/commands',
-        queryParameters: <String, String>{'limit': '$limit'},
-      ),
-      headers: _tokenHeaders(agentToken),
+    final Uri uri = _buildUri(
+      '/networking/agent/devices/$deviceId/commands',
+      queryParameters: <String, String>{'limit': '$limit'},
+    );
+    final Map<String, String> headers = <String, String>{
+      ..._tokenHeaders(agentToken),
+      'Connection': 'close',
+    };
+
+    final http.Response response = await _getWithSingleTransportRetry(
+      uri,
+      headers: headers,
+      timeout: _agentCommandPollTimeout,
     );
     final dynamic decoded = _decodeResponse(response);
     final List<Map<String, dynamic>> items = _extractMapList(decoded);
     return items.map(NetworkAgentCommand.fromJson).toList();
+  }
+
+  Future<http.Response> _getWithSingleTransportRetry(
+    Uri uri, {
+    required Map<String, String> headers,
+    required Duration timeout,
+  }) async {
+    try {
+      return await _client.get(uri, headers: headers).timeout(timeout);
+    } on http.ClientException {
+      return _client.get(uri, headers: headers).timeout(timeout);
+    } on TimeoutException {
+      return _client.get(uri, headers: headers).timeout(timeout);
+    }
   }
 
   @override
