@@ -1,8 +1,12 @@
+import 'dart:async';
 import 'dart:io';
 
+import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/constants/app_constants.dart';
 import 'package:file_transfer_flutter/core/services/desktop_tray_service.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_agent_provider.dart';
+import 'package:file_transfer_flutter/shared/providers/p2p_presence_providers.dart';
+import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -47,11 +51,29 @@ class _AppShellState extends ConsumerState<AppShell> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(networkingAgentRuntimeProvider.notifier).activate();
+      if (ref.read(appConfigProvider).autoOnline) {
+        _applyAutoOnline(enabled: true);
+      }
     });
   }
 
   @override
   Widget build(BuildContext context) {
+    ref.listen<AppConfig>(appConfigProvider, (
+      AppConfig? previous,
+      AppConfig next,
+    ) {
+      if (previous?.autoOnline == next.autoOnline) {
+        return;
+      }
+
+      if (next.autoOnline) {
+        _applyAutoOnline(enabled: true);
+      } else {
+        _applyAutoOnline(enabled: false);
+      }
+    });
+
     final bool isDesktop =
         Platform.isWindows || Platform.isLinux || Platform.isMacOS;
     final Widget content = Column(
@@ -78,6 +100,16 @@ class _AppShellState extends ConsumerState<AppShell> {
         },
       ),
     );
+  }
+
+  void _applyAutoOnline({required bool enabled}) {
+    final P2pPresenceController notifier =
+        ref.read(p2pPresenceProvider.notifier);
+    final Future<void> action =
+        enabled ? notifier.goOnline() : notifier.goOffline();
+    unawaited(action.catchError((Object error, StackTrace stackTrace) {
+      // Presence errors are reflected in the presence state when possible.
+    }));
   }
 }
 
@@ -194,11 +226,11 @@ class _AppShellBranchContainerState extends State<AppShellBranchContainer>
   }
 }
 
-class _DesktopTitleBar extends StatelessWidget {
+class _DesktopTitleBar extends ConsumerWidget {
   const _DesktopTitleBar();
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
 
     return Material(
@@ -309,7 +341,14 @@ class _DesktopTitleBar extends StatelessWidget {
               isClose: true,
               onPressed: () async {
                 if (Platform.isWindows) {
-                  await DesktopTrayService.hideToTray();
+                  final bool minimizeToTray = ref
+                      .read(appConfigProvider)
+                      .minimizeToTrayOnClose;
+                  if (minimizeToTray) {
+                    await DesktopTrayService.hideToTray();
+                  } else {
+                    await DesktopTrayService.quitApp();
+                  }
                   return;
                 }
                 await windowManager.close();

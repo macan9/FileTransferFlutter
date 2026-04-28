@@ -48,7 +48,8 @@ void main() {
         zeroTierNodeId: '',
         agentToken: '',
         downloadDirectory: 'C:/Temp',
-        autoOnline: true,
+        autoOnline: false,
+        minimizeToTrayOnClose: true,
       ),
     );
     final _FakeNetworkingService networkingService =

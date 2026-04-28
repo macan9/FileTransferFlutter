@@ -30,6 +30,8 @@ dependencies:
   window_manager: ^0.5.1
   tray_manager:
     path: third_party/tray_manager
+  launch_at_startup: ^0.5.1
+  package_info_plus: ^9.0.1
 
 dev_dependencies:
   flutter_test:

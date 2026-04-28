@@ -36,7 +36,8 @@ const AppConfig _testConfig = AppConfig(
   zeroTierNodeId: '',
   agentToken: '',
   downloadDirectory: 'C:/Downloads',
-  autoOnline: true,
+  autoOnline: false,
+  minimizeToTrayOnClose: true,
 );
 
 class _FakeFileRepository implements FileRepository {

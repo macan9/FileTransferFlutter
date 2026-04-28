@@ -20,6 +20,7 @@ class DesktopTrayService with TrayListener {
   static const String _exitIconPath = 'assets/tray_menu/exit.bmp';
 
   static DesktopTrayService? _instance;
+  static bool _isQuitting = false;
 
   static Future<DesktopTrayService?> initialize() async {
     if (!Platform.isWindows) {
@@ -104,6 +105,7 @@ class DesktopTrayService with TrayListener {
   }
 
   static Future<void> showMainWindow() async {
+    await windowManager.setSkipTaskbar(false);
     await WindowsWindowControl.restore();
     await windowManager.focus();
     await Future<void>.delayed(const Duration(milliseconds: 80));
@@ -112,11 +114,29 @@ class DesktopTrayService with TrayListener {
   }
 
   static Future<void> hideToTray() async {
-    await WindowsWindowControl.minimize();
+    await windowManager.setSkipTaskbar(true);
+    await windowManager.hide();
+  }
+
+  static Future<void> quitApp() async {
+    if (_isQuitting) {
+      return;
+    }
+    _isQuitting = true;
+
+    await WindowsWindowControl.hide();
+    unawaited(_finishQuit());
   }
 
   Future<void> _quit() async {
-    await trayManager.destroy();
-    await windowManager.destroy();
+    await quitApp();
+  }
+
+  static Future<void> _finishQuit() async {
+    try {
+      await trayManager.destroy();
+    } finally {
+      await windowManager.destroy();
+    }
   }
 }

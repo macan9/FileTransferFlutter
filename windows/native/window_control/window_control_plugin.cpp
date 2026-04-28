@@ -41,6 +41,12 @@ void WindowControlPlugin::HandleMethodCall(
     return;
   }
 
+  if (call.method_name() == "hide") {
+    HideMainWindow();
+    result->Success(flutter::EncodableValue(true));
+    return;
+  }
+
   result->NotImplemented();
 }
 
@@ -83,4 +89,13 @@ void WindowControlPlugin::MinimizeMainWindow() {
   }
 
   ::ShowWindow(window, SW_MINIMIZE);
+}
+
+void WindowControlPlugin::HideMainWindow() {
+  HWND window = GetMainWindow();
+  if (window == nullptr) {
+    return;
+  }
+
+  ::ShowWindow(window, SW_HIDE);
 }

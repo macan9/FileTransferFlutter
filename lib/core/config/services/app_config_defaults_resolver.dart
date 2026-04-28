@@ -35,6 +35,7 @@ class AppConfigDefaultsResolver {
       agentToken: '',
       downloadDirectory: downloadDirectory,
       autoOnline: true,
+      minimizeToTrayOnClose: true,
     );
   }
 

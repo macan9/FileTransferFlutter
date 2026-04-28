@@ -2,6 +2,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/p2p_presence_state.dart';
+import 'package:file_transfer_flutter/core/services/launch_at_startup_service.dart';
 import 'package:file_transfer_flutter/shared/providers/p2p_presence_providers.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:file_transfer_flutter/shared/widgets/section_card.dart';
@@ -23,6 +24,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   late final TextEditingController _downloadDirectoryController;
 
   bool _autoOnline = true;
+  bool _minimizeToTrayOnClose = true;
+  bool _launchAtStartup = false;
+  bool _launchAtStartupLoading = false;
   bool _saving = false;
   bool _didInitialize = false;
 
@@ -32,6 +36,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     _serverUrlController = TextEditingController();
     _deviceNameController = TextEditingController();
     _downloadDirectoryController = TextEditingController();
+    _loadLaunchAtStartup();
   }
 
   @override
@@ -92,15 +97,37 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   const SizedBox(height: 16),
                   SwitchListTile.adaptive(
                     value: _autoOnline,
-                    onChanged: (bool value) {
-                      setState(() {
-                        _autoOnline = value;
-                      });
-                    },
+                    onChanged: _saving ? null : _setAutoOnline,
                     contentPadding: EdgeInsets.zero,
+                    secondary: const Icon(Icons.cloud_sync_outlined),
                     title: const Text('自动上线'),
                     subtitle: const Text('为后续自动接入信令层预留开关。'),
                   ),
+                  SwitchListTile.adaptive(
+                    value: _minimizeToTrayOnClose,
+                    onChanged: _saving ? null : _setMinimizeToTrayOnClose,
+                    contentPadding: EdgeInsets.zero,
+                    secondary: const Icon(Icons.system_update_alt_rounded),
+                    title: const Text('\u5173\u95ed\u65f6\u6700\u5c0f\u5316\u5230\u6258\u76d8'),
+                    subtitle: const Text(
+                      '\u5f00\u542f\u540e\u5173\u95ed\u7a97\u53e3\u53ea\u4fdd\u7559\u6258\u76d8\uff1b\u5173\u95ed\u540e\u76f4\u63a5\u9000\u51fa\u7a0b\u5e8f',
+                    ),
+                  ),
+                  if (LaunchAtStartupService.isSupported)
+                    SwitchListTile.adaptive(
+                      value: _launchAtStartup,
+                      onChanged: _launchAtStartupLoading
+                          ? null
+                          : _setLaunchAtStartup,
+                      contentPadding: EdgeInsets.zero,
+                      secondary: const Icon(Icons.rocket_launch_outlined),
+                      title: const Text('\u5f00\u673a\u81ea\u542f\u52a8'),
+                      subtitle: Text(
+                        _launchAtStartupLoading
+                            ? '\u6b63\u5728\u8bfb\u53d6\u5f00\u673a\u542f\u52a8\u72b6\u6001...'
+                            : '\u767b\u5f55\u7cfb\u7edf\u540e\u81ea\u52a8\u542f\u52a8\u5c0f\u9a6c\u5de5\u5177\u7bb1',
+                      ),
+                    ),
                   const SizedBox(height: 20),
                   Align(
                     alignment: Alignment.centerRight,
@@ -252,6 +279,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     _deviceNameController.text = config.deviceName;
     _downloadDirectoryController.text = config.downloadDirectory;
     _autoOnline = config.autoOnline;
+    _minimizeToTrayOnClose = config.minimizeToTrayOnClose;
   }
 
   Future<void> _pickDirectory() async {
@@ -266,6 +294,150 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     setState(() {
       _downloadDirectoryController.text = directory;
     });
+  }
+
+  Future<void> _loadLaunchAtStartup() async {
+    if (!LaunchAtStartupService.isSupported) {
+      return;
+    }
+
+    setState(() {
+      _launchAtStartupLoading = true;
+    });
+
+    try {
+      final bool enabled = await LaunchAtStartupService.isEnabled();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _launchAtStartup = enabled;
+      });
+    } catch (error) {
+      if (mounted) {
+        _showSnackBar(
+          '\u8bfb\u53d6\u5f00\u673a\u81ea\u542f\u52a8\u72b6\u6001\u5931\u8d25: $error',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _launchAtStartupLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _setLaunchAtStartup(bool value) async {
+    setState(() {
+      _launchAtStartup = value;
+      _launchAtStartupLoading = true;
+    });
+
+    try {
+      await LaunchAtStartupService.setEnabled(value);
+      if (!mounted) {
+        return;
+      }
+      _showSnackBar(
+        value
+            ? '\u5df2\u5f00\u542f\u5f00\u673a\u81ea\u542f\u52a8'
+            : '\u5df2\u5173\u95ed\u5f00\u673a\u81ea\u542f\u52a8',
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _launchAtStartup = !value;
+        });
+        _showSnackBar(
+          '\u66f4\u65b0\u5f00\u673a\u81ea\u542f\u52a8\u5931\u8d25: $error',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _launchAtStartupLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _setAutoOnline(bool value) async {
+    setState(() {
+      _autoOnline = value;
+      _saving = true;
+    });
+
+    try {
+      final AppConfig currentConfig = ref.read(appConfigProvider);
+      final AppConfig savedConfig =
+          await ref.read(appConfigProvider.notifier).save(
+                currentConfig.copyWith(autoOnline: value),
+              );
+      if (!mounted) {
+        return;
+      }
+      _applyConfig(savedConfig);
+      _showSnackBar(
+        value
+            ? '\u5df2\u5f00\u542f\u81ea\u52a8\u4e0a\u7ebf'
+            : '\u5df2\u5173\u95ed\u81ea\u52a8\u4e0a\u7ebf\uff0c\u5f53\u524d\u8bbe\u5907\u5c06\u4e0b\u7ebf',
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _autoOnline = !value;
+        });
+        _showSnackBar(
+          '\u66f4\u65b0\u81ea\u52a8\u4e0a\u7ebf\u5931\u8d25: $error',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _setMinimizeToTrayOnClose(bool value) async {
+    setState(() {
+      _minimizeToTrayOnClose = value;
+      _saving = true;
+    });
+
+    try {
+      final AppConfig currentConfig = ref.read(appConfigProvider);
+      final AppConfig savedConfig =
+          await ref.read(appConfigProvider.notifier).save(
+                currentConfig.copyWith(minimizeToTrayOnClose: value),
+              );
+      if (!mounted) {
+        return;
+      }
+      _applyConfig(savedConfig);
+      _showSnackBar(
+        value
+            ? '\u5df2\u5f00\u542f\u5173\u95ed\u65f6\u6700\u5c0f\u5316\u5230\u6258\u76d8'
+            : '\u5df2\u5173\u95ed\u6258\u76d8\u4fdd\u7559\uff0c\u5173\u95ed\u6309\u94ae\u5c06\u9000\u51fa\u7a0b\u5e8f',
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _minimizeToTrayOnClose = !value;
+        });
+        _showSnackBar(
+          '\u66f4\u65b0\u5173\u95ed\u884c\u4e3a\u5931\u8d25: $error',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+        });
+      }
+    }
   }
 
   Future<void> _copyDeviceId(String deviceId) async {
@@ -300,6 +472,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       deviceName: _deviceNameController.text,
       downloadDirectory: _downloadDirectoryController.text,
       autoOnline: _autoOnline,
+      minimizeToTrayOnClose: _minimizeToTrayOnClose,
     );
 
     try {

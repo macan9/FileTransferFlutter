@@ -20,4 +20,11 @@ abstract final class WindowsWindowControl {
     }
     await _channel.invokeMethod<void>('minimize');
   }
+
+  static Future<void> hide() async {
+    if (!Platform.isWindows) {
+      return;
+    }
+    await _channel.invokeMethod<void>('hide');
+  }
 }

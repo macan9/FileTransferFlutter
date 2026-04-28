@@ -77,6 +77,9 @@ class HiveAppConfigRepository implements AppConfigRepository {
       autoOnline: json.containsKey('autoOnline')
           ? persisted.autoOnline
           : defaults.autoOnline,
+      minimizeToTrayOnClose: json.containsKey('minimizeToTrayOnClose')
+          ? persisted.minimizeToTrayOnClose
+          : defaults.minimizeToTrayOnClose,
     );
   }
 

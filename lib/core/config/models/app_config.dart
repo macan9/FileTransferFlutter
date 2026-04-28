@@ -10,6 +10,7 @@ class AppConfig extends Equatable {
     required this.agentToken,
     required this.downloadDirectory,
     required this.autoOnline,
+    required this.minimizeToTrayOnClose,
   });
 
   factory AppConfig.fromJson(Map<String, dynamic> json) {
@@ -22,6 +23,7 @@ class AppConfig extends Equatable {
       agentToken: json['agentToken']?.toString() ?? '',
       downloadDirectory: json['downloadDirectory']?.toString() ?? '',
       autoOnline: json['autoOnline'] as bool? ?? true,
+      minimizeToTrayOnClose: json['minimizeToTrayOnClose'] as bool? ?? true,
     );
   }
 
@@ -33,6 +35,7 @@ class AppConfig extends Equatable {
   final String agentToken;
   final String downloadDirectory;
   final bool autoOnline;
+  final bool minimizeToTrayOnClose;
 
   Uri get serverUri => Uri.parse(serverUrl);
 
@@ -45,6 +48,7 @@ class AppConfig extends Equatable {
     String? agentToken,
     String? downloadDirectory,
     bool? autoOnline,
+    bool? minimizeToTrayOnClose,
   }) {
     return AppConfig(
       serverUrl: serverUrl ?? this.serverUrl,
@@ -55,6 +59,8 @@ class AppConfig extends Equatable {
       agentToken: agentToken ?? this.agentToken,
       downloadDirectory: downloadDirectory ?? this.downloadDirectory,
       autoOnline: autoOnline ?? this.autoOnline,
+      minimizeToTrayOnClose:
+          minimizeToTrayOnClose ?? this.minimizeToTrayOnClose,
     );
   }
 
@@ -68,6 +74,7 @@ class AppConfig extends Equatable {
       agentToken: agentToken.trim(),
       downloadDirectory: downloadDirectory.trim(),
       autoOnline: autoOnline,
+      minimizeToTrayOnClose: minimizeToTrayOnClose,
     );
   }
 
@@ -81,6 +88,7 @@ class AppConfig extends Equatable {
       'agentToken': agentToken,
       'downloadDirectory': downloadDirectory,
       'autoOnline': autoOnline,
+      'minimizeToTrayOnClose': minimizeToTrayOnClose,
     };
   }
 
@@ -94,6 +102,7 @@ class AppConfig extends Equatable {
         agentToken,
         downloadDirectory,
         autoOnline,
+        minimizeToTrayOnClose,
       ];
 
   static String _normalizeServerUrl(String value) {

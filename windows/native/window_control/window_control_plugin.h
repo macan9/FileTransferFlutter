@@ -27,6 +27,7 @@ class WindowControlPlugin : public flutter::Plugin {
   HWND GetMainWindow() const;
   void RestoreMainWindow();
   void MinimizeMainWindow();
+  void HideMainWindow();
 
   flutter::PluginRegistrarWindows* registrar_ = nullptr;
 };

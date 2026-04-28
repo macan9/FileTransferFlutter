@@ -51,6 +51,7 @@ class TrayManagerPlugin : public flutter::Plugin {
   NOTIFYICONIDENTIFIER niif;
   // do create pop-up menu only once.
   HMENU hMenu = CreatePopupMenu();
+  HWND menu_owner_window = nullptr;
   std::vector<HBITMAP> menu_bitmaps;
   bool tray_icon_setted = false;
   UINT windows_taskbar_created_message_id = 0;
@@ -62,6 +63,9 @@ class TrayManagerPlugin : public flutter::Plugin {
   void TrayManagerPlugin::_ApplyIcon();
   void TrayManagerPlugin::_ClearMenuBitmaps();
   HBITMAP TrayManagerPlugin::_LoadMenuBitmap(const std::string& icon);
+  HWND TrayManagerPlugin::_GetMenuOwnerWindow();
+  static LRESULT CALLBACK TrayManagerPlugin::_MenuOwnerWndProc(
+      HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 
   // Called for top-level WindowProc delegation.
   std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hwnd,
@@ -129,8 +133,59 @@ TrayManagerPlugin::TrayManagerPlugin(flutter::PluginRegistrarWindows* registrar)
 }
 
 TrayManagerPlugin::~TrayManagerPlugin() {
+  if (menu_owner_window != nullptr) {
+    DestroyWindow(menu_owner_window);
+    menu_owner_window = nullptr;
+  }
   _ClearMenuBitmaps();
   registrar->UnregisterTopLevelWindowProcDelegate(window_proc_id);
+}
+
+LRESULT CALLBACK TrayManagerPlugin::_MenuOwnerWndProc(HWND hwnd, UINT message,
+                                                      WPARAM wparam,
+                                                      LPARAM lparam) {
+  if (message == WM_NCCREATE) {
+    auto create_struct = reinterpret_cast<CREATESTRUCT*>(lparam);
+    SetWindowLongPtr(hwnd, GWLP_USERDATA,
+                     reinterpret_cast<LONG_PTR>(create_struct->lpCreateParams));
+  }
+
+  auto plugin = reinterpret_cast<TrayManagerPlugin*>(
+      GetWindowLongPtr(hwnd, GWLP_USERDATA));
+  if (plugin != nullptr && message == WM_COMMAND) {
+    flutter::EncodableMap eventData = flutter::EncodableMap();
+    eventData[flutter::EncodableValue("id")] =
+        flutter::EncodableValue((int)wparam);
+
+    channel->InvokeMethod("onTrayMenuItemClick",
+                          std::make_unique<flutter::EncodableValue>(eventData));
+    return 0;
+  }
+
+  return DefWindowProc(hwnd, message, wparam, lparam);
+}
+
+HWND TrayManagerPlugin::_GetMenuOwnerWindow() {
+  if (menu_owner_window != nullptr) {
+    return menu_owner_window;
+  }
+
+  constexpr const wchar_t kMenuOwnerWindowClassName[] =
+      L"TRAY_MANAGER_MENU_OWNER_WINDOW";
+  static bool class_registered = false;
+  if (!class_registered) {
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = TrayManagerPlugin::_MenuOwnerWndProc;
+    window_class.hInstance = GetModuleHandle(nullptr);
+    window_class.lpszClassName = kMenuOwnerWindowClassName;
+    RegisterClassW(&window_class);
+    class_registered = true;
+  }
+
+  menu_owner_window = CreateWindowExW(
+      WS_EX_TOOLWINDOW, kMenuOwnerWindowClassName, L"", WS_POPUP, 0, 0, 0, 0,
+      nullptr, nullptr, GetModuleHandle(nullptr), this);
+  return menu_owner_window;
 }
 
 void TrayManagerPlugin::_ClearMenuBitmaps() {
@@ -159,9 +214,16 @@ HBITMAP TrayManagerPlugin::_LoadMenuBitmap(const std::string& icon) {
   icon_path += L"\\data\\flutter_assets\\";
   icon_path += g_converter.from_bytes(icon);
 
+  int bitmap_size = GetSystemMetrics(SM_CYMENU);
+  if (bitmap_size < 24) {
+    bitmap_size = 24;
+  } else if (bitmap_size > 32) {
+    bitmap_size = 32;
+  }
+
   HBITMAP bitmap = static_cast<HBITMAP>(
-      LoadImageW(nullptr, icon_path.c_str(), IMAGE_BITMAP, 20, 20,
-                 LR_LOADFROMFILE | LR_CREATEDIBSECTION));
+      LoadImageW(nullptr, icon_path.c_str(), IMAGE_BITMAP, bitmap_size,
+                 bitmap_size, LR_LOADFROMFILE | LR_CREATEDIBSECTION));
   if (bitmap != nullptr) {
     menu_bitmaps.push_back(bitmap);
   }
@@ -389,7 +451,17 @@ void TrayManagerPlugin::SetContextMenu(
 void TrayManagerPlugin::PopUpContextMenu(
     const flutter::MethodCall<flutter::EncodableValue>& method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  HWND hWnd = GetMainWindow();
+  const flutter::EncodableMap& args =
+      std::get<flutter::EncodableMap>(*method_call.arguments());
+
+  bool bringAppToFront =
+      std::get<bool>(args.at(flutter::EncodableValue("bringAppToFront")));
+
+  HWND main_window = GetMainWindow();
+  HWND menu_owner = bringAppToFront ? main_window : _GetMenuOwnerWindow();
+  if (menu_owner == nullptr) {
+    menu_owner = main_window;
+  }
 
   double x, y;
 
@@ -404,10 +476,14 @@ void TrayManagerPlugin::PopUpContextMenu(
   x = cursorPos.x;
   y = cursorPos.y;
 
-  SetForegroundWindow(hWnd);
+  if (bringAppToFront) {
+    SetForegroundWindow(main_window);
+  } else {
+    SetForegroundWindow(menu_owner);
+  }
   TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, static_cast<int>(x),
-                 static_cast<int>(y), 0, hWnd, NULL);
-  PostMessage(hWnd, WM_NULL, 0, 0);
+                 static_cast<int>(y), 0, menu_owner, NULL);
+  PostMessage(menu_owner, WM_NULL, 0, 0);
   result->Success(flutter::EncodableValue(true));
 }
 
