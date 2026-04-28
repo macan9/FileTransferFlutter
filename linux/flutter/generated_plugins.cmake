@@ -6,6 +6,7 @@ list(APPEND FLUTTER_PLUGIN_LIST
   desktop_drop
   flutter_webrtc
   screen_retriever_linux
+  tray_manager
   window_manager
 )
 

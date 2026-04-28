@@ -4,6 +4,7 @@
 
 #include "flutter/generated_plugin_registrant.h"
 #include <flutter/plugin_registrar.h>
+#include "native/window_control/window_control_plugin.h"
 #include "native/zerotier/zerotier_windows_plugin.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
@@ -32,6 +33,13 @@ bool FlutterWindow::OnCreate() {
           ->GetRegistrar<flutter::PluginRegistrarWindows>(
               flutter_controller_->engine()->GetRegistrarForPlugin(
                   "ZeroTierWindowsPlugin"));
+  auto* window_control_plugin_registrar =
+      flutter::PluginRegistrarManager::GetInstance()
+          ->GetRegistrar<flutter::PluginRegistrarWindows>(
+              flutter_controller_->engine()->GetRegistrarForPlugin(
+                  "WindowControlPlugin"));
+  WindowControlPlugin::RegisterWithRegistrar(
+      window_control_plugin_registrar);
   ZeroTierWindowsPlugin::RegisterWithRegistrar(
       plugin_registrar);
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
@@ -73,6 +81,16 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   switch (message) {
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
+      break;
+    case WM_SIZE:
+      if (wparam == SIZE_RESTORED || wparam == SIZE_MAXIMIZED) {
+        flutter_controller_->ForceRedraw();
+      }
+      break;
+    case WM_SYSCOMMAND:
+      if ((wparam & 0xFFF0) == SC_RESTORE) {
+        flutter_controller_->ForceRedraw();
+      }
       break;
   }
 

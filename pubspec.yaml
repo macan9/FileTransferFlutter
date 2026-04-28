@@ -28,6 +28,8 @@ dependencies:
   socket_io_client: ^3.1.2
   uuid: ^4.5.1
   window_manager: ^0.5.1
+  tray_manager:
+    path: third_party/tray_manager
 
 dev_dependencies:
   flutter_test:
@@ -38,3 +40,10 @@ flutter:
   uses-material-design: true
   assets:
     - app_env.json
+    - assets/icon/tray_icon.ico
+    - assets/tray_menu/open.bmp
+    - assets/tray_menu/network.bmp
+    - assets/tray_menu/private.bmp
+    - assets/tray_menu/transfer.bmp
+    - assets/tray_menu/settings.bmp
+    - assets/tray_menu/exit.bmp

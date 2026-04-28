@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:file_transfer_flutter/core/constants/app_constants.dart';
+import 'package:file_transfer_flutter/core/services/desktop_tray_service.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_agent_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -307,6 +308,10 @@ class _DesktopTitleBar extends StatelessWidget {
               tooltip: '\u5173\u95ed',
               isClose: true,
               onPressed: () async {
+                if (Platform.isWindows) {
+                  await DesktopTrayService.hideToTray();
+                  return;
+                }
                 await windowManager.close();
               },
             ),

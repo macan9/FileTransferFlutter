@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:file_transfer_flutter/app/app.dart';
 import 'package:file_transfer_flutter/core/bootstrap/app_bootstrap.dart';
 import 'package:file_transfer_flutter/core/constants/app_constants.dart';
+import 'package:file_transfer_flutter/core/services/desktop_tray_service.dart';
 import 'package:file_transfer_flutter/core/services/window_state_service.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:flutter/material.dart';
@@ -70,6 +71,8 @@ Future<void> main() async {
       child: const FileTransferApp(),
     ),
   );
+
+  await DesktopTrayService.initialize();
 }
 
 bool get _isDesktopPlatform =>

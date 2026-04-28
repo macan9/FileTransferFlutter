@@ -29,6 +29,7 @@ class WindowLaunchOptions {
 class WindowStateService with WindowListener {
   WindowStateService._(this._prefs);
 
+  static const double _invalidMinimizedCoordinate = -10000;
   static const String _widthKey = 'window.width';
   static const String _heightKey = 'window.height';
   static const String _xKey = 'window.x';
@@ -55,7 +56,10 @@ class WindowStateService with WindowListener {
 
     Rect? restoredBounds;
     if (width != null && height != null && x != null && y != null) {
-      restoredBounds = Rect.fromLTWH(x, y, width, height);
+      final Rect candidate = Rect.fromLTWH(x, y, width, height);
+      if (_isRestorableBounds(candidate, minimumSize)) {
+        restoredBounds = candidate;
+      }
     }
 
     return WindowLaunchOptions(
@@ -122,14 +126,29 @@ class WindowStateService with WindowListener {
     final bool isMaximized = await windowManager.isMaximized();
     await _prefs.setBool(_maximizedKey, isMaximized);
 
-    if (isMaximized) {
+    if (isMaximized || await windowManager.isMinimized()) {
       return;
     }
 
     final Rect bounds = await windowManager.getBounds();
+    if (!_isRestorableBounds(bounds, const Size(1, 1))) {
+      return;
+    }
+
     await _prefs.setDouble(_widthKey, bounds.width);
     await _prefs.setDouble(_heightKey, bounds.height);
     await _prefs.setDouble(_xKey, bounds.left);
     await _prefs.setDouble(_yKey, bounds.top);
+  }
+
+  bool _isRestorableBounds(Rect bounds, Size minimumSize) {
+    return bounds.width.isFinite &&
+        bounds.height.isFinite &&
+        bounds.left.isFinite &&
+        bounds.top.isFinite &&
+        bounds.width >= minimumSize.width &&
+        bounds.height >= minimumSize.height &&
+        bounds.left > _invalidMinimizedCoordinate &&
+        bounds.top > _invalidMinimizedCoordinate;
   }
 }
