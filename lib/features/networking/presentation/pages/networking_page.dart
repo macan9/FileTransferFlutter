@@ -161,6 +161,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   bool _isDefaultJoinTransitioning = false;
   bool _isDefaultLeaveTransitioning = false;
   DateTime? _defaultJoinTransitionStartedAt;
+  DateTime? _defaultLeaveTransitionStartedAt;
   int _selectedPrimaryTab = 0;
   int _selectedPrivateTab = 0;
 
@@ -245,6 +246,25 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
               currentDeviceId: currentConfig.deviceId,
               runtimeStatus: next.runtimeStatus,
             );
+        if (_defaultFlowState == _DefaultNetworkingUiState.closing && mounted) {
+          final bool defaultNetworkGone = currentDefaultNetwork == null;
+          final bool localNetworkGone = currentDefaultLocalState == null;
+          final bool leaveHasStalled = _defaultLeaveTransitionStartedAt !=
+                  null &&
+              DateTime.now().difference(_defaultLeaveTransitionStartedAt!) >=
+                  _defaultMountStallTimeout;
+          if (defaultNetworkGone ||
+              (localNetworkGone && !leaveProgressObserved) ||
+              leaveHasStalled) {
+            setState(() {
+              _hasDefaultNetworkingIntent = false;
+              _isDefaultLeaveTransitioning = false;
+              _defaultFlowState = _DefaultNetworkingUiState.idle;
+              _defaultJoinTransitionStartedAt = null;
+              _defaultLeaveTransitionStartedAt = null;
+            });
+          }
+        }
         if (_hasDefaultNetworkingIntent &&
             _defaultFlowState != _DefaultNetworkingUiState.closing &&
             mounted) {
@@ -621,6 +641,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
           _isDefaultJoinTransitioning = false;
           _defaultFlowState = _DefaultNetworkingUiState.closing;
           _defaultJoinTransitionStartedAt = null;
+          _defaultLeaveTransitionStartedAt = DateTime.now();
         });
       }
 
@@ -637,6 +658,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         _isDefaultLeaveTransitioning = false;
         _defaultFlowState = _DefaultNetworkingUiState.idle;
         _defaultJoinTransitionStartedAt = null;
+        _defaultLeaveTransitionStartedAt = null;
       });
       _showPageMessage('已取消默认网络组网。');
     } on RealtimeError catch (error) {
@@ -651,12 +673,23 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
           _defaultFlowState = _DefaultNetworkingUiState.idle;
         }
         _defaultJoinTransitionStartedAt = null;
+        _defaultLeaveTransitionStartedAt = null;
       });
       _showPageMessage(error.message);
     } catch (error) {
       if (!mounted) {
         return;
       }
+      setState(() {
+        _isDefaultLeaveTransitioning = false;
+        if (_hasDefaultNetworkingIntent) {
+          _defaultFlowState = _DefaultNetworkingUiState.success;
+        } else {
+          _defaultFlowState = _DefaultNetworkingUiState.idle;
+        }
+        _defaultJoinTransitionStartedAt = null;
+        _defaultLeaveTransitionStartedAt = null;
+      });
       _showPageMessage('$error');
     }
   }
@@ -4303,7 +4336,7 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
     case _DefaultNetworkFlowState.retryableError:
       return const _DefaultNetworkFlowPresentation(
         label: '重新组网',
-        subtitle: '上一轮组网出现异常，点击重新发起编排。',
+        subtitle: '上一轮组网异常\n请重新开始编排',
         hint: '当前链路曾出现异常，建议结合最近事件一起排查。',
         icon: Icons.error_outline_rounded,
         tone: _NetworkingOrbTone.idle,

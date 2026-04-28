@@ -204,7 +204,7 @@ ZT_ResultCode Node::processWirePacket(
 	volatile int64_t *nextBackgroundTaskDeadline)
 {
 	_now = now;
-#if defined(_WIN32) || defined(_WIN64)
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 	{
 		const InetAddress remote(*reinterpret_cast<const InetAddress *>(remoteAddress));
 		if (remote.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
@@ -366,6 +366,7 @@ ZT_ResultCode Node::processBackgroundTasks(void *tptr,int64_t now,volatile int64
 					}
 				}
 			}
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 			fprintf(stderr,
 				"[ZT/CORE] upstream_health now=%lld last_received_from_upstream=%lld upstream_rx_age=%lld timeout=%d am_upstream=%d upstream_count=%u\n",
 				(long long)now,
@@ -403,6 +404,7 @@ ZT_ResultCode Node::processBackgroundTasks(void *tptr,int64_t now,volatile int64
 				}
 			}
 			fflush(stderr);
+#endif
 
 			// Clean up any old local controller auth memorizations.
 			{
@@ -461,6 +463,7 @@ ZT_ResultCode Node::processBackgroundTasks(void *tptr,int64_t now,volatile int64
 			const bool oldOnline = _online;
 			_online = (((now - lastReceivedFromUpstream) < ZT_PEER_ACTIVITY_TIMEOUT)||(RR->topology->amUpstream()));
 			if (oldOnline != _online) {
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 				fprintf(stderr,
 					"[ZT/CORE] online_state_change now=%lld old_online=%d new_online=%d last_received_from_upstream=%lld upstream_rx_age=%lld timeout=%d am_upstream=%d upstream_count=%u\n",
 					(long long)now,
@@ -472,6 +475,7 @@ ZT_ResultCode Node::processBackgroundTasks(void *tptr,int64_t now,volatile int64
 					RR->topology->amUpstream() ? 1 : 0,
 					(unsigned int)alwaysContact.size());
 				{
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 					Hashtable< Address,std::vector<InetAddress> >::Iterator i(alwaysContact);
 					Address *upstreamAddress = (Address *)0;
 					std::vector<InetAddress> *upstreamStableEndpoints = (std::vector<InetAddress> *)0;
@@ -487,8 +491,10 @@ ZT_ResultCode Node::processBackgroundTasks(void *tptr,int64_t now,volatile int64
 							(long long)(p ? (now - p->lastReceive()) : -1),
 							(unsigned int)(upstreamStableEndpoints ? upstreamStableEndpoints->size() : 0));
 					}
+#endif
 				}
 				fflush(stderr);
+#endif
 				postEvent(tptr,_online ? ZT_EVENT_ONLINE : ZT_EVENT_OFFLINE);
 			}
 		} catch ( ... ) {

@@ -98,9 +98,9 @@ bool IncomingPacket::tryDecode(const RuntimeEnvironment *RR,void *tPtr,int32_t f
 			_authenticated = true;
 			const Packet::Verb v = verb();
 			const bool upstreamPeer = RR->topology->isUpstream(peer->identity());
-#ifdef __WINDOWS__
-			const bool globalScope = (_path->address().ipScope() == InetAddress::IP_SCOPE_GLOBAL);
 			char peerAddrBuf[11];
+#if defined(__WINDOWS__) && defined(ZT_VERBOSE_PACKET_LOGGING)
+			const bool globalScope = (_path->address().ipScope() == InetAddress::IP_SCOPE_GLOBAL);
 #define ZT_LOG_INCOMING_BRANCH(_handlerName,_willRefreshLastReceive) \
 			do { \
 				if (globalScope) { \

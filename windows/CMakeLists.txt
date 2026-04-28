@@ -56,6 +56,40 @@ set(FLUTTER_EMBEDDED_BUILD TRUE CACHE BOOL "" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libzt"
   "${CMAKE_CURRENT_BINARY_DIR}/third_party/libzt")
 
+if(MSVC)
+  function(SUPPRESS_LIBZT_THIRD_PARTY_WARNINGS TARGET)
+    if(TARGET ${TARGET})
+      target_compile_options(${TARGET} PRIVATE
+        /wd4018
+        /wd4102
+        /wd4133
+        /wd4244
+        /wd4267
+        /wd4273
+        /wd4819
+        /wd4828
+        /wd4996)
+      target_compile_definitions(${TARGET} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+  endfunction()
+
+  foreach(TARGET
+      libnatpmp_obj
+      miniupnpc_obj
+      libzt_obj
+      zto_obj
+      lwip_obj
+      natpmp_pic
+      miniupnpc_pic
+      zt_pic
+      zto_pic
+      lwip_pic
+      zt-static
+      zt-shared)
+    suppress_libzt_third_party_warnings(${TARGET})
+  endforeach()
+endif()
+
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 

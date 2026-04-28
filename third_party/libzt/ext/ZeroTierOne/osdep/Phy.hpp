@@ -196,6 +196,7 @@ private:
 			getsockoptIpv6OnlyRc = ::getsockopt(sock,IPPROTO_IPV6,IPV6_V6ONLY,(char *)&ipv6Only,&ipv6OnlyLen);
 		}
 
+#if defined(ZT_VERBOSE_PACKET_LOGGING)
 		fprintf(stderr,
 			"[ZT/PHY] socket_diagnostics stage=%s sock=%llu requested_local=%s actual_local=%s getsockname_rc=%d reuseaddr=%d reuseaddr_rc=%d exclusiveaddruse=%d exclusiveaddruse_rc=%d broadcast=%d broadcast_rc=%d ipv6only=%d ipv6only_rc=%d rcvbuf=%lu rcvbuf_rc=%d sndbuf=%lu sndbuf_rc=%d\n",
 			stage,
@@ -215,6 +216,7 @@ private:
 			getsockoptRcvBufRc,
 			(unsigned long)sendBuffer,
 			getsockoptSndBufRc);
+#endif
 	}
 #endif
 
@@ -447,15 +449,16 @@ public:
 				nullptr,
 				nullptr);
 			char addrbuf[64];
-			fprintf(
-				stderr,
-				"[ZT/PHY] udp_connreset_result local=%s family=%d success=%d rc=%d wsa_error=%d sock=%llu\n",
-				ztPhyAddrToString(localAddress,addrbuf),
-				(int)localAddress->sa_family,
-				(udpConnResetRc == 0) ? 1 : 0,
-				udpConnResetRc,
-				(udpConnResetRc == 0) ? 0 : (int)WSAGetLastError(),
-				(unsigned long long)s);
+			if (udpConnResetRc != 0) {
+				fprintf(
+					stderr,
+					"[ZT/PHY] udp_connreset_result local=%s family=%d success=0 rc=%d wsa_error=%d sock=%llu\n",
+					ztPhyAddrToString(localAddress,addrbuf),
+					(int)localAddress->sa_family,
+					udpConnResetRc,
+					(int)WSAGetLastError(),
+					(unsigned long long)s);
+			}
 		}
 #else // not Windows
 		{
@@ -521,11 +524,13 @@ public:
 		memcpy(&(sws.saddr),localAddress,(localAddress->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in));
 
 #if defined(_WIN32) || defined(_WIN64)
+#if defined(ZT_VERBOSE_PACKET_LOGGING)
 		{
 			char addrbuf[64];
 			fprintf(stderr,"[ZT/PHY] udp_bind_result stage=bind local=%s family=%d success=1 sock=%llu phy_socket=%lld\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(unsigned long long)s,(long long)reinterpret_cast<int64_t>((PhySocket *)&sws));
 			ztPhyLogSocketDiagnostics("udp_bind",s,localAddress,(int)localAddress->sa_family);
 		}
+#endif
 #endif
 
 		return (PhySocket *)&sws;
@@ -724,10 +729,12 @@ public:
 		memcpy(&(sws.saddr),localAddress,(localAddress->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in));
 
 #if defined(_WIN32) || defined(_WIN64)
+#if defined(ZT_VERBOSE_PACKET_LOGGING)
 		{
 			char addrbuf[64];
 			fprintf(stderr,"[ZT/PHY] tcp_listen_result stage=listen local=%s family=%d success=1 sock=%llu phy_socket=%lld\n",ztPhyAddrToString(localAddress,addrbuf),(int)localAddress->sa_family,(unsigned long long)s,(long long)reinterpret_cast<int64_t>((PhySocket *)&sws));
 		}
+#endif
 #endif
 
 		return (PhySocket *)&sws;
@@ -1117,7 +1124,7 @@ public:
 
 				case ZT_PHY_SOCKET_UDP:
 					if (FD_ISSET(s->sock, &rfds)) {
-#if defined(_WIN32) || defined(_WIN64)
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 						{
 							u_long pendingBytes = 0;
 							const int fionreadRc = ::ioctlsocket(s->sock,FIONREAD,&pendingBytes);
@@ -1180,7 +1187,7 @@ public:
 							socklen_t slen = sizeof(ss);
 							long n = (long)::recvfrom(s->sock, buf, sizeof(buf), 0, (struct sockaddr*)&ss, &slen);
 							if (n > 0) {
-#if defined(_WIN32) || defined(_WIN64)
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 								{
 									InetAddress fromAddr(reinterpret_cast<const struct sockaddr *>(&ss));
 									if (fromAddr.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {

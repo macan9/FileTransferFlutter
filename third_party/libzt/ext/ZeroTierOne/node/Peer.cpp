@@ -106,7 +106,7 @@ void Peer::received(
 #endif
 	recordIncomingPacket(path, packetId, payloadLength, verb, flowId, now);
 
-#ifdef __WINDOWS__
+#if defined(__WINDOWS__) && defined(ZT_VERBOSE_PACKET_LOGGING)
 	if (upstreamPeer) {
 		char peerBuf[11];
 		char pathBuf[64];

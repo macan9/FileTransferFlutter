@@ -82,7 +82,7 @@ void Switch::onRemotePacket(void *tPtr,const int64_t localSocket,const InetAddre
 
 		const SharedPtr<Path> path(RR->topology->getPath(localSocket,fromAddr));
 		path->received(now);
-#if defined(_WIN32) || defined(_WIN64)
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 		if (fromAddr.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
 			char frombuf[64];
 			fprintf(stderr,
@@ -198,7 +198,7 @@ void Switch::onRemotePacket(void *tPtr,const int64_t localSocket,const InetAddre
 
 				const Address destination(reinterpret_cast<const uint8_t *>(data) + 8,ZT_ADDRESS_LENGTH);
 				const Address source(reinterpret_cast<const uint8_t *>(data) + 13,ZT_ADDRESS_LENGTH);
-#if defined(_WIN32) || defined(_WIN64)
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 				if (fromAddr.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
 					char frombuf[64];
 					char dstbuf[64];
@@ -298,7 +298,7 @@ void Switch::onRemotePacket(void *tPtr,const int64_t localSocket,const InetAddre
 					// Packet is unfragmented, so just process it
 					IncomingPacket packet(data,len,path,now);
 					const bool decoded = packet.tryDecode(RR,tPtr,flowId);
-#if defined(_WIN32) || defined(_WIN64)
+#if (defined(_WIN32) || defined(_WIN64)) && defined(ZT_VERBOSE_PACKET_LOGGING)
 					if (fromAddr.ipScope() == InetAddress::IP_SCOPE_GLOBAL) {
 						char frombuf[64];
 						fprintf(stderr,

@@ -3205,7 +3205,7 @@ bool ZeroTierWindowsRuntime::EnsurePrepared(std::string* error_message) {
     std::string backend_action;
     const bool backend_changed =
         tap_backend_->EnsureAdapterPresent(adapter_probe_, {}, &backend_action);
-    {
+    if (backend_changed) {
       std::ostringstream stream;
       stream << "tap_backend_ensure_adapter"
              << " phase=prepare"
@@ -3297,14 +3297,8 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
   auto* event = reinterpret_cast<zts_event_msg_t*>(message_ptr);
   const char* event_name = EventCodeToString(event->event_code);
   const bool should_log_event =
-      event->event_code == ZTS_EVENT_NODE_ONLINE ||
       event->event_code == ZTS_EVENT_NODE_OFFLINE ||
-      event->event_code == ZTS_EVENT_NODE_DOWN ||
-      event->event_code == ZTS_EVENT_PEER_DIRECT ||
-      event->event_code == ZTS_EVENT_PEER_RELAY ||
-      event->event_code == ZTS_EVENT_PEER_UNREACHABLE ||
-      event->event_code == ZTS_EVENT_PEER_PATH_DISCOVERED ||
-      event->event_code == ZTS_EVENT_PEER_PATH_DEAD;
+      event->event_code == ZTS_EVENT_NODE_DOWN;
   if (event_name != nullptr && should_log_event) {
     std::ostringstream stream;
     stream << "libzt_event"
@@ -3355,6 +3349,7 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
         node_offline_ = false;
         ClearLastErrorLocked();
         payload = BuildNodeDiagnosticsPayloadLocked(event->event_code);
+#if defined(ZT_VERBOSE_PACKET_LOGGING)
         std::ostringstream stream;
         stream << "node_online"
                << " trigger=" << DescribeNodeTriggerLocked("nodeOnline")
@@ -3369,6 +3364,7 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
                << " sockets="
                << SummarizeUdpEndpointsForPid(GetCurrentProcessId(), node_port_);
         LogNodeTrace(stream.str());
+#endif
       }
       EmitEvent(BuildEvent("nodeOnline", "ZeroTier node is online.", "",
                            payload));
@@ -4401,7 +4397,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     std::string backend_action;
     const bool backend_changed = tap_backend_->EnsureAdapterPresent(
         adapter_probe, expected_addresses, &backend_action);
-    {
+    if (backend_changed) {
       std::ostringstream stream;
       stream << "tap_backend_ensure_adapter"
              << " phase=refresh"

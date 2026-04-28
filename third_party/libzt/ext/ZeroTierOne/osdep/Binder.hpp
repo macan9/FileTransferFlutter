@@ -468,7 +468,7 @@ class Binder {
 						_bindings[_bindingCount].tcpListenSock = tcps;
 						_bindings[_bindingCount].address = ii->first;
 						memcpy(_bindings[_bindingCount].ifname, (char*)ii->second.c_str(), (int)ii->second.length());
-#ifdef __WINDOWS__
+#if defined(__WINDOWS__) && defined(ZT_VERBOSE_PACKET_LOGGING)
 						{
 							char addrbuf[64];
 							fprintf(stderr,
