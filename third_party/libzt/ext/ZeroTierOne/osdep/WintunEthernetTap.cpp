@@ -683,8 +683,28 @@ std::string WintunEthernetTap::friendlyName() const
 
 void WintunEthernetTap::scanMulticastGroups(std::vector<MulticastGroup> &added,std::vector<MulticastGroup> &removed)
 {
-	(void)added;
-	(void)removed;
+	std::vector<MulticastGroup> nextGroups;
+	{
+		Mutex::Lock lock(_assignedIpsMutex);
+		for (std::vector<InetAddress>::const_iterator ip = _assignedIps.begin(); ip != _assignedIps.end(); ++ip) {
+			nextGroups.push_back(MulticastGroup::deriveMulticastGroupForAddressResolution(*ip));
+		}
+	}
+	std::sort(nextGroups.begin(),nextGroups.end());
+	nextGroups.erase(std::unique(nextGroups.begin(),nextGroups.end()),nextGroups.end());
+
+	Mutex::Lock lock(_multicastGroupsMutex);
+	for (std::vector<MulticastGroup>::const_iterator group = nextGroups.begin(); group != nextGroups.end(); ++group) {
+		if (!std::binary_search(_multicastGroups.begin(),_multicastGroups.end(),*group)) {
+			added.push_back(*group);
+		}
+	}
+	for (std::vector<MulticastGroup>::const_iterator group = _multicastGroups.begin(); group != _multicastGroups.end(); ++group) {
+		if (!std::binary_search(nextGroups.begin(),nextGroups.end(),*group)) {
+			removed.push_back(*group);
+		}
+	}
+	_multicastGroups.swap(nextGroups);
 }
 
 void WintunEthernetTap::setMtu(unsigned int mtu)

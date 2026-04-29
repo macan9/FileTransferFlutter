@@ -132,6 +132,8 @@ private:
 	std::string _friendlyName;
 	std::vector<InetAddress> _assignedIps;
 	mutable Mutex _assignedIpsMutex;
+	std::vector<MulticastGroup> _multicastGroups;
+	mutable Mutex _multicastGroupsMutex;
 	Arp _arp;
 	Mutex _arpMutex;
 	std::deque<PendingIpv4Packet> _pendingIpv4;
