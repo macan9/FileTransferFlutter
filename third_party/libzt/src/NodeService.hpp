@@ -166,6 +166,7 @@ class NodeService {
     volatile unsigned int _udpPortPickerCounter;
 
     std::map<uint64_t, unsigned int> peerCache;
+    uint64_t _lastPeerDiagnosticsAt;
 
     // Local configuration and memo-ized information from it
     Hashtable<uint64_t, std::vector<InetAddress> > _v4Hints;

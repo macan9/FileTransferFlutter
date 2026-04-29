@@ -11,6 +11,8 @@
  */
 /****/
 
+#include <stdio.h>
+
 #include "../version.h"
 #include "Constants.hpp"
 #include "Peer.hpp"
@@ -159,7 +161,7 @@ void Peer::received(
 		}
 
 		if ( (!havePath) && RR->node->shouldUsePathForZeroTierTraffic(tPtr,_id.address(),path->localSocket(),path->address()) ) {
-			if (verb == Packet::VERB_OK) {
+			if ((verb == Packet::VERB_OK)||(verb == Packet::VERB_HELLO)||(verb == Packet::VERB_ECHO)||(verb == Packet::VERB_FRAME)||(verb == Packet::VERB_EXT_FRAME)) {
 				Mutex::Lock _l(_paths_m);
 				unsigned int oldestPathIdx = ZT_MAX_PEER_NETWORK_PATHS;
 				unsigned int oldestPathAge = 0;
@@ -194,6 +196,20 @@ void Peer::received(
 					_paths[replacePath].lr = now;
 					_paths[replacePath].p = path;
 					_paths[replacePath].priority = 1;
+#ifdef __WINDOWS__
+					char peerBuf[11];
+					char pathBuf[64];
+					fprintf(stderr,
+						"[ZT/PEER] learned_path peer=%s verb=%u network=%llu remote=%s local_socket=%lld replace=%u packet_id=%llu\n",
+						address().toString(peerBuf),
+						(unsigned int)verb,
+						(unsigned long long)networkId,
+						path->address().toString(pathBuf),
+						(long long)path->localSocket(),
+						replacePath,
+						(unsigned long long)packetId);
+					fflush(stderr);
+#endif
 					Mutex::Lock _l(_bond_m);
 					if(_bond) {
 						_bond->nominatePathToBond(_paths[replacePath].p, now);
@@ -399,6 +415,24 @@ void Peer::introduce(void *const tPtr,const int64_t now,const SharedPtr<Peer> &o
 		}
 	}
 
+#ifdef __WINDOWS__
+	{
+		char minePeerBuf[11];
+		char otherPeerBuf[11];
+		char minePathBuf[64] = { 0 };
+		char otherPathBuf[64] = { 0 };
+		fprintf(stderr,
+			"[ZT/PEER] introduce mine=%s other=%s selected_mine=%d selected_other=%d mine_path=%s other_path=%s\n",
+			address().toString(minePeerBuf),
+			other->address().toString(otherPeerBuf),
+			(mine == ZT_MAX_PEER_NETWORK_PATHS) ? -1 : (int)mine,
+			(theirs == ZT_MAX_PEER_NETWORK_PATHS) ? -1 : (int)theirs,
+			(mine == ZT_MAX_PEER_NETWORK_PATHS) ? "-" : _paths[mine].p->address().toString(minePathBuf),
+			(theirs == ZT_MAX_PEER_NETWORK_PATHS) ? "-" : other->_paths[theirs].p->address().toString(otherPathBuf));
+		fflush(stderr);
+	}
+#endif
+
 	if (mine != ZT_MAX_PEER_NETWORK_PATHS) {
 		unsigned int alt = (unsigned int)RR->node->prng() & 1; // randomize which hint we send first for black magickal NAT-t reasons
 		const unsigned int completed = alt + 2;
@@ -486,6 +520,19 @@ void Peer::sendHELLO(void *tPtr,const int64_t localSocket,const InetAddress &atA
 
 void Peer::attemptToContactAt(void *tPtr,const int64_t localSocket,const InetAddress &atAddress,int64_t now,bool sendFullHello)
 {
+#ifdef __WINDOWS__
+	{
+		char peerBuf[11];
+		char addrBuf[64];
+		fprintf(stderr,
+			"[ZT/PEER] attempt_contact peer=%s remote=%s local_socket=%lld packet=%s\n",
+			address().toString(peerBuf),
+			atAddress.toString(addrBuf),
+			(long long)localSocket,
+			sendFullHello ? "HELLO" : "ECHO");
+		fflush(stderr);
+	}
+#endif
 	if ( (!sendFullHello) && (_vProto >= 5) && (!((_vMajor == 1)&&(_vMinor == 1)&&(_vRevision == 0))) ) {
 		Packet outp(_id.address(),RR->identity.address(),Packet::VERB_ECHO);
 		outp.armor(_key,true,aesKeysIfSupported());

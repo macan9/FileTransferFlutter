@@ -106,17 +106,25 @@ private:
 	void handleInboundIpv4Packet(const BYTE *packet,DWORD packetSize);
 	void handleInboundIpv6Packet(const BYTE *packet,DWORD packetSize);
 	void handleIncomingArpFrame(const void *data,unsigned int len);
+	bool isAssignedIpv4Broadcast(uint32_t ip) const;
 	void flushQueuedIpv4(uint32_t targetIp,const MAC &destination);
 	void sendFrameToZeroTier(const MAC &to,unsigned int etherType,const void *data,unsigned int len);
-	void enqueueIpv4(uint32_t targetIp,const BYTE *packet,DWORD packetSize);
+	void enqueueIpv4(uint32_t sourceIp,uint32_t targetIp,const BYTE *packet,DWORD packetSize);
+	void processPendingIpv4Resolutions();
+	void sendArpQuery(uint32_t sourceIp,uint32_t targetIp);
+	void maybeLogStats(bool force = false);
 	bool sendPacketToWintun(const void *data,unsigned int len);
 
 	static DWORD WINAPI receiveThreadEntry(LPVOID context);
 
 	struct PendingIpv4Packet
 	{
+		uint64_t firstQueuedAt = 0;
+		uint64_t lastQueryAt = 0;
 		uint32_t targetIp = 0;
+		uint32_t sourceIp = 0;
 		unsigned int len = 0;
+		unsigned int retries = 0;
 		unsigned char data[ZT_MAX_MTU] = { 0 };
 	};
 
@@ -149,7 +157,19 @@ private:
 	volatile unsigned long long _txPackets = 0;
 	volatile unsigned long long _txBytes = 0;
 	volatile unsigned long long _queuedPackets = 0;
+	volatile unsigned long long _flushedPackets = 0;
+	volatile unsigned long long _arpQueriesSent = 0;
+	volatile unsigned long long _arpRepliesReceived = 0;
+	volatile unsigned long long _arpResponsesSent = 0;
+	volatile unsigned long long _dropInvalidPackets = 0;
+	volatile unsigned long long _dropDisabledPackets = 0;
+	volatile unsigned long long _dropQueueOverflowPackets = 0;
+	volatile unsigned long long _dropQueueTimeoutPackets = 0;
+	volatile unsigned long long _dropNoSessionPackets = 0;
+	volatile unsigned long long _dropSendAllocPackets = 0;
+	volatile unsigned long long _dropUnsupportedPackets = 0;
 	volatile unsigned long long _droppedPackets = 0;
+	uint64_t _lastStatsLogAt = 0;
 	volatile unsigned int _mtu = 0;
 	MAC _mac;
 	uint64_t _nwid = 0;

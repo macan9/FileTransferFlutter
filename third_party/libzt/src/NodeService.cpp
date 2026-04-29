@@ -42,12 +42,51 @@
 #include <shlobj.h>
 #include <windows.h>
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #define stat _stat
 #endif
 
 #define ZT_TCP_FALLBACK_RELAY "204.80.128.1/443"
 
 namespace ZeroTier {
+
+namespace {
+
+std::string peerPathAddressString(const struct sockaddr_storage &address)
+{
+    char host[INET6_ADDRSTRLEN] = { 0 };
+    unsigned int port = 0;
+    if (address.ss_family == AF_INET) {
+        const struct sockaddr_in *in4 = reinterpret_cast<const struct sockaddr_in *>(&address);
+        if (!inet_ntop(AF_INET,&in4->sin_addr,host,sizeof(host))) {
+            return std::string("-");
+        }
+        port = Utils::ntoh((uint16_t)in4->sin_port);
+    }
+    else if (address.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = reinterpret_cast<const struct sockaddr_in6 *>(&address);
+        if (!inet_ntop(AF_INET6,&in6->sin6_addr,host,sizeof(host))) {
+            return std::string("-");
+        }
+        port = Utils::ntoh((uint16_t)in6->sin6_port);
+    }
+    else {
+        return std::string("-");
+    }
+    char result[128] = { 0 };
+    OSUtils::ztsnprintf(result,sizeof(result),"%s/%u",host,port);
+    return std::string(result);
+}
+
+float sanePeerMetric(float value)
+{
+    if ((value < 0.0f) || (value > 1000000.0f)) {
+        return -1.0f;
+    }
+    return value;
+}
+
+} // namespace
 
 static int SnodeVirtualNetworkConfigFunction(
     ZT_Node* node,
@@ -183,6 +222,7 @@ NodeService::NodeService()
     , _randomPortRangeStart(0)
     , _randomPortRangeEnd(0)
     , _udpPortPickerCounter(0)
+    , _lastPeerDiagnosticsAt(0)
     , _lastDirectReceiveFromGlobal(0)
     , _fallbackRelayAddress(ZT_TCP_FALLBACK_RELAY)
     , _allowTcpRelay(true)
@@ -208,6 +248,14 @@ NodeService::NodeService()
     , _homePath("")
     , _events(NULL)
 {
+#if defined(__WINDOWS__)
+    const char* forceTcpRelay = getenv("ZTS_FORCE_TCP_RELAY");
+    if (forceTcpRelay && ((forceTcpRelay[0] == '1') || (forceTcpRelay[0] == 't') || (forceTcpRelay[0] == 'T') || (forceTcpRelay[0] == 'y') || (forceTcpRelay[0] == 'Y'))) {
+        _forceTcpRelay = true;
+        fprintf(stderr,"[ZT/PEER] tcp_fallback_force enabled source=env\n");
+        fflush(stderr);
+    }
+#endif
 }
 
 NodeService::~NodeService()
@@ -266,8 +314,19 @@ NodeService::ReasonForTermination NodeService::run()
 
         // Make sure we can use the primary port, and hunt for one if
         // configured to do so
+        if (_primaryPort == 0) {
+            const unsigned int defaultPort = 9993;
+            if (_trialBind(defaultPort)) {
+                _primaryPort = defaultPort;
+                _ports[0] = defaultPort;
+                fprintf(stderr,"[ZT/BINDER] selected_default_primary_port port=%u\n",defaultPort);
+            }
+        }
         const int portTrials = (_primaryPort == 0) ? 256 : 1;   // if port is 0, pick random
         for (int k = 0; k < portTrials; ++k) {
+            if (_ports[0] != 0) {
+                break;
+            }
             if (_primaryPort == 0) {
                 unsigned int randp = 0;
                 Utils::getSecureRandom(&randp, sizeof(randp));
@@ -830,6 +889,15 @@ void NodeService::phyOnTcpConnect(PhySocket* sock, void** uptr, bool success)
         if (_tcpFallbackTunnel)
             _phy.close(_tcpFallbackTunnel->sock);
         _tcpFallbackTunnel = tc;
+#if defined(__WINDOWS__)
+        {
+            char relayBuf[64];
+            fprintf(stderr,
+                "[ZT/PEER] tcp_fallback_connected remote=%s\n",
+                tc->remoteAddr.toString(relayBuf));
+            fflush(stderr);
+        }
+#endif
         _phy.streamSend(sock, ZT_TCP_TUNNEL_HELLO, sizeof(ZT_TCP_TUNNEL_HELLO));
     }
     else {
@@ -1444,6 +1512,11 @@ void NodeService::generateSyntheticEvents()
     }
     ZT_PeerList* pl = _node->peers();
     if (pl) {
+        const uint64_t now = OSUtils::now();
+        const bool logPeerDiagnostics = ((_lastPeerDiagnosticsAt == 0) || ((now - _lastPeerDiagnosticsAt) >= 30000));
+        if (logPeerDiagnostics) {
+            _lastPeerDiagnosticsAt = now;
+        }
         for (unsigned long i = 0; i < pl->peerCount; ++i) {
             if (! peerCache.count(pl->peers[i].address)) {
                 // New peer, add status
@@ -1470,6 +1543,44 @@ void NodeService::generateSyntheticEvents()
             }
             // Update our cache with most recently observed path count
             peerCache[pl->peers[i].address] = pl->peers[i].pathCount;
+            if (logPeerDiagnostics) {
+                const ZT_Peer &peer = pl->peers[i];
+                const ZT_PeerPhysicalPath *preferredPath = (const ZT_PeerPhysicalPath*)0;
+                for (unsigned int j = 0; j < peer.pathCount; ++j) {
+                    if (peer.paths[j].preferred) {
+                        preferredPath = &(peer.paths[j]);
+                        break;
+                    }
+                }
+                if ((!preferredPath) && (peer.pathCount > 0)) {
+                    preferredPath = &(peer.paths[0]);
+                }
+                if (preferredPath) {
+                    const int64_t lastTxAge = preferredPath->lastSend ? (int64_t)(now - preferredPath->lastSend) : -1;
+                    const int64_t lastRxAge = preferredPath->lastReceive ? (int64_t)(now - preferredPath->lastReceive) : -1;
+                    fprintf(stderr,
+                        "[ZT/PEER] peer=%010llx mode=DIRECT path_count=%u latency=%d path_latency=%.2f path_loss=%.3f preferred=%d expired=%d last_tx_age_ms=%lld last_rx_age_ms=%lld ifname=%.32s path=%s tcp_fallback=%s\n",
+                        (unsigned long long)peer.address,
+                        peer.pathCount,
+                        peer.latency,
+                        sanePeerMetric(preferredPath->latencyMean),
+                        sanePeerMetric(preferredPath->packetLossRatio),
+                        preferredPath->preferred,
+                        preferredPath->expired,
+                        (long long)lastTxAge,
+                        (long long)lastRxAge,
+                        preferredPath->ifname,
+                        peerPathAddressString(preferredPath->address).c_str(),
+                        _tcpFallbackTunnel ? "active" : "inactive");
+                }
+                else {
+                    fprintf(stderr,
+                        "[ZT/PEER] peer=%010llx mode=RELAY path_count=0 latency=%d tcp_fallback=%s\n",
+                        (unsigned long long)peer.address,
+                        peer.latency,
+                        _tcpFallbackTunnel ? "active" : "inactive");
+                }
+            }
         }
     }
     _node->freeQueryResult((void*)pl);

@@ -872,7 +872,23 @@ bool IncomingPacket::_doRENDEZVOUS(const RuntimeEnvironment *RR,void *tPtr,const
 			const unsigned int addrlen = (*this)[ZT_PROTO_VERB_RENDEZVOUS_IDX_ADDRLEN];
 			if ((port > 0)&&((addrlen == 4)||(addrlen == 16))) {
 				InetAddress atAddr(field(ZT_PROTO_VERB_RENDEZVOUS_IDX_ADDRESS,addrlen),addrlen,port);
-				if (RR->node->shouldUsePathForZeroTierTraffic(tPtr,with,_path->localSocket(),atAddr)) {
+				const bool accepted = RR->node->shouldUsePathForZeroTierTraffic(tPtr,with,_path->localSocket(),atAddr);
+#ifdef __WINDOWS__
+				{
+					char upstreamBuf[11];
+					char withBuf[11];
+					char addrBuf[64];
+					fprintf(stderr,
+						"[ZT/PEER] rendezvous_in from_upstream=%s with=%s candidate=%s local_socket=%lld accepted=%d\n",
+						peer->address().toString(upstreamBuf),
+						with.toString(withBuf),
+						atAddr.toString(addrBuf),
+						(long long)_path->localSocket(),
+						accepted ? 1 : 0);
+					fflush(stderr);
+				}
+#endif
+				if (accepted) {
 					const uint64_t junk = RR->node->prng();
 					RR->node->putPacket(tPtr,_path->localSocket(),atAddr,&junk,4,2); // send low-TTL junk packet to 'open' local NAT(s) and stateful firewalls
 					rendezvousWith->attemptToContactAt(tPtr,_path->localSocket(),atAddr,RR->node->now(),false);
@@ -1002,6 +1018,7 @@ bool IncomingPacket::_doFRAME(const RuntimeEnvironment *RR,void *tPtr,const Shar
 			}
 		} else {
 			_sendErrorNeedCredentials(RR,tPtr,peer,nwid);
+			peer->received(tPtr,_path,hops(),packetId(),payloadLength(),Packet::VERB_FRAME,0,Packet::VERB_NOP,false,nwid,_flowId);
 			return false;
 		}
 	}
@@ -1030,6 +1047,7 @@ bool IncomingPacket::_doEXT_FRAME(const RuntimeEnvironment *RR,void *tPtr,const 
 		if (!network->gate(tPtr,peer)) {
 			RR->t->incomingNetworkAccessDenied(tPtr,network,_path,packetId(),size(),peer->address(),Packet::VERB_EXT_FRAME,true);
 			_sendErrorNeedCredentials(RR,tPtr,peer,nwid);
+			peer->received(tPtr,_path,hops(),packetId(),payloadLength(),Packet::VERB_EXT_FRAME,0,Packet::VERB_NOP,false,nwid,flowId);
 			return false;
 		}
 
@@ -1496,6 +1514,15 @@ bool IncomingPacket::_doPUSH_DIRECT_PATHS(const RuntimeEnvironment *RR,void *tPt
 	const int64_t now = RR->node->now();
 
 	if (!peer->rateGatePushDirectPaths(now)) {
+#ifdef __WINDOWS__
+		{
+			char peerBuf[11];
+			fprintf(stderr,
+				"[ZT/PEER] push_direct_paths_rate_limited peer=%s\n",
+				peer->address().toString(peerBuf));
+			fflush(stderr);
+		}
+#endif
 		peer->received(tPtr,_path,hops(),packetId(),payloadLength(),Packet::VERB_PUSH_DIRECT_PATHS,0,Packet::VERB_NOP,false,0,ZT_QOS_NO_FLOW);
 		return true;
 	}
@@ -1518,12 +1545,33 @@ bool IncomingPacket::_doPUSH_DIRECT_PATHS(const RuntimeEnvironment *RR,void *tPt
 		switch(addrType) {
 			case 4: {
 				const InetAddress a(field(ptr,4),4,at<uint16_t>(ptr + 4));
-				if (
-					((flags & ZT_PUSH_DIRECT_PATHS_FLAG_FORGET_PATH) == 0) && // not being told to forget
-						(!( ((flags & ZT_PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT) == 0) && (peer->hasActivePathTo(now,a)) )) && // not already known
-						(RR->node->shouldUsePathForZeroTierTraffic(tPtr,peer->address(),_path->localSocket(),a)) ) // should use path
+				const bool forgetPath = ((flags & ZT_PUSH_DIRECT_PATHS_FLAG_FORGET_PATH) != 0);
+				const bool clusterRedirect = ((flags & ZT_PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT) != 0);
+				const bool alreadyActive = (!clusterRedirect && peer->hasActivePathTo(now,a));
+				const bool accepted = RR->node->shouldUsePathForZeroTierTraffic(tPtr,peer->address(),_path->localSocket(),a);
+#ifdef __WINDOWS__
 				{
-					if ((flags & ZT_PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT) != 0) {
+					char peerBuf[11];
+					char addrBuf[64];
+					fprintf(stderr,
+						"[ZT/PEER] push_direct_candidate peer=%s family=4 addr=%s flags=0x%02x forget=%d cluster=%d already_active=%d accepted=%d scope=%d\n",
+						peer->address().toString(peerBuf),
+						a.toString(addrBuf),
+						(unsigned int)flags,
+						forgetPath ? 1 : 0,
+						clusterRedirect ? 1 : 0,
+						alreadyActive ? 1 : 0,
+						accepted ? 1 : 0,
+						(int)a.ipScope());
+					fflush(stderr);
+				}
+#endif
+				if (
+					(!forgetPath) && // not being told to forget
+						(!alreadyActive) && // not already known
+						accepted ) // should use path
+				{
+					if (clusterRedirect) {
 						peer->clusterRedirect(tPtr,_path,a,now);
 					} else if (++countPerScope[(int)a.ipScope()][0] <= ZT_PUSH_DIRECT_PATHS_MAX_PER_SCOPE_AND_FAMILY) {
 						peer->attemptToContactAt(tPtr,InetAddress(),a,now,false);
@@ -1533,12 +1581,33 @@ bool IncomingPacket::_doPUSH_DIRECT_PATHS(const RuntimeEnvironment *RR,void *tPt
 			case 6: {
 
 				const InetAddress a(field(ptr,16),16,at<uint16_t>(ptr + 16));
-				if (
-					((flags & ZT_PUSH_DIRECT_PATHS_FLAG_FORGET_PATH) == 0) && // not being told to forget
-						(!( ((flags & ZT_PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT) == 0) && (peer->hasActivePathTo(now,a)) )) && // not already known
-						(RR->node->shouldUsePathForZeroTierTraffic(tPtr,peer->address(),_path->localSocket(),a)) ) // should use path
+				const bool forgetPath = ((flags & ZT_PUSH_DIRECT_PATHS_FLAG_FORGET_PATH) != 0);
+				const bool clusterRedirect = ((flags & ZT_PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT) != 0);
+				const bool alreadyActive = (!clusterRedirect && peer->hasActivePathTo(now,a));
+				const bool accepted = RR->node->shouldUsePathForZeroTierTraffic(tPtr,peer->address(),_path->localSocket(),a);
+#ifdef __WINDOWS__
 				{
-					if ((flags & ZT_PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT) != 0) {
+					char peerBuf[11];
+					char addrBuf[64];
+					fprintf(stderr,
+						"[ZT/PEER] push_direct_candidate peer=%s family=6 addr=%s flags=0x%02x forget=%d cluster=%d already_active=%d accepted=%d scope=%d\n",
+						peer->address().toString(peerBuf),
+						a.toString(addrBuf),
+						(unsigned int)flags,
+						forgetPath ? 1 : 0,
+						clusterRedirect ? 1 : 0,
+						alreadyActive ? 1 : 0,
+						accepted ? 1 : 0,
+						(int)a.ipScope());
+					fflush(stderr);
+				}
+#endif
+				if (
+					(!forgetPath) && // not being told to forget
+						(!alreadyActive) && // not already known
+						accepted ) // should use path
+				{
+					if (clusterRedirect) {
 						peer->clusterRedirect(tPtr,_path,a,now);
 					} else if (++countPerScope[(int)a.ipScope()][1] <= ZT_PUSH_DIRECT_PATHS_MAX_PER_SCOPE_AND_FAMILY) {
 						peer->attemptToContactAt(tPtr,InetAddress(),a,now,false);

@@ -1130,6 +1130,7 @@ bool Switch::_shouldUnite(const int64_t now,const Address &source,const Address 
 bool Switch::_trySend(void *tPtr,Packet &packet,bool encrypt,int32_t flowId)
 {
 	SharedPtr<Path> viaPath;
+	bool viaRelay = false;
 	const int64_t now = RR->node->now();
 	const Address destination(packet.destination());
 
@@ -1149,15 +1150,64 @@ bool Switch::_trySend(void *tPtr,Packet &packet,bool encrypt,int32_t flowId)
 		} else {
 			viaPath = peer->getAppropriatePath(now,false,flowId);
 			if (!viaPath) {
+				// If we know the peer identity but have no usable physical path,
+				// refresh WHOIS as well as trying cached paths. Without this a
+				// pathless peer can keep relaying for a long time after its
+				// endpoint changes or after both sides restart behind NAT.
+				requestWhois(tPtr,now,destination);
 				peer->tryMemorizedPath(tPtr,now); // periodically attempt memorized or statically defined paths, if any are known
 				const SharedPtr<Peer> relay(RR->topology->getUpstreamPeer());
 				if ( (!relay) || (!(viaPath = relay->getAppropriatePath(now,false,flowId))) ) {
 					if (!(viaPath = peer->getAppropriatePath(now,true,flowId))) {
 						return false;
 					}
+				} else {
+					viaRelay = true;
+#if (defined(_WIN32) || defined(_WIN64))
+					SharedPtr<Path> bestIpv4RelayPath;
+					long bestIpv4RelayQuality = 2147483647;
+					const std::vector<Address> upstreams(RR->topology->upstreamAddresses());
+					for(std::vector<Address>::const_iterator a(upstreams.begin());a != upstreams.end();++a) {
+						const SharedPtr<Peer> upstreamPeer(RR->topology->getPeer(tPtr,*a));
+						if (!upstreamPeer) {
+							continue;
+						}
+						Mutex::Lock _l(upstreamPeer->_paths_m);
+						for(unsigned int i=0;i<ZT_MAX_PEER_NETWORK_PATHS;++i) {
+							if (!upstreamPeer->_paths[i].p) {
+								break;
+							}
+							if ((upstreamPeer->_paths[i].p->address().ss_family == AF_INET) && (upstreamPeer->_paths[i].p->alive(now))) {
+								const long q = upstreamPeer->_paths[i].p->quality(now) / upstreamPeer->_paths[i].priority;
+								if (q <= bestIpv4RelayQuality) {
+									bestIpv4RelayQuality = q;
+									bestIpv4RelayPath = upstreamPeer->_paths[i].p;
+								}
+							}
+						}
+					}
+					if (bestIpv4RelayPath) {
+						viaPath = bestIpv4RelayPath;
+					}
+#endif
 				}
 			}
 			if (viaPath) {
+#if (defined(_WIN32) || defined(_WIN64))
+				if ((packet.verb() == Packet::VERB_FRAME) || (packet.verb() == Packet::VERB_EXT_FRAME) || viaRelay) {
+					char dstBuf[11];
+					char pathBuf[64];
+					fprintf(stderr,
+						"[ZT/PEER] send_path destination=%s verb=%u via=%s remote=%s local_socket=%lld flow=%d\n",
+						destination.toString(dstBuf),
+						(unsigned int)packet.verb(),
+						viaRelay ? "relay" : "direct",
+						viaPath->address().toString(pathBuf),
+						(long long)viaPath->localSocket(),
+						(int)flowId);
+					fflush(stderr);
+				}
+#endif
 				uint16_t userSpecifiedMtu = viaPath->mtu();
 				_sendViaSpecificPath(tPtr,peer,viaPath,userSpecifiedMtu,now,packet,encrypt,flowId);
 				return true;

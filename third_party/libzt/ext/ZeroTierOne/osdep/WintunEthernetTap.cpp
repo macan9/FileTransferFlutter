@@ -9,6 +9,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "OSUtils.hpp"
+
 namespace ZeroTier {
 
 namespace {
@@ -17,6 +19,9 @@ const unsigned int kEtherTypeIpv4 = 0x0800;
 const unsigned int kEtherTypeArp = 0x0806;
 const unsigned int kEtherTypeIpv6 = 0x86dd;
 const size_t kMaxPendingIpv4Packets = 512;
+const uint64_t kPendingIpv4RetryInterval = 1000;
+const uint64_t kPendingIpv4MaxAge = 15000;
+const uint64_t kStatsLogInterval = 10000;
 
 std::string wideToUtf8(const std::wstring &value)
 {
@@ -152,6 +157,17 @@ bool isIpv6Multicast(const BYTE *packet,DWORD packetSize)
 MAC ipv6MulticastToMac(const BYTE *packet)
 {
 	return MAC(0x33,0x33,packet[36],packet[37],packet[38],packet[39]);
+}
+
+std::string ipv4ToString(uint32_t ip)
+{
+	char buffer[INET_ADDRSTRLEN] = { 0 };
+	in_addr address;
+	address.s_addr = ip;
+	if (InetNtopA(AF_INET,&address,buffer,sizeof(buffer)) == nullptr) {
+		return std::string("0.0.0.0");
+	}
+	return std::string(buffer);
 }
 
 } // namespace
@@ -362,14 +378,19 @@ void WintunEthernetTap::stopSession()
 		static_cast<unsigned long>(_ifIndex),
 		static_cast<unsigned long long>(_rxPackets),
 		static_cast<unsigned long long>(_rxBytes));
-	fprintf(stderr,"[ZT/WINTUN] dataplane_stats injected_packets=%llu injected_bytes=%llu queued_packets=%llu dropped_packets=%llu\n",
+	fprintf(stderr,"[ZT/WINTUN] dataplane_stats injected_packets=%llu injected_bytes=%llu queued_packets=%llu flushed_packets=%llu arp_queries_sent=%llu arp_replies_received=%llu arp_responses_sent=%llu dropped_packets=%llu\n",
 		static_cast<unsigned long long>(_injectedPackets),
 		static_cast<unsigned long long>(_injectedBytes),
 		static_cast<unsigned long long>(_queuedPackets),
+		static_cast<unsigned long long>(_flushedPackets),
+		static_cast<unsigned long long>(_arpQueriesSent),
+		static_cast<unsigned long long>(_arpRepliesReceived),
+		static_cast<unsigned long long>(_arpResponsesSent),
 		static_cast<unsigned long long>(_droppedPackets));
 	fprintf(stderr,"[ZT/WINTUN] wintun_tx_stats tx_packets=%llu tx_bytes=%llu\n",
 		static_cast<unsigned long long>(_txPackets),
 		static_cast<unsigned long long>(_txBytes));
+	maybeLogStats(true);
 }
 
 void WintunEthernetTap::closeAdapter()
@@ -403,11 +424,15 @@ void WintunEthernetTap::receiveLoop()
 			_rxBytes += packetSize;
 			handleInboundIpPacket(packet,packetSize);
 			_api.releaseReceivePacket(_session,packet);
+			processPendingIpv4Resolutions();
+			maybeLogStats(false);
 			continue;
 		}
 		const DWORD error = GetLastError();
 		if (error == ERROR_NO_MORE_ITEMS) {
-			const DWORD waitResult = WaitForMultipleObjects(2,waitHandles,FALSE,1000);
+			processPendingIpv4Resolutions();
+			maybeLogStats(false);
+			const DWORD waitResult = WaitForMultipleObjects(2,waitHandles,FALSE,250);
 			if (waitResult == WAIT_OBJECT_0) {
 				break;
 			}
@@ -423,6 +448,10 @@ void WintunEthernetTap::receiveLoop()
 void WintunEthernetTap::handleInboundIpPacket(const BYTE *packet,DWORD packetSize)
 {
 	if ((!packet)||(packetSize == 0)||(!_enabled)) {
+		if (!_enabled) {
+			++_dropDisabledPackets;
+			++_droppedPackets;
+		}
 		return;
 	}
 	const unsigned int version = (packet[0] >> 4) & 0x0f;
@@ -433,6 +462,7 @@ void WintunEthernetTap::handleInboundIpPacket(const BYTE *packet,DWORD packetSiz
 		handleInboundIpv6Packet(packet,packetSize);
 	}
 	else {
+		++_dropInvalidPackets;
 		++_droppedPackets;
 	}
 }
@@ -440,15 +470,18 @@ void WintunEthernetTap::handleInboundIpPacket(const BYTE *packet,DWORD packetSiz
 void WintunEthernetTap::handleInboundIpv4Packet(const BYTE *packet,DWORD packetSize)
 {
 	if (packetSize < 20) {
+		++_dropInvalidPackets;
 		++_droppedPackets;
 		return;
 	}
 	const unsigned int headerLen = static_cast<unsigned int>(packet[0] & 0x0f) * 4;
 	if (headerLen < 20 || packetSize < headerLen) {
+		++_dropInvalidPackets;
 		++_droppedPackets;
 		return;
 	}
 	if (packetSize > ZT_MAX_MTU) {
+		++_dropInvalidPackets;
 		++_droppedPackets;
 		return;
 	}
@@ -458,7 +491,7 @@ void WintunEthernetTap::handleInboundIpv4Packet(const BYTE *packet,DWORD packetS
 	memcpy(&sourceIp,packet + 12,4);
 	memcpy(&targetIp,packet + 16,4);
 
-	if (isIpv4BroadcastOrLimitedBroadcast(targetIp)) {
+	if (isIpv4BroadcastOrLimitedBroadcast(targetIp) || isAssignedIpv4Broadcast(targetIp)) {
 		sendFrameToZeroTier(MAC(0xffffffffffffULL),kEtherTypeIpv4,packet,packetSize);
 		return;
 	}
@@ -477,18 +510,20 @@ void WintunEthernetTap::handleInboundIpv4Packet(const BYTE *packet,DWORD packetS
 	}
 	if (queryLen > 0) {
 		sendFrameToZeroTier(queryDest,kEtherTypeArp,query,queryLen);
+		++_arpQueriesSent;
 	}
 	if (targetMac) {
 		sendFrameToZeroTier(targetMac,kEtherTypeIpv4,packet,packetSize);
 	}
 	else {
-		enqueueIpv4(targetIp,packet,packetSize);
+		enqueueIpv4(sourceIp,targetIp,packet,packetSize);
 	}
 }
 
 void WintunEthernetTap::handleInboundIpv6Packet(const BYTE *packet,DWORD packetSize)
 {
 	if (packetSize < 40 || packetSize > ZT_MAX_MTU) {
+		++_dropInvalidPackets;
 		++_droppedPackets;
 		return;
 	}
@@ -498,6 +533,7 @@ void WintunEthernetTap::handleInboundIpv6Packet(const BYTE *packet,DWORD packetS
 	}
 	// IPv6 unicast requires a Wintun L3 to ZeroTier L2 neighbor-discovery
 	// resolver. Keep this explicit until the ND queue is wired like IPv4 ARP.
+	++_dropUnsupportedPackets;
 	++_droppedPackets;
 }
 
@@ -513,8 +549,10 @@ void WintunEthernetTap::handleIncomingArpFrame(const void *data,unsigned int len
 	}
 	if (responseLen > 0) {
 		sendFrameToZeroTier(responseDest,kEtherTypeArp,response,responseLen);
+		++_arpResponsesSent;
 	}
 	if (learnedIp != 0) {
+		++_arpRepliesReceived;
 		MAC targetMac;
 		unsigned char ignoredQuery[ZT_ARP_BUF_LENGTH] = { 0 };
 		unsigned int ignoredQueryLen = 0;
@@ -524,9 +562,35 @@ void WintunEthernetTap::handleIncomingArpFrame(const void *data,unsigned int len
 			targetMac = _arp.query(_mac,0,learnedIp,ignoredQuery,ignoredQueryLen,ignoredQueryDest);
 		}
 		if (targetMac) {
+			char macString[18] = { 0 };
+			targetMac.toString(macString);
+			fprintf(stderr,"[ZT/WINTUN] arp_learned target=%s mac=%s peer=%010llx\n",
+				ipv4ToString(learnedIp).c_str(),
+				macString,
+				static_cast<unsigned long long>(targetMac.toAddress(_nwid).toInt()));
 			flushQueuedIpv4(learnedIp,targetMac);
 		}
 	}
+}
+
+bool WintunEthernetTap::isAssignedIpv4Broadcast(uint32_t ip) const
+{
+	Mutex::Lock lock(_assignedIpsMutex);
+	for (std::vector<InetAddress>::const_iterator it = _assignedIps.begin(); it != _assignedIps.end(); ++it) {
+		if ((!it->isV4())||(!it->netmaskBitsValid())) {
+			continue;
+		}
+		const InetAddress broadcast = it->broadcast();
+		if (!broadcast.isV4()) {
+			continue;
+		}
+		uint32_t broadcastIp = 0;
+		memcpy(&broadcastIp,broadcast.rawIpData(),4);
+		if (broadcastIp == ip) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void WintunEthernetTap::flushQueuedIpv4(uint32_t targetIp,const MAC &destination)
@@ -546,12 +610,24 @@ void WintunEthernetTap::flushQueuedIpv4(uint32_t targetIp,const MAC &destination
 	}
 	for (std::deque<PendingIpv4Packet>::const_iterator it = ready.begin(); it != ready.end(); ++it) {
 		sendFrameToZeroTier(destination,kEtherTypeIpv4,it->data,it->len);
+		++_flushedPackets;
+	}
+	if (!ready.empty()) {
+		fprintf(stderr,"[ZT/WINTUN] arp_resolved target=%s flushed=%llu\n",
+			ipv4ToString(targetIp).c_str(),
+			static_cast<unsigned long long>(ready.size()));
 	}
 }
 
 void WintunEthernetTap::sendFrameToZeroTier(const MAC &to,unsigned int etherType,const void *data,unsigned int len)
 {
 	if ((!_handler)||(!data)||(len == 0)||(!_enabled)) {
+		if (!_enabled) {
+			++_dropDisabledPackets;
+		}
+		else {
+			++_dropInvalidPackets;
+		}
 		++_droppedPackets;
 		return;
 	}
@@ -562,13 +638,25 @@ void WintunEthernetTap::sendFrameToZeroTier(const MAC &to,unsigned int etherType
 
 bool WintunEthernetTap::sendPacketToWintun(const void *data,unsigned int len)
 {
-	if ((!data)||(len == 0)||(len > 0xffff)||(!_enabled)||(!_sessionStarted)||(_session == nullptr)) {
+	if ((!data)||(len == 0)||(len > 0xffff)) {
+		++_dropInvalidPackets;
+		++_droppedPackets;
+		return false;
+	}
+	if (!_enabled) {
+		++_dropDisabledPackets;
+		++_droppedPackets;
+		return false;
+	}
+	if ((!_sessionStarted)||(_session == nullptr)) {
+		++_dropNoSessionPackets;
 		++_droppedPackets;
 		return false;
 	}
 	Mutex::Lock lock(_sendMutex);
 	BYTE *packet = _api.allocateSendPacket(_session,static_cast<DWORD>(len));
 	if (packet == nullptr) {
+		++_dropSendAllocPackets;
 		++_droppedPackets;
 		return false;
 	}
@@ -579,25 +667,124 @@ bool WintunEthernetTap::sendPacketToWintun(const void *data,unsigned int len)
 	return true;
 }
 
-void WintunEthernetTap::enqueueIpv4(uint32_t targetIp,const BYTE *packet,DWORD packetSize)
+void WintunEthernetTap::enqueueIpv4(uint32_t sourceIp,uint32_t targetIp,const BYTE *packet,DWORD packetSize)
 {
 	if ((!packet)||(packetSize == 0)||(packetSize > ZT_MAX_MTU)) {
+		++_dropInvalidPackets;
 		++_droppedPackets;
 		return;
 	}
 	PendingIpv4Packet pending;
+	pending.firstQueuedAt = OSUtils::now();
+	pending.lastQueryAt = 0;
 	pending.targetIp = targetIp;
+	pending.sourceIp = sourceIp;
 	pending.len = static_cast<unsigned int>(packetSize);
 	memcpy(pending.data,packet,packetSize);
 	{
 		Mutex::Lock lock(_pendingIpv4Mutex);
 		if (_pendingIpv4.size() >= kMaxPendingIpv4Packets) {
 			_pendingIpv4.pop_front();
+			++_dropQueueOverflowPackets;
 			++_droppedPackets;
 		}
 		_pendingIpv4.push_back(pending);
 	}
 	++_queuedPackets;
+}
+
+void WintunEthernetTap::sendArpQuery(uint32_t sourceIp,uint32_t targetIp)
+{
+	unsigned char query[ZT_ARP_BUF_LENGTH] = { 0 };
+	unsigned int queryLen = 0;
+	MAC queryDest;
+	{
+		Mutex::Lock lock(_arpMutex);
+		_arp.query(_mac,sourceIp,targetIp,query,queryLen,queryDest);
+	}
+	if (queryLen > 0) {
+		sendFrameToZeroTier(queryDest,kEtherTypeArp,query,queryLen);
+		++_arpQueriesSent;
+	}
+}
+
+void WintunEthernetTap::processPendingIpv4Resolutions()
+{
+	struct Retry
+	{
+		uint32_t sourceIp;
+		uint32_t targetIp;
+	};
+	std::vector<Retry> retries;
+	const uint64_t now = OSUtils::now();
+	{
+		Mutex::Lock lock(_pendingIpv4Mutex);
+		for (std::deque<PendingIpv4Packet>::iterator it = _pendingIpv4.begin(); it != _pendingIpv4.end();) {
+			if ((it->firstQueuedAt == 0)||(now < it->firstQueuedAt)) {
+				it->firstQueuedAt = now;
+			}
+			const uint64_t age = now - it->firstQueuedAt;
+			if (age >= kPendingIpv4MaxAge) {
+				fprintf(stderr,"[ZT/WINTUN] arp_pending_timeout target=%s age_ms=%llu retries=%u len=%u\n",
+					ipv4ToString(it->targetIp).c_str(),
+					static_cast<unsigned long long>(age),
+					it->retries,
+					it->len);
+				it = _pendingIpv4.erase(it);
+				++_dropQueueTimeoutPackets;
+				++_droppedPackets;
+				continue;
+			}
+			if ((it->lastQueryAt == 0)||((now - it->lastQueryAt) >= kPendingIpv4RetryInterval)) {
+				Retry retry;
+				retry.sourceIp = it->sourceIp;
+				retry.targetIp = it->targetIp;
+				retries.push_back(retry);
+				it->lastQueryAt = now;
+				++it->retries;
+			}
+			++it;
+		}
+	}
+	for (std::vector<Retry>::const_iterator it = retries.begin(); it != retries.end(); ++it) {
+		sendArpQuery(it->sourceIp,it->targetIp);
+	}
+}
+
+void WintunEthernetTap::maybeLogStats(bool force)
+{
+	const uint64_t now = OSUtils::now();
+	if ((!force)&&(_lastStatsLogAt != 0)&&((now - _lastStatsLogAt) < kStatsLogInterval)) {
+		return;
+	}
+	_lastStatsLogAt = now;
+	size_t pendingCount = 0;
+	{
+		Mutex::Lock lock(_pendingIpv4Mutex);
+		pendingCount = _pendingIpv4.size();
+	}
+	fprintf(stderr,
+		"[ZT/WINTUN] stats rx=%llu/%llu injected=%llu/%llu tx=%llu/%llu queued=%llu pending=%llu flushed=%llu arp_query=%llu arp_reply=%llu arp_resp=%llu drops=%llu invalid=%llu disabled=%llu overflow=%llu timeout=%llu no_session=%llu send_alloc=%llu unsupported=%llu\n",
+		static_cast<unsigned long long>(_rxPackets),
+		static_cast<unsigned long long>(_rxBytes),
+		static_cast<unsigned long long>(_injectedPackets),
+		static_cast<unsigned long long>(_injectedBytes),
+		static_cast<unsigned long long>(_txPackets),
+		static_cast<unsigned long long>(_txBytes),
+		static_cast<unsigned long long>(_queuedPackets),
+		static_cast<unsigned long long>(pendingCount),
+		static_cast<unsigned long long>(_flushedPackets),
+		static_cast<unsigned long long>(_arpQueriesSent),
+		static_cast<unsigned long long>(_arpRepliesReceived),
+		static_cast<unsigned long long>(_arpResponsesSent),
+		static_cast<unsigned long long>(_droppedPackets),
+		static_cast<unsigned long long>(_dropInvalidPackets),
+		static_cast<unsigned long long>(_dropDisabledPackets),
+		static_cast<unsigned long long>(_dropQueueOverflowPackets),
+		static_cast<unsigned long long>(_dropQueueTimeoutPackets),
+		static_cast<unsigned long long>(_dropNoSessionPackets),
+		static_cast<unsigned long long>(_dropSendAllocPackets),
+		static_cast<unsigned long long>(_dropUnsupportedPackets));
 }
 
 void WintunEthernetTap::setEnabled(bool en)

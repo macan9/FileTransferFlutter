@@ -1161,6 +1161,9 @@ std::string FirewallRuleNameForProgram(const std::filesystem::path& program_path
   return stream.str();
 }
 
+bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code,
+                         bool allow_privileged_executor);
+
 bool EnsureFirewallRulesForCurrentHostExe(DWORD* helper_exit_code,
                                           std::string* helper_debug) {
   if (helper_exit_code != nullptr) {
@@ -1194,8 +1197,43 @@ bool EnsureFirewallRulesForCurrentHostExe(DWORD* helper_exit_code,
   const bool loaded = RunStandaloneMountHelperRequest(request, &response,
                                                       &launch_error,
                                                       &helper_detail);
+  DWORD effective_exit_code = loaded ? response.service_error : launch_error;
+  bool fallback_attempted = false;
+  bool fallback_ok = false;
+  DWORD fallback_exit_code = ERROR_GEN_FAILURE;
+  if (!(loaded && (response.result ==
+                       static_cast<uint32_t>(ztwin::privileged_mount::Result::kSuccess) ||
+                   response.result ==
+                       static_cast<uint32_t>(ztwin::privileged_mount::Result::kAlreadyExists)))) {
+    const std::string exe = EscapePowerShellDoubleQuotedLiteral(exe_path.wstring());
+    const std::string in_name = FirewallRuleNameForProgram(exe_path,"Inbound");
+    const std::string out_name = FirewallRuleNameForProgram(exe_path,"Outbound");
+    const std::string script =
+        "$ErrorActionPreference='Stop'\n"
+        "$exe=\"" + exe + "\"\n"
+        "$inName=\"" + in_name + "\"\n"
+        "$outName=\"" + out_name + "\"\n"
+        "function Ensure-UdpProgramRule([string]$name,[string]$direction,[string]$program){\n"
+        "  $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Select-Object -First 1\n"
+        "  if ($rule) {\n"
+        "    $app = ($rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue | Select-Object -First 1).Program\n"
+        "    $port = ($rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue | Select-Object -First 1).Protocol\n"
+        "    if ($rule.Direction -eq $direction -and $rule.Action -eq 'Allow' -and $app -ieq $program -and ($port -eq 'UDP' -or $port -eq 17)) { return 'present' }\n"
+        "    $rule | Remove-NetFirewallRule -ErrorAction Stop | Out-Null\n"
+        "  }\n"
+        "  New-NetFirewallRule -DisplayName $name -Direction $direction -Program $program -Protocol UDP -Action Allow -Profile Any -ErrorAction Stop | Out-Null\n"
+        "  return 'created'\n"
+        "}\n"
+        "Ensure-UdpProgramRule $inName 'Inbound' $exe | Out-String | Write-Output\n"
+        "Ensure-UdpProgramRule $outName 'Outbound' $exe | Out-String | Write-Output\n";
+    fallback_attempted = true;
+    fallback_ok = RunPowerShellScript(Utf8ToWide(script), &fallback_exit_code, true);
+    if (fallback_ok && fallback_exit_code == NO_ERROR) {
+      effective_exit_code = NO_ERROR;
+    }
+  }
   if (helper_exit_code != nullptr) {
-    *helper_exit_code = loaded ? response.service_error : launch_error;
+    *helper_exit_code = effective_exit_code;
   }
   if (helper_debug != nullptr) {
     std::ostringstream stream;
@@ -1213,12 +1251,13 @@ bool EnsureFirewallRulesForCurrentHostExe(DWORD* helper_exit_code,
         stream << " response=" << message;
       }
     }
+    if (fallback_attempted) {
+      stream << " fallback_powershell=" << BoolLabel(fallback_ok)
+             << " fallback_exit_code=" << fallback_exit_code;
+    }
     *helper_debug = stream.str();
   }
-  return loaded && (response.result ==
-                        static_cast<uint32_t>(ztwin::privileged_mount::Result::kSuccess) ||
-                    response.result ==
-                        static_cast<uint32_t>(ztwin::privileged_mount::Result::kAlreadyExists));
+  return effective_exit_code == NO_ERROR;
 }
 
 bool RunPowerShellScript(const std::wstring& script, DWORD* exit_code,
