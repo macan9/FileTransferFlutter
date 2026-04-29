@@ -32,6 +32,9 @@
 #if defined(__WINDOWS__) && defined(ZTS_ENABLE_WINDOWS_OS_TAP)
 #include "../ext/ZeroTierOne/osdep/WindowsEthernetTap.hpp"
 #endif
+#if defined(__WINDOWS__) && !defined(ZTS_ENABLE_WINDOWS_OS_TAP)
+#include "../ext/ZeroTierOne/osdep/WintunEthernetTap.hpp"
+#endif
 
 #if defined(__WINDOWS__)
 #include <iphlpapi.h>
@@ -1022,6 +1025,24 @@ EthernetTap* NodeService::createNetworkTap(uint64_t net_id, const ZT_VirtualNetw
         return (EthernetTap*)0;
     }
 #else
+    try {
+        return new WintunEthernetTap(
+            _homePath.c_str(),
+            MAC(nwc->mac),
+            nwc->mtu,
+            (unsigned int)ZT_IF_METRIC,
+            net_id,
+            nwc->name,
+            StapFrameHandler,
+            (void*)this);
+    }
+    catch (const std::exception& e) {
+        fprintf(
+            stderr,
+            "ERROR: tapFactory wintun_ethernet_tap error=%s net=%llx fallback=VirtualTap\n",
+            e.what(),
+            (unsigned long long)net_id);
+    }
 #endif
 #endif
     return new VirtualTap(

@@ -573,6 +573,12 @@ file(GLOB ztcoreSrcGlob ${ZTO_SRC_DIR}/node/*.cpp
 list(APPEND ztcoreSrcGlob
     ${ZTO_SRC_DIR}/osdep/EthernetTap.cpp)
 
+if(BUILD_WIN)
+list(APPEND ztcoreSrcGlob
+    ${ZTO_SRC_DIR}/osdep/Arp.cpp
+    ${ZTO_SRC_DIR}/osdep/WintunEthernetTap.cpp)
+endif()
+
 if(BUILD_WIN AND ZTS_ENABLE_WINDOWS_OS_TAP)
 list(APPEND ztcoreSrcGlob
     ${ZTO_SRC_DIR}/osdep/WindowsEthernetTap.cpp
