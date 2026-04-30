@@ -43,6 +43,12 @@ flutter:
   assets:
     - app_env.json
     - assets/icon/tray_icon.ico
+    - assets/tray_menu/open.png
+    - assets/tray_menu/network.png
+    - assets/tray_menu/private.png
+    - assets/tray_menu/transfer.png
+    - assets/tray_menu/settings.png
+    - assets/tray_menu/exit.png
     - assets/tray_menu/open.bmp
     - assets/tray_menu/network.bmp
     - assets/tray_menu/private.bmp

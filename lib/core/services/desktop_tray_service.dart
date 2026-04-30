@@ -12,12 +12,12 @@ class DesktopTrayService with TrayListener {
   DesktopTrayService._();
 
   static const String _trayIconPath = 'assets/icon/tray_icon.ico';
-  static const String _openIconPath = 'assets/tray_menu/open.bmp';
-  static const String _networkIconPath = 'assets/tray_menu/network.bmp';
-  static const String _privateIconPath = 'assets/tray_menu/private.bmp';
-  static const String _transferIconPath = 'assets/tray_menu/transfer.bmp';
-  static const String _settingsIconPath = 'assets/tray_menu/settings.bmp';
-  static const String _exitIconPath = 'assets/tray_menu/exit.bmp';
+  static const String _openIconPath = 'assets/tray_menu/open.png';
+  static const String _networkIconPath = 'assets/tray_menu/network.png';
+  static const String _privateIconPath = 'assets/tray_menu/private.png';
+  static const String _transferIconPath = 'assets/tray_menu/transfer.png';
+  static const String _settingsIconPath = 'assets/tray_menu/settings.png';
+  static const String _exitIconPath = 'assets/tray_menu/exit.png';
 
   static DesktopTrayService? _instance;
   static bool _isQuitting = false;

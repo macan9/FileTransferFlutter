@@ -3,7 +3,9 @@
 // This must be included before many other Windows headers.
 #include <stdio.h>
 #include <windows.h>
+#include <windowsx.h>
 
+#include <gdiplus.h>
 #include <shellapi.h>
 #include <strsafe.h>
 
@@ -16,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <vector>
 
 #define WM_MYMESSAGE (WM_USER + 1)
@@ -30,10 +33,38 @@ const flutter::EncodableValue* ValueOrNull(const flutter::EncodableMap& map,
   }
   return &(it->second);
 }
+
+void FillRoundedRectangle(Gdiplus::Graphics* graphics,
+                          Gdiplus::Brush* brush,
+                          Gdiplus::REAL x,
+                          Gdiplus::REAL y,
+                          Gdiplus::REAL width,
+                          Gdiplus::REAL height,
+                          Gdiplus::REAL radius) {
+  Gdiplus::GraphicsPath path;
+  const Gdiplus::REAL diameter = radius * 2.0f;
+  path.AddArc(x, y, diameter, diameter, 180.0f, 90.0f);
+  path.AddArc(x + width - diameter, y, diameter, diameter, 270.0f, 90.0f);
+  path.AddArc(x + width - diameter, y + height - diameter, diameter, diameter,
+              0.0f, 90.0f);
+  path.AddArc(x, y + height - diameter, diameter, diameter, 90.0f, 90.0f);
+  path.CloseFigure();
+  graphics->FillPath(brush, &path);
+}
+
 std::unique_ptr<
     flutter::MethodChannel<flutter::EncodableValue>,
     std::default_delete<flutter::MethodChannel<flutter::EncodableValue>>>
     channel = nullptr;
+
+struct OwnerDrawMenuItem {
+  int id = 0;
+  std::wstring label;
+  std::wstring icon_path;
+  bool disabled = false;
+  bool checked = false;
+  bool separator = false;
+};
 
 class TrayManagerPlugin : public flutter::Plugin {
  public:
@@ -49,10 +80,14 @@ class TrayManagerPlugin : public flutter::Plugin {
   flutter::PluginRegistrarWindows* registrar;
   NOTIFYICONDATA nid;
   NOTIFYICONIDENTIFIER niif;
+  ULONG_PTR gdiplus_token = 0;
   // do create pop-up menu only once.
   HMENU hMenu = CreatePopupMenu();
   HWND menu_owner_window = nullptr;
+  HWND custom_menu_window = nullptr;
   std::vector<HBITMAP> menu_bitmaps;
+  std::vector<std::unique_ptr<OwnerDrawMenuItem>> owner_draw_menu_items;
+  int custom_menu_hover_index = -1;
   bool tray_icon_setted = false;
   UINT windows_taskbar_created_message_id = 0;
 
@@ -62,9 +97,22 @@ class TrayManagerPlugin : public flutter::Plugin {
   void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args);
   void TrayManagerPlugin::_ApplyIcon();
   void TrayManagerPlugin::_ClearMenuBitmaps();
+  void TrayManagerPlugin::_ClearOwnerDrawMenuItems();
+  std::wstring TrayManagerPlugin::_ResolveAssetPath(const std::string& asset);
   HBITMAP TrayManagerPlugin::_LoadMenuBitmap(const std::string& icon);
+  bool TrayManagerPlugin::_MeasureOwnerDrawMenuItem(MEASUREITEMSTRUCT* measure);
+  bool TrayManagerPlugin::_DrawOwnerDrawMenuItem(DRAWITEMSTRUCT* draw);
   HWND TrayManagerPlugin::_GetMenuOwnerWindow();
+  HWND TrayManagerPlugin::_GetCustomMenuWindow();
+  SIZE TrayManagerPlugin::_MeasureCustomMenu();
+  int TrayManagerPlugin::_HitTestCustomMenu(int y);
+  void TrayManagerPlugin::_PaintCustomMenu(HWND hwnd);
+  void TrayManagerPlugin::_ShowCustomMenu(int x, int y);
+  void TrayManagerPlugin::_HideCustomMenu();
+  void TrayManagerPlugin::_InvokeCustomMenuItem(int index);
   static LRESULT CALLBACK TrayManagerPlugin::_MenuOwnerWndProc(
+      HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+  static LRESULT CALLBACK TrayManagerPlugin::_CustomMenuWndProc(
       HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 
   // Called for top-level WindowProc delegation.
@@ -125,6 +173,8 @@ void TrayManagerPlugin::RegisterWithRegistrar(
 
 TrayManagerPlugin::TrayManagerPlugin(flutter::PluginRegistrarWindows* registrar)
     : registrar(registrar) {
+  Gdiplus::GdiplusStartupInput startup_input;
+  Gdiplus::GdiplusStartup(&gdiplus_token, &startup_input, nullptr);
   window_proc_id = registrar->RegisterTopLevelWindowProcDelegate(
       [this](HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
         return HandleWindowProc(hwnd, message, wparam, lparam);
@@ -133,11 +183,20 @@ TrayManagerPlugin::TrayManagerPlugin(flutter::PluginRegistrarWindows* registrar)
 }
 
 TrayManagerPlugin::~TrayManagerPlugin() {
+  if (custom_menu_window != nullptr) {
+    DestroyWindow(custom_menu_window);
+    custom_menu_window = nullptr;
+  }
   if (menu_owner_window != nullptr) {
     DestroyWindow(menu_owner_window);
     menu_owner_window = nullptr;
   }
   _ClearMenuBitmaps();
+  _ClearOwnerDrawMenuItems();
+  if (gdiplus_token != 0) {
+    Gdiplus::GdiplusShutdown(gdiplus_token);
+    gdiplus_token = 0;
+  }
   registrar->UnregisterTopLevelWindowProcDelegate(window_proc_id);
 }
 
@@ -152,6 +211,18 @@ LRESULT CALLBACK TrayManagerPlugin::_MenuOwnerWndProc(HWND hwnd, UINT message,
 
   auto plugin = reinterpret_cast<TrayManagerPlugin*>(
       GetWindowLongPtr(hwnd, GWLP_USERDATA));
+  if (plugin != nullptr && message == WM_MEASUREITEM) {
+    if (plugin->_MeasureOwnerDrawMenuItem(
+            reinterpret_cast<MEASUREITEMSTRUCT*>(lparam))) {
+      return TRUE;
+    }
+  }
+  if (plugin != nullptr && message == WM_DRAWITEM) {
+    if (plugin->_DrawOwnerDrawMenuItem(
+            reinterpret_cast<DRAWITEMSTRUCT*>(lparam))) {
+      return TRUE;
+    }
+  }
   if (plugin != nullptr && message == WM_COMMAND) {
     flutter::EncodableMap eventData = flutter::EncodableMap();
     eventData[flutter::EncodableValue("id")] =
@@ -188,6 +259,106 @@ HWND TrayManagerPlugin::_GetMenuOwnerWindow() {
   return menu_owner_window;
 }
 
+HWND TrayManagerPlugin::_GetCustomMenuWindow() {
+  if (custom_menu_window != nullptr) {
+    return custom_menu_window;
+  }
+
+  constexpr const wchar_t kCustomMenuWindowClassName[] =
+      L"TRAY_MANAGER_CUSTOM_MENU_WINDOW";
+  static bool class_registered = false;
+  if (!class_registered) {
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = TrayManagerPlugin::_CustomMenuWndProc;
+    window_class.hInstance = GetModuleHandle(nullptr);
+    window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    window_class.lpszClassName = kCustomMenuWindowClassName;
+    RegisterClassW(&window_class);
+    class_registered = true;
+  }
+
+  custom_menu_window = CreateWindowExW(
+      WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
+      kCustomMenuWindowClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
+      GetModuleHandle(nullptr), this);
+  SetLayeredWindowAttributes(custom_menu_window, 0, 245, LWA_ALPHA);
+  return custom_menu_window;
+}
+
+LRESULT CALLBACK TrayManagerPlugin::_CustomMenuWndProc(HWND hwnd, UINT message,
+                                                       WPARAM wparam,
+                                                       LPARAM lparam) {
+  if (message == WM_NCCREATE) {
+    auto create_struct = reinterpret_cast<CREATESTRUCT*>(lparam);
+    SetWindowLongPtr(hwnd, GWLP_USERDATA,
+                     reinterpret_cast<LONG_PTR>(create_struct->lpCreateParams));
+  }
+
+  auto plugin = reinterpret_cast<TrayManagerPlugin*>(
+      GetWindowLongPtr(hwnd, GWLP_USERDATA));
+
+  switch (message) {
+    case WM_PAINT:
+      if (plugin != nullptr) {
+        plugin->_PaintCustomMenu(hwnd);
+        return 0;
+      }
+      break;
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_MOUSEMOVE:
+      if (plugin != nullptr) {
+        int hover_index =
+            plugin->_HitTestCustomMenu(GET_Y_LPARAM(lparam));
+        if (hover_index != plugin->custom_menu_hover_index) {
+          plugin->custom_menu_hover_index = hover_index;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT event{};
+        event.cbSize = sizeof(TRACKMOUSEEVENT);
+        event.dwFlags = TME_LEAVE;
+        event.hwndTrack = hwnd;
+        TrackMouseEvent(&event);
+        return 0;
+      }
+      break;
+    case WM_MOUSELEAVE:
+      if (plugin != nullptr) {
+        plugin->custom_menu_hover_index = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      break;
+    case WM_LBUTTONUP:
+      if (plugin != nullptr) {
+        plugin->_InvokeCustomMenuItem(
+            plugin->_HitTestCustomMenu(GET_Y_LPARAM(lparam)));
+        return 0;
+      }
+      break;
+    case WM_ACTIVATE:
+      if (plugin != nullptr && LOWORD(wparam) == WA_INACTIVE) {
+        plugin->_HideCustomMenu();
+        return 0;
+      }
+      break;
+    case WM_KILLFOCUS:
+      if (plugin != nullptr) {
+        plugin->_HideCustomMenu();
+        return 0;
+      }
+      break;
+    case WM_KEYDOWN:
+      if (plugin != nullptr && wparam == VK_ESCAPE) {
+        plugin->_HideCustomMenu();
+        return 0;
+      }
+      break;
+  }
+
+  return DefWindowProc(hwnd, message, wparam, lparam);
+}
+
 void TrayManagerPlugin::_ClearMenuBitmaps() {
   for (HBITMAP bitmap : menu_bitmaps) {
     DeleteObject(bitmap);
@@ -195,30 +366,71 @@ void TrayManagerPlugin::_ClearMenuBitmaps() {
   menu_bitmaps.clear();
 }
 
+void TrayManagerPlugin::_ClearOwnerDrawMenuItems() {
+  owner_draw_menu_items.clear();
+}
+
+std::wstring TrayManagerPlugin::_ResolveAssetPath(const std::string& asset) {
+  wchar_t module_path[MAX_PATH];
+  DWORD path_length = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+  if (path_length == 0 || path_length >= MAX_PATH) {
+    return L"";
+  }
+
+  std::wstring asset_path(module_path, path_length);
+  size_t slash_index = asset_path.find_last_of(L"\\/");
+  if (slash_index != std::wstring::npos) {
+    asset_path = asset_path.substr(0, slash_index);
+  }
+  asset_path += L"\\data\\flutter_assets\\";
+  asset_path += g_converter.from_bytes(asset);
+  return asset_path;
+}
+
 HBITMAP TrayManagerPlugin::_LoadMenuBitmap(const std::string& icon) {
   if (icon.empty()) {
     return nullptr;
   }
 
-  wchar_t module_path[MAX_PATH];
-  DWORD path_length = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
-  if (path_length == 0 || path_length >= MAX_PATH) {
+  std::wstring icon_path = _ResolveAssetPath(icon);
+  if (icon_path.empty()) {
     return nullptr;
   }
-
-  std::wstring icon_path(module_path, path_length);
-  size_t slash_index = icon_path.find_last_of(L"\\/");
-  if (slash_index != std::wstring::npos) {
-    icon_path = icon_path.substr(0, slash_index);
-  }
-  icon_path += L"\\data\\flutter_assets\\";
-  icon_path += g_converter.from_bytes(icon);
 
   int bitmap_size = GetSystemMetrics(SM_CYMENU);
   if (bitmap_size < 24) {
     bitmap_size = 24;
-  } else if (bitmap_size > 32) {
-    bitmap_size = 32;
+  } else if (bitmap_size > 36) {
+    bitmap_size = 36;
+  }
+
+  if (gdiplus_token != 0) {
+    Gdiplus::Bitmap source(icon_path.c_str());
+    if (source.GetLastStatus() == Gdiplus::Ok) {
+      Gdiplus::Bitmap resized(bitmap_size, bitmap_size,
+                              PixelFormat32bppPARGB);
+      Gdiplus::Graphics graphics(&resized);
+      graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+      graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+      graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+      graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+      graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+      graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+      const int draw_size = static_cast<int>(bitmap_size * 1.16);
+      const int draw_offset_x = bitmap_size - draw_size;
+      const int draw_offset_y = (bitmap_size - draw_size) / 2;
+      graphics.DrawImage(
+          &source,
+          Gdiplus::Rect(draw_offset_x, draw_offset_y, draw_size, draw_size));
+
+      HBITMAP bitmap = nullptr;
+      if (resized.GetHBITMAP(Gdiplus::Color(0, 0, 0, 0), &bitmap) ==
+              Gdiplus::Ok &&
+          bitmap != nullptr) {
+        menu_bitmaps.push_back(bitmap);
+        return bitmap;
+      }
+    }
   }
 
   HBITMAP bitmap = static_cast<HBITMAP>(
@@ -228,6 +440,306 @@ HBITMAP TrayManagerPlugin::_LoadMenuBitmap(const std::string& icon) {
     menu_bitmaps.push_back(bitmap);
   }
   return bitmap;
+}
+
+bool TrayManagerPlugin::_MeasureOwnerDrawMenuItem(
+    MEASUREITEMSTRUCT* measure) {
+  if (measure == nullptr || measure->CtlType != ODT_MENU) {
+    return false;
+  }
+
+  auto* item = reinterpret_cast<OwnerDrawMenuItem*>(measure->itemData);
+  if (item == nullptr) {
+    return false;
+  }
+
+  if (item->separator) {
+    measure->itemWidth = 1;
+    measure->itemHeight = 9;
+    return true;
+  }
+
+  HDC hdc = GetDC(nullptr);
+  HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HFONT old_font = static_cast<HFONT>(SelectObject(hdc, font));
+  SIZE text_size = {0, 0};
+  GetTextExtentPoint32W(hdc, item->label.c_str(),
+                        static_cast<int>(item->label.length()), &text_size);
+  SelectObject(hdc, old_font);
+  ReleaseDC(nullptr, hdc);
+
+  const UINT icon_left = 10;
+  const UINT icon_size = 20;
+  const UINT text_gap = 7;
+  const UINT text_right_padding = 18;
+  measure->itemWidth =
+      icon_left + icon_size + text_gap + text_size.cx + text_right_padding;
+  measure->itemHeight = 30;
+  return true;
+}
+
+bool TrayManagerPlugin::_DrawOwnerDrawMenuItem(DRAWITEMSTRUCT* draw) {
+  if (draw == nullptr || draw->CtlType != ODT_MENU) {
+    return false;
+  }
+
+  auto* item = reinterpret_cast<OwnerDrawMenuItem*>(draw->itemData);
+  if (item == nullptr) {
+    return false;
+  }
+
+  HDC hdc = draw->hDC;
+  RECT rect = draw->rcItem;
+
+  HBRUSH menu_brush = CreateSolidBrush(GetSysColor(COLOR_MENU));
+  FillRect(hdc, &rect, menu_brush);
+  DeleteObject(menu_brush);
+
+  if (item->separator) {
+    RECT line_rect = rect;
+    line_rect.left += 10;
+    line_rect.right -= 8;
+    line_rect.top += (rect.bottom - rect.top) / 2;
+    line_rect.bottom = line_rect.top + 1;
+    HBRUSH line_brush = CreateSolidBrush(RGB(225, 225, 225));
+    FillRect(hdc, &line_rect, line_brush);
+    DeleteObject(line_brush);
+    return true;
+  }
+
+  const bool selected = (draw->itemState & ODS_SELECTED) != 0;
+  if (selected && !item->disabled) {
+    RECT selected_rect = rect;
+    selected_rect.left += 3;
+    selected_rect.right -= 3;
+    HBRUSH selected_brush = CreateSolidBrush(RGB(238, 238, 238));
+    FillRect(hdc, &selected_rect, selected_brush);
+    DeleteObject(selected_brush);
+  }
+
+  const int item_height = rect.bottom - rect.top;
+  const int icon_size = 20;
+  const int icon_left = rect.left + 10;
+  const int icon_top = rect.top + (item_height - icon_size) / 2;
+
+  if (!item->icon_path.empty() && gdiplus_token != 0) {
+    Gdiplus::Bitmap icon(item->icon_path.c_str());
+    if (icon.GetLastStatus() == Gdiplus::Ok) {
+      Gdiplus::Graphics graphics(hdc);
+      graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+      graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+      graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+      graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+      graphics.DrawImage(&icon, Gdiplus::Rect(icon_left, icon_top, icon_size,
+                                              icon_size));
+    }
+  }
+
+  RECT text_rect = rect;
+  text_rect.left = rect.left + 37;
+  text_rect.right -= 14;
+  text_rect.top += 1;
+
+  HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HFONT old_font = static_cast<HFONT>(SelectObject(hdc, font));
+  int old_bk_mode = SetBkMode(hdc, TRANSPARENT);
+  COLORREF old_text_color = SetTextColor(
+      hdc, item->disabled ? GetSysColor(COLOR_GRAYTEXT)
+                          : GetSysColor(COLOR_MENUTEXT));
+  DrawTextW(hdc, item->label.c_str(), -1, &text_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+  SetTextColor(hdc, old_text_color);
+  SetBkMode(hdc, old_bk_mode);
+  SelectObject(hdc, old_font);
+
+  return true;
+}
+
+SIZE TrayManagerPlugin::_MeasureCustomMenu() {
+  const int icon_left = 12;
+  const int icon_size = 26;
+  const int text_gap = 8;
+  const int right_padding = 20;
+  const int min_width = 150;
+  SIZE size = {min_width, 12};
+
+  HDC hdc = GetDC(nullptr);
+  HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HFONT old_font = static_cast<HFONT>(SelectObject(hdc, font));
+  for (const auto& item : owner_draw_menu_items) {
+    if (item->separator) {
+      size.cy += 9;
+      continue;
+    }
+
+    SIZE text_size = {0, 0};
+    GetTextExtentPoint32W(hdc, item->label.c_str(),
+                          static_cast<int>(item->label.length()), &text_size);
+    size.cx = std::max(size.cx,
+                       icon_left + icon_size + text_gap + text_size.cx +
+                           right_padding);
+    size.cy += 34;
+  }
+  SelectObject(hdc, old_font);
+  ReleaseDC(nullptr, hdc);
+  size.cx += 2;
+  return size;
+}
+
+int TrayManagerPlugin::_HitTestCustomMenu(int y) {
+  int top = 6;
+  for (size_t index = 0; index < owner_draw_menu_items.size(); index++) {
+    const auto& item = owner_draw_menu_items[index];
+    int height = item->separator ? 9 : 34;
+    if (y >= top && y < top + height) {
+      if (item->separator || item->disabled) {
+        return -1;
+      }
+      return static_cast<int>(index);
+    }
+    top += height;
+  }
+  return -1;
+}
+
+void TrayManagerPlugin::_PaintCustomMenu(HWND hwnd) {
+  PAINTSTRUCT paint;
+  HDC hdc = BeginPaint(hwnd, &paint);
+
+  RECT client_rect;
+  GetClientRect(hwnd, &client_rect);
+  const int width = client_rect.right - client_rect.left;
+  const int height = client_rect.bottom - client_rect.top;
+
+  HDC buffer_hdc = CreateCompatibleDC(hdc);
+  HBITMAP buffer_bitmap = CreateCompatibleBitmap(hdc, width, height);
+  HBITMAP old_buffer_bitmap =
+      static_cast<HBITMAP>(SelectObject(buffer_hdc, buffer_bitmap));
+
+  Gdiplus::Graphics graphics(buffer_hdc);
+  graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+  graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+  graphics.Clear(Gdiplus::Color(248, 250, 252));
+
+  Gdiplus::SolidBrush background(Gdiplus::Color(248, 250, 252));
+  FillRoundedRectangle(&graphics, &background, 0.0f, 0.0f,
+                       static_cast<Gdiplus::REAL>(width),
+                       static_cast<Gdiplus::REAL>(height), 10.0f);
+
+  int top = 6;
+  const int icon_left = 12;
+  const int icon_size = 26;
+  const int text_left = icon_left + icon_size + 8;
+
+  for (size_t index = 0; index < owner_draw_menu_items.size(); index++) {
+    const auto& item = owner_draw_menu_items[index];
+    if (item->separator) {
+      Gdiplus::SolidBrush line_brush(Gdiplus::Color(226, 232, 240));
+      graphics.FillRectangle(&line_brush, 10, top + 4, width - 20, 1);
+      top += 9;
+      continue;
+    }
+
+    const int item_height = 34;
+    const bool selected = static_cast<int>(index) == custom_menu_hover_index;
+    if (selected) {
+      Gdiplus::SolidBrush selected_brush(Gdiplus::Color(235, 239, 244));
+      FillRoundedRectangle(&graphics, &selected_brush, 5.0f,
+                           static_cast<float>(top),
+                           static_cast<float>(width - 10), 30.0f, 7.0f);
+    }
+
+    if (!item->icon_path.empty() && gdiplus_token != 0) {
+      Gdiplus::Bitmap icon(item->icon_path.c_str());
+      if (icon.GetLastStatus() == Gdiplus::Ok) {
+        graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+        graphics.SetInterpolationMode(
+            Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.DrawImage(&icon,
+                           Gdiplus::Rect(icon_left,
+                                         top + (item_height - icon_size) / 2,
+                                         icon_size, icon_size));
+      }
+    }
+
+    RECT text_rect = {text_left, top, width - 16, top + item_height};
+    HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HFONT old_font = static_cast<HFONT>(SelectObject(buffer_hdc, font));
+    int old_bk_mode = SetBkMode(buffer_hdc, TRANSPARENT);
+    COLORREF old_text_color = SetTextColor(
+        buffer_hdc,
+        item->disabled ? GetSysColor(COLOR_GRAYTEXT) : RGB(31, 41, 55));
+    DrawTextW(buffer_hdc, item->label.c_str(), -1, &text_rect,
+              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    SetTextColor(buffer_hdc, old_text_color);
+    SetBkMode(buffer_hdc, old_bk_mode);
+    SelectObject(buffer_hdc, old_font);
+
+    top += item_height;
+  }
+
+  BitBlt(hdc, 0, 0, width, height, buffer_hdc, 0, 0, SRCCOPY);
+  SelectObject(buffer_hdc, old_buffer_bitmap);
+  DeleteObject(buffer_bitmap);
+  DeleteDC(buffer_hdc);
+
+  EndPaint(hwnd, &paint);
+}
+
+void TrayManagerPlugin::_ShowCustomMenu(int x, int y) {
+  HWND hwnd = _GetCustomMenuWindow();
+  if (hwnd == nullptr) {
+    return;
+  }
+
+  SIZE size = _MeasureCustomMenu();
+  HMONITOR monitor = MonitorFromPoint({x, y}, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitor_info{};
+  monitor_info.cbSize = sizeof(MONITORINFO);
+  GetMonitorInfoW(monitor, &monitor_info);
+
+  int left = x;
+  int top = y - size.cy;
+  if (left + size.cx > monitor_info.rcWork.right) {
+    left = monitor_info.rcWork.right - size.cx;
+  }
+  if (top < monitor_info.rcWork.top) {
+    top = y;
+  }
+  left = std::max(left, static_cast<int>(monitor_info.rcWork.left));
+  top = std::max(top, static_cast<int>(monitor_info.rcWork.top));
+
+  HRGN region = CreateRoundRectRgn(0, 0, size.cx + 1, size.cy + 1, 12, 12);
+  SetWindowRgn(hwnd, region, TRUE);
+  custom_menu_hover_index = -1;
+  SetWindowPos(hwnd, HWND_TOPMOST, left, top, size.cx, size.cy,
+               SWP_SHOWWINDOW);
+  SetForegroundWindow(hwnd);
+  SetFocus(hwnd);
+  InvalidateRect(hwnd, nullptr, TRUE);
+}
+
+void TrayManagerPlugin::_HideCustomMenu() {
+  if (custom_menu_window != nullptr && IsWindowVisible(custom_menu_window)) {
+    ShowWindow(custom_menu_window, SW_HIDE);
+  }
+  custom_menu_hover_index = -1;
+}
+
+void TrayManagerPlugin::_InvokeCustomMenuItem(int index) {
+  if (index < 0 ||
+      index >= static_cast<int>(owner_draw_menu_items.size()) ||
+      owner_draw_menu_items[index]->separator ||
+      owner_draw_menu_items[index]->disabled) {
+    return;
+  }
+
+  int id = owner_draw_menu_items[index]->id;
+  _HideCustomMenu();
+  flutter::EncodableMap eventData = flutter::EncodableMap();
+  eventData[flutter::EncodableValue("id")] = flutter::EncodableValue(id);
+  channel->InvokeMethod("onTrayMenuItemClick",
+                        std::make_unique<flutter::EncodableValue>(eventData));
 }
 
 void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
@@ -254,14 +766,27 @@ void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
         std::get<bool>(item_map.at(flutter::EncodableValue("disabled")));
 
     UINT_PTR item_id = id;
-    UINT uFlags = MF_STRING;
+    UINT uFlags = MF_OWNERDRAW;
 
     if (disabled) {
       uFlags |= MF_GRAYED;
     }
 
+    auto owner_draw_item = std::make_unique<OwnerDrawMenuItem>();
+    owner_draw_item->id = id;
+    owner_draw_item->label = g_converter.from_bytes(label);
+    owner_draw_item->disabled = disabled;
+    owner_draw_item->checked = checked != nullptr && *checked == true;
+    if (icon != nullptr) {
+      owner_draw_item->icon_path = _ResolveAssetPath(*icon);
+    }
+    OwnerDrawMenuItem* owner_draw_item_ptr = owner_draw_item.get();
+    owner_draw_menu_items.push_back(std::move(owner_draw_item));
+
     if (type.compare("separator") == 0) {
-      AppendMenuW(menu, MF_SEPARATOR, item_id, NULL);
+      owner_draw_item_ptr->separator = true;
+      AppendMenuW(menu, MF_SEPARATOR | MF_OWNERDRAW, item_id,
+                  reinterpret_cast<LPCWSTR>(owner_draw_item_ptr));
     } else {
       if (type.compare("checkbox") == 0) {
         if (checked == nullptr) {
@@ -276,19 +801,8 @@ void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
                                   flutter::EncodableValue("submenu"))));
         item_id = reinterpret_cast<UINT_PTR>(sub_menu);
       }
-      AppendMenuW(menu, uFlags, item_id, g_converter.from_bytes(label).c_str());
-      if (icon != nullptr) {
-        HBITMAP bitmap = _LoadMenuBitmap(*icon);
-        if (bitmap != nullptr) {
-          MENUITEMINFOW menu_item_info;
-          ZeroMemory(&menu_item_info, sizeof(MENUITEMINFOW));
-          menu_item_info.cbSize = sizeof(MENUITEMINFOW);
-          menu_item_info.fMask = MIIM_BITMAP;
-          menu_item_info.hbmpItem = bitmap;
-          SetMenuItemInfoW(menu, GetMenuItemCount(menu) - 1, TRUE,
-                           &menu_item_info);
-        }
-      }
+      AppendMenuW(menu, uFlags, item_id,
+                  reinterpret_cast<LPCWSTR>(owner_draw_item_ptr));
     }
   }
 }
@@ -302,6 +816,15 @@ std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hWnd,
     if (tray_icon_setted) {
       Shell_NotifyIcon(NIM_DELETE, &nid);
       DestroyIcon(nid.hIcon);
+    }
+  } else if (message == WM_MEASUREITEM) {
+    if (_MeasureOwnerDrawMenuItem(
+            reinterpret_cast<MEASUREITEMSTRUCT*>(lParam))) {
+      return TRUE;
+    }
+  } else if (message == WM_DRAWITEM) {
+    if (_DrawOwnerDrawMenuItem(reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) {
+      return TRUE;
     }
   } else if (message == WM_COMMAND) {
     flutter::EncodableMap eventData = flutter::EncodableMap();
@@ -442,6 +965,7 @@ void TrayManagerPlugin::SetContextMenu(
       std::get<flutter::EncodableMap>(*method_call.arguments());
 
   _ClearMenuBitmaps();
+  _ClearOwnerDrawMenuItems();
   _CreateMenu(hMenu, std::get<flutter::EncodableMap>(
                          args.at(flutter::EncodableValue("menu"))));
 
@@ -481,8 +1005,7 @@ void TrayManagerPlugin::PopUpContextMenu(
   } else {
     SetForegroundWindow(menu_owner);
   }
-  TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, static_cast<int>(x),
-                 static_cast<int>(y), 0, menu_owner, NULL);
+  _ShowCustomMenu(static_cast<int>(x), static_cast<int>(y));
   PostMessage(menu_owner, WM_NULL, 0, 0);
   result->Success(flutter::EncodableValue(true));
 }
