@@ -557,8 +557,8 @@ bool TrayManagerPlugin::_DrawOwnerDrawMenuItem(DRAWITEMSTRUCT* draw) {
 
 SIZE TrayManagerPlugin::_MeasureCustomMenu() {
   const int icon_left = 12;
-  const int icon_size = 26;
-  const int text_gap = 8;
+  const int icon_size = 28;
+  const int text_gap = 4;
   const int right_padding = 20;
   const int min_width = 150;
   SIZE size = {min_width, 12};
@@ -628,8 +628,8 @@ void TrayManagerPlugin::_PaintCustomMenu(HWND hwnd) {
 
   int top = 6;
   const int icon_left = 12;
-  const int icon_size = 26;
-  const int text_left = icon_left + icon_size + 8;
+  const int icon_size = 28;
+  const int text_left = icon_left + icon_size + 4;
 
   for (size_t index = 0; index < owner_draw_menu_items.size(); index++) {
     const auto& item = owner_draw_menu_items[index];
