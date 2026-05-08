@@ -21,6 +21,9 @@ class P2pSessionTransport extends Equatable {
     required this.dataChannelOpen,
     this.dataChannelLabel,
     this.lastError,
+    this.rttMs,
+    this.txBytes,
+    this.rxBytes,
   });
 
   final String sessionId;
@@ -31,6 +34,9 @@ class P2pSessionTransport extends Equatable {
   final bool dataChannelOpen;
   final String? dataChannelLabel;
   final String? lastError;
+  final int? rttMs;
+  final int? txBytes;
+  final int? rxBytes;
 
   bool get canTransfer =>
       dataChannelOpen && linkStatus == TransportLinkStatus.connected;
@@ -46,6 +52,12 @@ class P2pSessionTransport extends Equatable {
     bool clearDataChannelLabel = false,
     String? lastError,
     bool clearLastError = false,
+    int? rttMs,
+    bool clearRttMs = false,
+    int? txBytes,
+    bool clearTxBytes = false,
+    int? rxBytes,
+    bool clearRxBytes = false,
   }) {
     return P2pSessionTransport(
       sessionId: sessionId ?? this.sessionId,
@@ -58,6 +70,9 @@ class P2pSessionTransport extends Equatable {
           ? null
           : dataChannelLabel ?? this.dataChannelLabel,
       lastError: clearLastError ? null : lastError ?? this.lastError,
+      rttMs: clearRttMs ? null : rttMs ?? this.rttMs,
+      txBytes: clearTxBytes ? null : txBytes ?? this.txBytes,
+      rxBytes: clearRxBytes ? null : rxBytes ?? this.rxBytes,
     );
   }
 
@@ -71,6 +86,9 @@ class P2pSessionTransport extends Equatable {
         dataChannelOpen,
         dataChannelLabel,
         lastError,
+        rttMs,
+        txBytes,
+        rxBytes,
       ];
 }
 

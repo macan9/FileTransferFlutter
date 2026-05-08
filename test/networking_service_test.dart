@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import 'package:file_transfer_flutter/core/models/network_agent_command.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
+import 'package:file_transfer_flutter/core/models/pairing_session.dart';
 import 'package:file_transfer_flutter/core/services/networking_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -67,6 +69,42 @@ void main() {
       expect(requestCount, 2);
       expect(commands, hasLength(1));
       expect(commands.single.id, 'cmd-3');
+    });
+
+    test('heartbeatAgent includes relay observation fields', () async {
+      late http.Request capturedRequest;
+      final HttpNetworkingService service = HttpNetworkingService(
+        baseUri: Uri.parse('http://localhost:3000'),
+        client: MockClient((http.Request request) async {
+          capturedRequest = request;
+          return http.Response('{}', 204);
+        }),
+      );
+
+      await service.heartbeatAgent(
+        deviceId: 'cm-device-a',
+        agentToken: 'token-a',
+        zeroTierNodeId: 'zt-a',
+        connectionMode: P2pConnectionMode.relay,
+        relayNodeId: 'relay-01',
+        rttMs: 42,
+        txBytes: 123,
+        rxBytes: 456,
+      );
+
+      expect(capturedRequest.method, 'PATCH');
+      expect(
+        jsonDecode(capturedRequest.body),
+        <String, dynamic>{
+          'status': 'online',
+          'zeroTierNodeId': 'zt-a',
+          'connectionMode': 'relay',
+          'relayNodeId': 'relay-01',
+          'rttMs': 42,
+          'txBytes': 123,
+          'rxBytes': 456,
+        },
+      );
     });
 
     test(
@@ -285,6 +323,60 @@ void main() {
       expect(command.isExpired, isTrue);
       expect(command.isSkipped, isTrue);
       expect(command.isFinal, isTrue);
+    });
+
+    test('parses relay hint fields without breaking old payloads', () {
+      final NetworkAgentCommand command = NetworkAgentCommand.fromJson(
+        <String, dynamic>{
+          'id': 'cmd-4',
+          'type': 'join_zerotier_network',
+          'status': 'pending',
+          'payload': <String, dynamic>{
+            'preferredRelayNodeId': 'relay-01',
+            'relayPolicy': 'prefer_relay',
+          },
+        },
+      );
+
+      expect(command.preferredRelayNodeId, 'relay-01');
+      expect(command.relayPolicy, RelayPolicy.preferRelay);
+    });
+  });
+
+  group('PairingSession', () {
+    test('parses relay observation fields', () {
+      final PairingSession session = PairingSession.fromJson(
+        <String, dynamic>{
+          'id': 'ps-10',
+          'status': 'active',
+          'initiatorDevice': <String, dynamic>{
+            'id': 'cm-device-a',
+            'deviceName': 'Alpha',
+            'platform': 'windows',
+            'zeroTierNodeId': 'zt-a',
+            'status': 'online',
+          },
+          'targetDevice': <String, dynamic>{
+            'id': 'cm-device-b',
+            'deviceName': 'Beta',
+            'platform': 'android',
+            'zeroTierNodeId': 'zt-b',
+            'status': 'online',
+          },
+          'allowedPorts': const <Map<String, dynamic>>[],
+          'zeroTierBindings': const <Map<String, dynamic>>[],
+          'commands': const <Map<String, dynamic>>[],
+          'relayNodeId': 'relay-01',
+          'relayDecisionReason': 'p2p_failed',
+          'observedConnectionMode': 'relay',
+          'observedRelayNodeId': 'relay-01',
+        },
+      );
+
+      expect(session.relayNodeId, 'relay-01');
+      expect(session.relayDecisionReason, 'p2p_failed');
+      expect(session.observedConnectionMode, P2pConnectionMode.relay);
+      expect(session.observedRelayNodeId, 'relay-01');
     });
   });
 }

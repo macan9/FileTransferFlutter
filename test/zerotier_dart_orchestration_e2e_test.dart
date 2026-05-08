@@ -7,6 +7,7 @@ import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_agent_command.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
 import 'package:file_transfer_flutter/core/models/network_invite_code.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
 import 'package:file_transfer_flutter/core/models/pairing_session.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_adapter_bridge_status.dart';
@@ -249,6 +250,11 @@ class _FakeNetworkingService implements NetworkingService {
     required String agentToken,
     required String zeroTierNodeId,
     String status = 'online',
+    P2pConnectionMode? connectionMode,
+    String? relayNodeId,
+    int? rttMs,
+    int? txBytes,
+    int? rxBytes,
   }) async {
     expect(deviceId, _currentDeviceId);
     expect(agentToken, _currentAgentToken);

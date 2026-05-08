@@ -1,5 +1,6 @@
 import 'package:equatable/equatable.dart';
 import 'package:file_transfer_flutter/core/models/network_agent_command.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
 
 class PairingSession extends Equatable {
   const PairingSession({
@@ -22,6 +23,10 @@ class PairingSession extends Equatable {
     this.firewallScopeClosedAt,
     this.zeroTierNetworkId,
     this.zeroTierNetworkName,
+    this.relayNodeId,
+    this.relayDecisionReason,
+    this.observedConnectionMode,
+    this.observedRelayNodeId,
   });
 
   factory PairingSession.fromJson(Map<String, dynamic> json) {
@@ -57,6 +62,12 @@ class PairingSession extends Equatable {
       firewallScopeClosedAt: _parseDateTime(json['firewallScopeClosedAt']),
       zeroTierNetworkId: json['zeroTierNetworkId']?.toString(),
       zeroTierNetworkName: json['zeroTierNetworkName']?.toString(),
+      relayNodeId: json['relayNodeId']?.toString(),
+      relayDecisionReason: json['relayDecisionReason']?.toString(),
+      observedConnectionMode: P2pConnectionMode.tryParse(
+        json['observedConnectionMode']?.toString(),
+      ),
+      observedRelayNodeId: json['observedRelayNodeId']?.toString(),
     );
   }
 
@@ -79,6 +90,10 @@ class PairingSession extends Equatable {
   final DateTime? firewallScopeClosedAt;
   final String? zeroTierNetworkId;
   final String? zeroTierNetworkName;
+  final String? relayNodeId;
+  final String? relayDecisionReason;
+  final P2pConnectionMode? observedConnectionMode;
+  final String? observedRelayNodeId;
 
   bool get isCancelled => status == 'cancelled';
 
@@ -103,6 +118,10 @@ class PairingSession extends Equatable {
         firewallScopeClosedAt,
         zeroTierNetworkId,
         zeroTierNetworkName,
+        relayNodeId,
+        relayDecisionReason,
+        observedConnectionMode,
+        observedRelayNodeId,
       ];
 }
 

@@ -356,7 +356,10 @@ class P2pTransportService {
       return existing;
     }
 
-    final _WebrtcConfig rtcConfig = await _loadWebrtcConfig();
+    final bool forceRelay = _shouldForceRelay(session);
+    final _WebrtcConfig rtcConfig = await _loadWebrtcConfig(
+      forceRelay: forceRelay,
+    );
     _log(
         'ensureLink createPeerConnection session=${session.sessionId} peer=$peerDeviceId');
     final RTCPeerConnection peerConnection =
@@ -370,11 +373,68 @@ class P2pTransportService {
       peerDeviceId: peerDeviceId,
       peerConnection: peerConnection,
       connectionMode: session.connectionMode ?? P2pConnectionMode.connecting,
+      forceRelayOnly: forceRelay,
     );
     _links[session.sessionId] = link;
     _bindPeerConnection(link);
     _log('ensureLink created session=${session.sessionId}');
     return link;
+  }
+
+  bool _shouldForceRelay(P2pSession session) {
+    if (session.relayPolicy == RelayPolicy.preferRelay) {
+      return true;
+    }
+    final P2pConnectionMode? preferredMode = session.connectionMode;
+    return preferredMode == P2pConnectionMode.relay;
+  }
+
+  bool _canFallbackToRelay(_PeerLink link) {
+    if (link.forceRelayOnly || link.relayFallbackAttempted) {
+      return false;
+    }
+    return link.session.relayPolicy == RelayPolicy.directFirst ||
+        link.session.relayPolicy == RelayPolicy.preferRelay ||
+        link.session.preferredRelayNodeId?.trim().isNotEmpty == true;
+  }
+
+  Future<void> _switchToRelayAfterDirectFailure(_PeerLink link) async {
+    if (!_canFallbackToRelay(link)) {
+      return;
+    }
+
+    link.relayFallbackAttempted = true;
+    link.forceRelayOnly = true;
+    link.linkStatus = TransportLinkStatus.negotiating;
+    link.connectionMode = P2pConnectionMode.connecting;
+    link.lastError = null;
+    link.localCandidateTypes.clear();
+    link.remoteCandidateTypes.clear();
+    link.dataChannel = null;
+    link.dataChannelOpen = false;
+    link.dataChannelLabel = null;
+    link.negotiationStarted = false;
+    _refreshSessionTransports();
+
+    _log(
+      'switchToRelay session=${link.session.sessionId} '
+      'relayNode=${link.session.preferredRelayNodeId ?? "-"} '
+      'policy=${link.session.relayPolicy?.value ?? "-"}',
+    );
+
+    await link.peerConnection.close();
+    final _WebrtcConfig relayConfig = await _loadWebrtcConfig(
+      forceRelay: true,
+    );
+    link.peerConnection = await _peerConnectionFactory.create(
+      iceServers: relayConfig.iceServers,
+      iceTransportPolicy: relayConfig.iceTransportPolicy,
+    );
+    _bindPeerConnection(link);
+
+    if (link.session.createdByDeviceId == _selfDeviceId) {
+      await _createOffer(link);
+    }
   }
 
   Future<void> _createOffer(_PeerLink link) async {
@@ -458,6 +518,7 @@ class P2pTransportService {
           link.linkStatus = TransportLinkStatus.failed;
           link.connectionMode = P2pConnectionMode.failed;
           link.lastError = 'PeerConnection failed';
+          unawaited(_switchToRelayAfterDirectFailure(link));
           unawaited(
             _cleanupIncomingBuffersForSession(
               link.session.sessionId,
@@ -1204,7 +1265,7 @@ class P2pTransportService {
 
   P2pConnectionMode _effectiveConnectionMode(_PeerLink link) {
     final P2pConnectionMode? sessionMode = link.session.connectionMode;
-    if (sessionMode != null) {
+    if (sessionMode != null && sessionMode != P2pConnectionMode.unknown) {
       return sessionMode;
     }
     if (link.linkStatus == TransportLinkStatus.failed) {
@@ -1219,7 +1280,7 @@ class P2pTransportService {
 
   Future<void> _refreshConnectionMode(_PeerLink link) async {
     final P2pConnectionMode? sessionMode = link.session.connectionMode;
-    if (sessionMode != null) {
+    if (sessionMode != null && sessionMode != P2pConnectionMode.unknown) {
       if (link.connectionMode != sessionMode) {
         link.connectionMode = sessionMode;
         _refreshSessionTransports();
@@ -1296,6 +1357,8 @@ class P2pTransportService {
           continue;
         }
 
+        _updateTransportMetrics(link, values);
+
         final String? localType = _extractSelectedCandidateType(
           candidateReportId: values['localCandidateId']?.toString(),
           candidateTypeKey: 'localCandidateType',
@@ -1349,6 +1412,52 @@ class P2pTransportService {
     final Map<String, dynamic> reportValues =
         _normalizeStatsValues(report.values);
     return reportValues['candidateType']?.toString().toLowerCase();
+  }
+
+  void _updateTransportMetrics(_PeerLink link, Map<String, dynamic> values) {
+    final int? rttMs = _statsValueAsRttMs(
+      values['currentRoundTripTime'] ??
+          values['roundTripTime'] ??
+          values['googRtt'],
+    );
+    final int? txBytes = _statsValueAsInt(
+      values['bytesSent'] ?? values['googBytesSent'],
+    );
+    final int? rxBytes = _statsValueAsInt(
+      values['bytesReceived'] ?? values['googBytesReceived'],
+    );
+    if (rttMs != null) {
+      link.rttMs = rttMs;
+    }
+    if (txBytes != null) {
+      link.txBytes = txBytes;
+    }
+    if (rxBytes != null) {
+      link.rxBytes = rxBytes;
+    }
+  }
+
+  int? _statsValueAsRttMs(dynamic value) {
+    final num numeric = _statsValueAsNum(value) ?? 0;
+    if (numeric <= 0) {
+      return null;
+    }
+    return numeric < 10 ? (numeric * 1000).round() : numeric.round();
+  }
+
+  int? _statsValueAsInt(dynamic value) {
+    final num? numeric = _statsValueAsNum(value);
+    return numeric?.round();
+  }
+
+  num? _statsValueAsNum(dynamic value) {
+    if (value is num) {
+      return value;
+    }
+    if (value is String) {
+      return num.tryParse(value.trim());
+    }
+    return null;
   }
 
   bool _isSelectedCandidatePair(Map<String, dynamic> values) {
@@ -1410,15 +1519,23 @@ class P2pTransportService {
     return value == 'host' || value == 'srflx' || value == 'prflx';
   }
 
-  Future<_WebrtcConfig> _loadWebrtcConfig() {
+  Future<_WebrtcConfig> _loadWebrtcConfig({
+    required bool forceRelay,
+  }) {
     final Future<_WebrtcConfig>? existing = _webrtcConfigFuture;
     if (existing != null) {
-      return existing;
+      return existing.then(
+        (_WebrtcConfig value) =>
+            forceRelay ? value.withIceTransportPolicy('relay') : value,
+      );
     }
 
     final Future<_WebrtcConfig> future = _fetchWebrtcConfig();
     _webrtcConfigFuture = future;
-    return future;
+    return future.then(
+      (_WebrtcConfig value) =>
+          forceRelay ? value.withIceTransportPolicy('relay') : value,
+    );
   }
 
   Future<_WebrtcConfig> _fetchWebrtcConfig() async {
@@ -1485,6 +1602,9 @@ class P2pTransportService {
             dataChannelOpen: link.dataChannelOpen,
             dataChannelLabel: link.dataChannelLabel,
             lastError: link.lastError,
+            rttMs: link.rttMs,
+            txBytes: link.txBytes,
+            rxBytes: link.rxBytes,
           ),
         )
         .toList()
@@ -1571,20 +1691,26 @@ class _PeerLink {
     required this.peerDeviceId,
     required this.peerConnection,
     required this.connectionMode,
+    required this.forceRelayOnly,
   });
 
   P2pSession session;
   final String peerDeviceId;
-  final RTCPeerConnection peerConnection;
+  RTCPeerConnection peerConnection;
   RTCDataChannel? dataChannel;
   bool dataChannelOpen = false;
   String? dataChannelLabel;
   bool negotiationStarted = false;
+  bool forceRelayOnly;
+  bool relayFallbackAttempted = false;
   TransportLinkStatus linkStatus = TransportLinkStatus.idle;
   P2pConnectionMode connectionMode;
   final Set<String> localCandidateTypes = <String>{};
   final Set<String> remoteCandidateTypes = <String>{};
   String? lastError;
+  int? rttMs;
+  int? txBytes;
+  int? rxBytes;
   Future<void> messageQueue = Future<void>.value();
 
   Future<void> dispose() async {
@@ -1634,6 +1760,13 @@ class _WebrtcConfig {
 
   final String iceTransportPolicy;
   final List<Map<String, dynamic>> iceServers;
+
+  _WebrtcConfig withIceTransportPolicy(String policy) {
+    return _WebrtcConfig(
+      iceTransportPolicy: policy,
+      iceServers: iceServers,
+    );
+  }
 }
 
 class _IncomingBuffer {

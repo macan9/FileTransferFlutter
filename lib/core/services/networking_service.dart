@@ -5,6 +5,7 @@ import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_agent_command.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
 import 'package:file_transfer_flutter/core/models/network_invite_code.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
 import 'package:file_transfer_flutter/core/models/pairing_session.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
@@ -22,6 +23,11 @@ abstract class NetworkingService {
     required String agentToken,
     required String zeroTierNodeId,
     String status,
+    P2pConnectionMode? connectionMode,
+    String? relayNodeId,
+    int? rttMs,
+    int? txBytes,
+    int? rxBytes,
   });
   Future<List<NetworkAgentCommand>> fetchAgentCommands({
     required String deviceId,
@@ -145,6 +151,11 @@ class HttpNetworkingService implements NetworkingService {
     required String agentToken,
     required String zeroTierNodeId,
     String status = 'online',
+    P2pConnectionMode? connectionMode,
+    String? relayNodeId,
+    int? rttMs,
+    int? txBytes,
+    int? rxBytes,
   }) async {
     final http.Response response = await _client.patch(
       _buildUri('/networking/agent/devices/$deviceId/heartbeat'),
@@ -152,6 +163,12 @@ class HttpNetworkingService implements NetworkingService {
       body: jsonEncode(<String, dynamic>{
         'status': status,
         'zeroTierNodeId': zeroTierNodeId,
+        if (connectionMode != null) 'connectionMode': connectionMode.value,
+        if (relayNodeId != null && relayNodeId.trim().isNotEmpty)
+          'relayNodeId': relayNodeId.trim(),
+        if (rttMs != null) 'rttMs': rttMs,
+        if (txBytes != null) 'txBytes': txBytes,
+        if (rxBytes != null) 'rxBytes': rxBytes,
       }),
     );
     _decodeResponse(response);

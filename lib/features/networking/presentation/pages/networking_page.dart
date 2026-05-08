@@ -4,6 +4,8 @@ import 'package:file_transfer_flutter/app/router/app_route_names.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/managed_network.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
+import 'package:file_transfer_flutter/core/models/pairing_session.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_adapter_bridge_status.dart';
@@ -61,6 +63,7 @@ class NetworkingSectionPage extends ConsumerWidget {
           config: config,
           isRegistered: isRegistered,
           recentEvents: agentState.recentRuntimeEvents,
+          pairingSessions: dashboard.pairingSessions,
           lastError: agentState.lastError,
           onRefresh: () async {
             await ref
@@ -101,6 +104,7 @@ class NetworkingSectionPage extends ConsumerWidget {
           managedNetworks: dashboard.managedNetworks,
           deviceIdentity: dashboard.deviceIdentity,
           runtimeStatus: runtimeStatus,
+          pairingSessions: dashboard.pairingSessions,
         );
       case NetworkingSection.localNetworks:
         title = '本地网络';
@@ -992,6 +996,7 @@ class _HeroStatusCard extends StatelessWidget {
     required this.config,
     required this.isRegistered,
     required this.recentEvents,
+    required this.pairingSessions,
     required this.lastError,
     required this.onRefresh,
     required this.onCopyToken,
@@ -1002,6 +1007,7 @@ class _HeroStatusCard extends StatelessWidget {
   final AppConfig config;
   final bool isRegistered;
   final List<ZeroTierRuntimeEvent> recentEvents;
+  final List<PairingSession> pairingSessions;
   final String? lastError;
   final Future<void> Function() onRefresh;
   final VoidCallback? onCopyToken;
@@ -1126,6 +1132,19 @@ class _HeroStatusCard extends StatelessWidget {
               ),
             ),
           ),
+          const SizedBox(height: 10),
+          _CapabilityItem(
+            tone: pairingSessions.isEmpty
+                ? _CapabilityTone.warning
+                : _CapabilityTone.info,
+            label: pairingSessions.isEmpty
+                ? '浼氳瘽涓庝腑缁嶇姸鎬佸皻鏈悓姝ュ埌鍓嶇銆?'
+                : '宸插悓姝ュ埌 ${pairingSessions.length} 涓细璇濓紝鍙湪浼氳瘽璇︽儏涓煡鐪嬩腑缁嶇姸鎬併€?',
+          ),
+          if (pairingSessions.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            _PairingSessionRelayCard(session: pairingSessions.first),
+          ],
         ],
       ),
     );
@@ -1199,6 +1218,62 @@ class _RuntimeInsightCard extends StatelessWidget {
             onPressed: () => onRefresh(),
             icon: const Icon(Icons.refresh_rounded),
             label: const Text('刷新运行时状态'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PairingSessionRelayCard extends StatelessWidget {
+  const _PairingSessionRelayCard({
+    required this.session,
+  });
+
+  final PairingSession session;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFFE5E7EB)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            '会话链路观测',
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: <Widget>[
+              _InfoPill(label: '会话', value: session.id),
+              _InfoPill(
+                label: '推荐中继',
+                value: session.relayNodeId ?? '-',
+              ),
+              _InfoPill(
+                label: '推荐原因',
+                value: session.relayDecisionReason ?? '-',
+              ),
+              _InfoPill(
+                label: '实际链路',
+                value: _connectionModeLabel(session.observedConnectionMode),
+              ),
+              _InfoPill(
+                label: '实际中继',
+                value: session.observedRelayNodeId ?? '-',
+              ),
+            ],
           ),
         ],
       ),
@@ -1316,12 +1391,14 @@ class _NetworkingAlignmentCard extends StatelessWidget {
     required this.managedNetworks,
     required this.deviceIdentity,
     required this.runtimeStatus,
+    required this.pairingSessions,
   });
 
   final ManagedNetwork? defaultNetwork;
   final List<ManagedNetwork> managedNetworks;
   final NetworkDeviceIdentity? deviceIdentity;
   final ZeroTierRuntimeStatus runtimeStatus;
+  final List<PairingSession> pairingSessions;
 
   @override
   Widget build(BuildContext context) {
@@ -3411,6 +3488,19 @@ String _timeOrDash(DateTime? time) {
       '${local.hour.toString().padLeft(2, '0')}:'
       '${local.minute.toString().padLeft(2, '0')}:'
       '${local.second.toString().padLeft(2, '0')}';
+}
+
+String _connectionModeLabel(P2pConnectionMode? mode) {
+  if (mode == P2pConnectionMode.direct) {
+    return '直连中';
+  }
+  if (mode == P2pConnectionMode.relay) {
+    return '已切中继';
+  }
+  if (mode == P2pConnectionMode.failed) {
+    return '链路异常';
+  }
+  return '链路待确认';
 }
 
 String _buildDefaultPrivateNetworkName(AppConfig config) {

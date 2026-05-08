@@ -1,4 +1,5 @@
 import 'package:equatable/equatable.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
 
 class NetworkAgentCommand extends Equatable {
   const NetworkAgentCommand({
@@ -54,6 +55,15 @@ class NetworkAgentCommand extends Equatable {
       isSuperseded ||
       isExpired;
   bool get isSkipped => isCancelled || isSuperseded || isExpired;
+  String? get preferredRelayNodeId {
+    final String value =
+        payload['preferredRelayNodeId']?.toString().trim() ?? '';
+    return value.isEmpty ? null : value;
+  }
+
+  RelayPolicy? get relayPolicy {
+    return RelayPolicy.tryParse(payload['relayPolicy']?.toString());
+  }
 
   @override
   List<Object?> get props => <Object?>[

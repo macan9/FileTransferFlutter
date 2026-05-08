@@ -11,6 +11,11 @@ class P2pSession extends Equatable {
     required this.createdByDeviceId,
     required this.createdAt,
     this.connectionMode,
+    this.preferredRelayNodeId,
+    this.relayPolicy,
+    this.relayDecisionReason,
+    this.observedConnectionMode,
+    this.observedRelayNodeId,
     this.connectedAt,
     this.closedAt,
     this.closeReason,
@@ -30,6 +35,13 @@ class P2pSession extends Equatable {
       connectionMode: P2pConnectionMode.tryParse(
         json['connectionMode']?.toString(),
       ),
+      preferredRelayNodeId: _trimmedOrNull(json['preferredRelayNodeId']),
+      relayPolicy: RelayPolicy.tryParse(json['relayPolicy']?.toString()),
+      relayDecisionReason: _trimmedOrNull(json['relayDecisionReason']),
+      observedConnectionMode: P2pConnectionMode.tryParse(
+        json['observedConnectionMode']?.toString(),
+      ),
+      observedRelayNodeId: _trimmedOrNull(json['observedRelayNodeId']),
       connectedAt: _parseDateTime(json['connectedAt']),
       closedAt: _parseDateTime(json['closedAt']),
       closeReason: json['closeReason']?.toString(),
@@ -44,6 +56,11 @@ class P2pSession extends Equatable {
   final String createdByDeviceId;
   final DateTime createdAt;
   final P2pConnectionMode? connectionMode;
+  final String? preferredRelayNodeId;
+  final RelayPolicy? relayPolicy;
+  final String? relayDecisionReason;
+  final P2pConnectionMode? observedConnectionMode;
+  final String? observedRelayNodeId;
   final DateTime? connectedAt;
   final DateTime? closedAt;
   final String? closeReason;
@@ -77,6 +94,16 @@ class P2pSession extends Equatable {
     DateTime? createdAt,
     P2pConnectionMode? connectionMode,
     bool clearConnectionMode = false,
+    String? preferredRelayNodeId,
+    bool clearPreferredRelayNodeId = false,
+    RelayPolicy? relayPolicy,
+    bool clearRelayPolicy = false,
+    String? relayDecisionReason,
+    bool clearRelayDecisionReason = false,
+    P2pConnectionMode? observedConnectionMode,
+    bool clearObservedConnectionMode = false,
+    String? observedRelayNodeId,
+    bool clearObservedRelayNodeId = false,
     DateTime? connectedAt,
     bool clearConnectedAt = false,
     DateTime? closedAt,
@@ -94,6 +121,19 @@ class P2pSession extends Equatable {
       createdAt: createdAt ?? this.createdAt,
       connectionMode:
           clearConnectionMode ? null : connectionMode ?? this.connectionMode,
+      preferredRelayNodeId: clearPreferredRelayNodeId
+          ? null
+          : preferredRelayNodeId ?? this.preferredRelayNodeId,
+      relayPolicy: clearRelayPolicy ? null : relayPolicy ?? this.relayPolicy,
+      relayDecisionReason: clearRelayDecisionReason
+          ? null
+          : relayDecisionReason ?? this.relayDecisionReason,
+      observedConnectionMode: clearObservedConnectionMode
+          ? null
+          : observedConnectionMode ?? this.observedConnectionMode,
+      observedRelayNodeId: clearObservedRelayNodeId
+          ? null
+          : observedRelayNodeId ?? this.observedRelayNodeId,
       connectedAt: clearConnectedAt ? null : connectedAt ?? this.connectedAt,
       closedAt: clearClosedAt ? null : closedAt ?? this.closedAt,
       closeReason: clearCloseReason ? null : closeReason ?? this.closeReason,
@@ -110,6 +150,11 @@ class P2pSession extends Equatable {
       'createdByDeviceId': createdByDeviceId,
       'createdAt': createdAt.toIso8601String(),
       'connectionMode': connectionMode?.value,
+      'preferredRelayNodeId': preferredRelayNodeId,
+      'relayPolicy': relayPolicy?.value,
+      'relayDecisionReason': relayDecisionReason,
+      'observedConnectionMode': observedConnectionMode?.value,
+      'observedRelayNodeId': observedRelayNodeId,
       'connectedAt': connectedAt?.toIso8601String(),
       'closedAt': closedAt?.toIso8601String(),
       'closeReason': closeReason,
@@ -126,10 +171,20 @@ class P2pSession extends Equatable {
         createdByDeviceId,
         createdAt,
         connectionMode,
+        preferredRelayNodeId,
+        relayPolicy,
+        relayDecisionReason,
+        observedConnectionMode,
+        observedRelayNodeId,
         connectedAt,
         closedAt,
         closeReason,
       ];
+}
+
+String? _trimmedOrNull(dynamic value) {
+  final String text = value?.toString().trim() ?? '';
+  return text.isEmpty ? null : text;
 }
 
 DateTime? _parseDateTime(dynamic value) {

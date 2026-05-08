@@ -1843,6 +1843,7 @@ String _connectionModeLabel(P2pSessionTransport transport) {
   return switch (transport.connectionMode) {
     P2pConnectionMode.direct => '直连',
     P2pConnectionMode.relay => 'TURN 中继',
+    P2pConnectionMode.unknown => '待确认',
     P2pConnectionMode.connecting => '建立中',
     P2pConnectionMode.failed => '失败',
   };

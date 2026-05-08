@@ -127,6 +127,7 @@ enum P2pSessionStatus {
 enum P2pConnectionMode {
   direct('direct'),
   relay('relay'),
+  unknown('unknown'),
   connecting('connecting'),
   failed('failed');
 
@@ -140,6 +141,29 @@ enum P2pConnectionMode {
     }
 
     for (final P2pConnectionMode item in P2pConnectionMode.values) {
+      if (item.value == value) {
+        return item;
+      }
+    }
+
+    return null;
+  }
+}
+
+enum RelayPolicy {
+  preferRelay('prefer_relay'),
+  directFirst('direct_first');
+
+  const RelayPolicy(this.value);
+
+  final String value;
+
+  static RelayPolicy? tryParse(String? value) {
+    if (value == null) {
+      return null;
+    }
+
+    for (final RelayPolicy item in RelayPolicy.values) {
       if (item.value == value) {
         return item;
       }

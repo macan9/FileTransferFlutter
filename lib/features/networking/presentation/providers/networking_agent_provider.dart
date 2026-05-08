@@ -5,6 +5,7 @@ import 'package:equatable/equatable.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/network_agent_command.dart';
 import 'package:file_transfer_flutter/core/models/network_device_identity.dart';
+import 'package:file_transfer_flutter/core/models/p2p_state.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_network_state.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_runtime_event.dart';
@@ -14,6 +15,7 @@ import 'package:file_transfer_flutter/core/services/networking_service.dart';
 import 'package:file_transfer_flutter/core/services/zerotier_facade.dart';
 import 'package:file_transfer_flutter/core/services/zerotier_local_service.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_providers.dart';
+import 'package:file_transfer_flutter/shared/providers/p2p_transport_providers.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -60,6 +62,13 @@ class NetworkingAgentRuntimeState extends Equatable {
     this.activeNetworkActionType,
     this.activeNetworkActionNetworkId,
     this.activeNetworkActionStartedAt,
+    this.observedConnectionMode = 'unknown',
+    this.observedRelayNodeId,
+    this.preferredRelayNodeId,
+    this.relayPolicy,
+    this.observedRttMs,
+    this.observedTxBytes,
+    this.observedRxBytes,
   });
 
   const NetworkingAgentRuntimeState.initial()
@@ -82,7 +91,14 @@ class NetworkingAgentRuntimeState extends Equatable {
         lastError = null,
         activeNetworkActionType = null,
         activeNetworkActionNetworkId = null,
-        activeNetworkActionStartedAt = null;
+        activeNetworkActionStartedAt = null,
+        observedConnectionMode = 'unknown',
+        observedRelayNodeId = null,
+        preferredRelayNodeId = null,
+        relayPolicy = null,
+        observedRttMs = null,
+        observedTxBytes = null,
+        observedRxBytes = null;
 
   final ZeroTierRuntimeStatus runtimeStatus;
   final bool isServerReachable;
@@ -104,6 +120,13 @@ class NetworkingAgentRuntimeState extends Equatable {
   final String? activeNetworkActionType;
   final String? activeNetworkActionNetworkId;
   final DateTime? activeNetworkActionStartedAt;
+  final String observedConnectionMode;
+  final String? observedRelayNodeId;
+  final String? preferredRelayNodeId;
+  final String? relayPolicy;
+  final int? observedRttMs;
+  final int? observedTxBytes;
+  final int? observedRxBytes;
 
   bool get isReady => runtimeStatus.isNodeReady;
   bool get isLocalReady => runtimeStatus.isNodeReady;
@@ -141,6 +164,19 @@ class NetworkingAgentRuntimeState extends Equatable {
     bool clearActiveNetworkActionNetworkId = false,
     DateTime? activeNetworkActionStartedAt,
     bool clearActiveNetworkActionStartedAt = false,
+    String? observedConnectionMode,
+    String? observedRelayNodeId,
+    bool clearObservedRelayNodeId = false,
+    String? preferredRelayNodeId,
+    bool clearPreferredRelayNodeId = false,
+    String? relayPolicy,
+    bool clearRelayPolicy = false,
+    int? observedRttMs,
+    bool clearObservedRttMs = false,
+    int? observedTxBytes,
+    bool clearObservedTxBytes = false,
+    int? observedRxBytes,
+    bool clearObservedRxBytes = false,
   }) {
     return NetworkingAgentRuntimeState(
       runtimeStatus: runtimeStatus ?? this.runtimeStatus,
@@ -181,6 +217,21 @@ class NetworkingAgentRuntimeState extends Equatable {
       activeNetworkActionStartedAt: clearActiveNetworkActionStartedAt
           ? null
           : activeNetworkActionStartedAt ?? this.activeNetworkActionStartedAt,
+      observedConnectionMode:
+          observedConnectionMode ?? this.observedConnectionMode,
+      observedRelayNodeId: clearObservedRelayNodeId
+          ? null
+          : observedRelayNodeId ?? this.observedRelayNodeId,
+      preferredRelayNodeId: clearPreferredRelayNodeId
+          ? null
+          : preferredRelayNodeId ?? this.preferredRelayNodeId,
+      relayPolicy: clearRelayPolicy ? null : relayPolicy ?? this.relayPolicy,
+      observedRttMs:
+          clearObservedRttMs ? null : observedRttMs ?? this.observedRttMs,
+      observedTxBytes:
+          clearObservedTxBytes ? null : observedTxBytes ?? this.observedTxBytes,
+      observedRxBytes:
+          clearObservedRxBytes ? null : observedRxBytes ?? this.observedRxBytes,
     );
   }
 
@@ -206,6 +257,13 @@ class NetworkingAgentRuntimeState extends Equatable {
         activeNetworkActionType,
         activeNetworkActionNetworkId,
         activeNetworkActionStartedAt,
+        observedConnectionMode,
+        observedRelayNodeId,
+        preferredRelayNodeId,
+        relayPolicy,
+        observedRttMs,
+        observedTxBytes,
+        observedRxBytes,
       ];
 }
 
@@ -571,12 +629,18 @@ class NetworkingAgentRuntimeController
     }
 
     state = state.copyWith(isHeartbeating: true);
+    final _ObservedRelayState observedRelayState = _resolveObservedRelayState();
     try {
       try {
         await _networkingService.heartbeatAgent(
           deviceId: config.deviceId,
           agentToken: config.agentToken,
           zeroTierNodeId: config.zeroTierNodeId,
+          connectionMode: observedRelayState.connectionMode,
+          relayNodeId: observedRelayState.relayNodeId,
+          rttMs: observedRelayState.rttMs,
+          txBytes: observedRelayState.txBytes,
+          rxBytes: observedRelayState.rxBytes,
         );
       } on RealtimeError catch (error) {
         if (!await _recoverIdentityIfRequired(error)) {
@@ -594,11 +658,25 @@ class NetworkingAgentRuntimeController
           deviceId: config.deviceId,
           agentToken: config.agentToken,
           zeroTierNodeId: config.zeroTierNodeId,
+          connectionMode: observedRelayState.connectionMode,
+          relayNodeId: observedRelayState.relayNodeId,
+          rttMs: observedRelayState.rttMs,
+          txBytes: observedRelayState.txBytes,
+          rxBytes: observedRelayState.rxBytes,
         );
       }
       state = state.copyWith(
         isHeartbeating: false,
         lastHeartbeatAt: DateTime.now(),
+        observedConnectionMode: observedRelayState.connectionMode.value,
+        observedRelayNodeId: observedRelayState.relayNodeId,
+        clearObservedRelayNodeId: observedRelayState.relayNodeId == null,
+        observedRttMs: observedRelayState.rttMs,
+        observedTxBytes: observedRelayState.txBytes,
+        observedRxBytes: observedRelayState.rxBytes,
+        clearObservedRttMs: observedRelayState.rttMs == null,
+        clearObservedTxBytes: observedRelayState.txBytes == null,
+        clearObservedRxBytes: observedRelayState.rxBytes == null,
         clearLastError: true,
       );
       _consecutiveHeartbeatTransportFailureCount = 0;
@@ -637,6 +715,62 @@ class NetworkingAgentRuntimeController
         message.contains('timed out') ||
         message.contains('socketexception') ||
         message.contains('clientexception');
+  }
+
+  _ObservedRelayState _resolveObservedRelayState() {
+    final transportState = ref.read(p2pTransportStreamProvider).valueOrNull;
+    P2pConnectionMode mode = P2pConnectionMode.unknown;
+    if (transportState != null) {
+      for (final transport in transportState.sessionTransports) {
+        if (transport.connectionMode == P2pConnectionMode.relay) {
+          mode = P2pConnectionMode.relay;
+          break;
+        }
+        if (transport.connectionMode == P2pConnectionMode.direct) {
+          mode = P2pConnectionMode.direct;
+        }
+      }
+    }
+
+    final String? relayNodeId = mode == P2pConnectionMode.relay
+        ? _firstNonEmpty(
+            state.observedRelayNodeId,
+            state.preferredRelayNodeId,
+          )
+        : null;
+    return _ObservedRelayState(
+      connectionMode: mode,
+      relayNodeId: relayNodeId,
+      rttMs: _firstObservedMetric(
+        transportState?.sessionTransports
+            .map((item) => item.rttMs)
+            .whereType<int>(),
+      ),
+      txBytes: _firstObservedMetric(
+        transportState?.sessionTransports
+            .map((item) => item.txBytes)
+            .whereType<int>(),
+      ),
+      rxBytes: _firstObservedMetric(
+        transportState?.sessionTransports
+            .map((item) => item.rxBytes)
+            .whereType<int>(),
+      ),
+    );
+  }
+
+  void _captureRelayHint(NetworkAgentCommand command) {
+    final String? relayNodeId = command.preferredRelayNodeId;
+    final RelayPolicy? relayPolicy = command.relayPolicy;
+    if (relayNodeId == null && relayPolicy == null) {
+      return;
+    }
+    state = state.copyWith(
+      preferredRelayNodeId: relayNodeId,
+      clearPreferredRelayNodeId: relayNodeId == null,
+      relayPolicy: relayPolicy?.value,
+      clearRelayPolicy: relayPolicy == null,
+    );
   }
 
   Future<void> _pollCommands() async {
@@ -751,6 +885,7 @@ class NetworkingAgentRuntimeController
     String? activeActionType;
     String? activeActionNetworkId;
     try {
+      _captureRelayHint(command);
       switch (command.type) {
         case 'join_zerotier_network':
           {
@@ -2053,4 +2188,42 @@ class NetworkingAgentRuntimeController
       'mount=${network.localMountState}',
     );
   }
+}
+
+class _ObservedRelayState {
+  const _ObservedRelayState({
+    required this.connectionMode,
+    required this.relayNodeId,
+    required this.rttMs,
+    required this.txBytes,
+    required this.rxBytes,
+  });
+
+  final P2pConnectionMode connectionMode;
+  final String? relayNodeId;
+  final int? rttMs;
+  final int? txBytes;
+  final int? rxBytes;
+}
+
+String? _firstNonEmpty(String? first, String? second) {
+  final String? normalizedFirst = first?.trim();
+  if (normalizedFirst != null && normalizedFirst.isNotEmpty) {
+    return normalizedFirst;
+  }
+  final String? normalizedSecond = second?.trim();
+  if (normalizedSecond != null && normalizedSecond.isNotEmpty) {
+    return normalizedSecond;
+  }
+  return null;
+}
+
+int? _firstObservedMetric(Iterable<int>? values) {
+  if (values == null) {
+    return null;
+  }
+  for (final int value in values) {
+    return value;
+  }
+  return null;
 }
