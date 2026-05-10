@@ -1774,6 +1774,7 @@ class NetworkingAgentRuntimeController
             isConnected: false,
             localInterfaceReady: false,
             matchedInterfaceName: '',
+            matchedInterfaceIfIndex: 0,
             matchedInterfaceUp: false,
             mountDriverKind: 'unknown',
             mountCandidateNames: const <String>[],
@@ -1799,6 +1800,9 @@ class NetworkingAgentRuntimeController
     final String mergedMatchedInterfaceName =
         event.payload['matchedInterfaceName']?.toString() ??
             previous.matchedInterfaceName;
+    final int mergedMatchedInterfaceIfIndex =
+        _readEventInt(event, 'matchedInterfaceIfIndex') ??
+            previous.matchedInterfaceIfIndex;
     final bool mergedMatchedInterfaceUp =
         (event.payload['matchedInterfaceUp'] as bool?) ??
             previous.matchedInterfaceUp;
@@ -1843,6 +1847,7 @@ class NetworkingAgentRuntimeController
       isConnected: mergedConnected,
       localInterfaceReady: mergedLocalInterfaceReady,
       matchedInterfaceName: mergedMatchedInterfaceName,
+      matchedInterfaceIfIndex: mergedMatchedInterfaceIfIndex,
       matchedInterfaceUp: mergedMatchedInterfaceUp,
       mountDriverKind: mergedMountDriverKind,
       mountCandidateNames: mergedMountCandidateNames,

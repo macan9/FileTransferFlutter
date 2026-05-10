@@ -243,10 +243,10 @@ std::string ResolveLocalMountState(
   if (network.matched_interface_name.empty()) {
     return has_virtual_adapter ? "ip_not_bound" : "missing_adapter";
   }
-  if (!network.matched_interface_up) {
-    return "adapter_down";
-  }
   if (!network.system_ip_bound) {
+    if (!network.matched_interface_up) {
+      return "adapter_down";
+    }
     return "ip_not_bound";
   }
   if (network.route_expected && !network.system_route_bound) {
@@ -287,6 +287,10 @@ bool IsJoinClosedLoopReady(const ZeroTierWindowsNetworkRecord& network,
                            bool allow_mount_degraded) {
   (void)allow_mount_degraded;
   if (network.local_interface_ready) {
+    return true;
+  }
+  if (network.status == "OK" && network.is_authorized && network.is_connected &&
+      network.system_ip_bound && !network.assigned_addresses.empty()) {
     return true;
   }
   // On some Windows/Wintun setups, node_online can flap even after
@@ -3835,6 +3839,7 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
     case ZTS_EVENT_NETWORK_DOWN:
     case ZTS_EVENT_NODE_FATAL_ERROR: {
       bool emit_network_left = false;
+      bool suppress_transient_network_down_error = false;
       std::string left_network_id;
       flutter::EncodableMap payload;
       if (event->event_code == ZTS_EVENT_NETWORK_DOWN) {
@@ -3854,10 +3859,16 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
         if (event->network != nullptr && !emit_network_left) {
           auto it = networks_.find(event->network->net_id);
           if (it != networks_.end()) {
+            suppress_transient_network_down_error =
+                it->second.system_ip_bound ||
+                (!it->second.assigned_addresses.empty() &&
+                 it->second.matched_interface_if_index != 0);
             it->second.status = "NETWORK_DOWN";
             it->second.is_connected = false;
             it->second.is_authorized = false;
-            it->second.assigned_addresses.clear();
+            if (!suppress_transient_network_down_error) {
+              it->second.assigned_addresses.clear();
+            }
           }
         }
       }
@@ -3871,6 +3882,12 @@ void ZeroTierWindowsRuntime::ProcessEvent(void* message_ptr) {
         break;
       }
       if (event->event_code == ZTS_EVENT_NETWORK_DOWN) {
+        if (suppress_transient_network_down_error) {
+          LogNodeTrace("network_down_transient_suppressed network_id=" +
+                       (event->network == nullptr ? ""
+                                                  : ToHexNetworkId(event->network->net_id)));
+          break;
+        }
         {
           std::scoped_lock lock(mutex_);
           SetLastErrorLocked("ZeroTier runtime reported an unexpected network down.");
@@ -5067,7 +5084,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
             (selected_adapter_has_expected_ip &&
              selected_adapter->has_expected_route);
         record.local_interface_ready =
-            selected_adapter_has_expected_ip && selected_adapter->is_up;
+            selected_adapter_has_expected_ip;
       }
     }
 

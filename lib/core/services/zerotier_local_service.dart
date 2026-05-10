@@ -389,6 +389,7 @@ Get-NetFirewallRule -DisplayName "FileTransferFlutter-$ruleScopeId-*" -ErrorActi
       isConnected: assignedAddresses.isNotEmpty || status.toUpperCase() == 'OK',
       localInterfaceReady: false,
       matchedInterfaceName: '',
+      matchedInterfaceIfIndex: 0,
       matchedInterfaceUp: false,
       mountDriverKind: 'unknown',
       mountCandidateNames: const <String>[],

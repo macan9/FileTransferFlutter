@@ -263,6 +263,7 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
       isConnected: _readBool(map, 'isConnected'),
       localInterfaceReady: _readBool(map, 'localInterfaceReady'),
       matchedInterfaceName: _readString(map, 'matchedInterfaceName'),
+      matchedInterfaceIfIndex: _readInt(map, 'matchedInterfaceIfIndex'),
       matchedInterfaceUp: _readBool(map, 'matchedInterfaceUp'),
       mountDriverKind: _readString(map, 'mountDriverKind', fallback: 'unknown'),
       mountCandidateNames: _readList(map, 'mountCandidateNames')

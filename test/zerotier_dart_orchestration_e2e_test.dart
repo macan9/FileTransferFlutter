@@ -585,6 +585,7 @@ class _FakeZeroTierPlatformApi implements ZeroTierPlatformApi {
       isConnected: true,
       localInterfaceReady: true,
       matchedInterfaceName: 'FakeZT',
+      matchedInterfaceIfIndex: 7,
       matchedInterfaceUp: true,
       mountDriverKind: 'fake',
       mountCandidateNames: const <String>['FakeZT'],

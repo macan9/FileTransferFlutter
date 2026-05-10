@@ -10,6 +10,7 @@ class ZeroTierNetworkState extends Equatable {
     required this.isConnected,
     required this.localInterfaceReady,
     required this.matchedInterfaceName,
+    required this.matchedInterfaceIfIndex,
     required this.matchedInterfaceUp,
     required this.mountDriverKind,
     required this.mountCandidateNames,
@@ -31,6 +32,7 @@ class ZeroTierNetworkState extends Equatable {
   final bool isConnected;
   final bool localInterfaceReady;
   final String matchedInterfaceName;
+  final int matchedInterfaceIfIndex;
   final bool matchedInterfaceUp;
   final String mountDriverKind;
   final List<String> mountCandidateNames;
@@ -53,6 +55,7 @@ class ZeroTierNetworkState extends Equatable {
         isConnected,
         localInterfaceReady,
         matchedInterfaceName,
+        matchedInterfaceIfIndex,
         matchedInterfaceUp,
         mountDriverKind,
         mountCandidateNames,

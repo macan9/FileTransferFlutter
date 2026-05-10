@@ -2135,6 +2135,8 @@ class _LocalNetworkCard extends StatelessWidget {
         resolvedAdapter.tapMediaStatus ?? network.tapMediaStatus;
     final String effectiveInterfaceName =
         resolvedAdapter.interfaceName ?? network.matchedInterfaceName;
+    final int effectiveInterfaceIfIndex =
+        resolvedAdapter.interfaceIfIndex ?? network.matchedInterfaceIfIndex;
     final Color accentColor = _isActuallyMountedLocalNetwork(
       network,
       matchedInterfaceUpOverride: effectiveInterfaceUp,
@@ -2166,6 +2168,8 @@ class _LocalNetworkCard extends StatelessWidget {
       effectiveInterfaceUp,
       effectiveMediaStatus,
     );
+    final String mediaStatusLabel =
+        _localMediaStatusDisplayLabel(effectiveMediaStatus);
     final String mountStateLabel = _localMountStateLabel(network);
     final String driverLabel =
         network.mountDriverKind.trim().isEmpty ? '-' : network.mountDriverKind;
@@ -2226,9 +2230,7 @@ class _LocalNetworkCard extends StatelessWidget {
                 const SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    !effectiveInterfaceUp
-                        ? '${visualState.message}\n接口状态：Disconnected\n实际网卡状态：${effectiveMediaStatus.trim().isEmpty ? "Disconnected" : effectiveMediaStatus}'
-                        : visualState.message,
+                    visualState.message,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                           color: visualState.foreground,
                           fontWeight: FontWeight.w600,
@@ -2248,6 +2250,12 @@ class _LocalNetworkCard extends StatelessWidget {
               _InfoPill(label: '本地挂载', value: mountStateLabel),
               _InfoPill(label: '接口', value: interfaceLabel),
               _InfoPill(label: '接口状态', value: interfaceStatusLabel),
+              _InfoPill(label: '实际网卡状态', value: mediaStatusLabel),
+              if (effectiveInterfaceIfIndex > 0)
+                _InfoPill(
+                  label: '接口索引',
+                  value: effectiveInterfaceIfIndex.toString(),
+                ),
             ],
           ),
           if (!effectiveInterfaceUp && network.assignedAddresses.isNotEmpty)
@@ -4338,11 +4346,13 @@ List<String> _dedupeAddresses(List<String> addresses) {
 class _ResolvedAdapterSnapshot {
   const _ResolvedAdapterSnapshot({
     this.interfaceName,
+    this.interfaceIfIndex,
     this.matchedInterfaceUp,
     this.tapMediaStatus,
   });
 
   final String? interfaceName;
+  final int? interfaceIfIndex;
   final bool? matchedInterfaceUp;
   final String? tapMediaStatus;
 }
@@ -4352,47 +4362,25 @@ _ResolvedAdapterSnapshot _resolveAdapterSnapshot(
   ZeroTierAdapterBridgeStatus adapterBridge,
 ) {
   for (final ZeroTierAdapterRecord adapter in adapterBridge.adapters) {
+    final bool sameIfIndex =
+        network.matchedInterfaceIfIndex > 0 &&
+        adapter.ifIndex == network.matchedInterfaceIfIndex;
     final bool sameName = network.matchedInterfaceName.trim().isNotEmpty &&
         adapter.displayName.trim() == network.matchedInterfaceName.trim();
     final bool sameIp = adapter.ipv4Addresses.any(
       (String item) => network.assignedAddresses.contains(item),
     );
-    if (!sameName && !sameIp) {
+    if (!sameIfIndex && !sameName && !sameIp) {
       continue;
     }
     return _ResolvedAdapterSnapshot(
       interfaceName: adapter.displayName,
+      interfaceIfIndex: adapter.ifIndex,
       matchedInterfaceUp: adapter.isUp,
       tapMediaStatus: adapter.mediaStatus,
     );
   }
   return const _ResolvedAdapterSnapshot();
-}
-
-String _localMountStateDisplayLabel(ZeroTierNetworkState localState) {
-  if (localState.localMountState == 'ready' && !localState.matchedInterfaceUp) {
-    return '已挂载，但网卡未连通';
-  }
-  switch (localState.localMountState) {
-    case 'adapter_down':
-      return '网卡未连通';
-    case 'ip_not_bound':
-      return '等待 IP 挂载';
-    case 'route_not_bound':
-      return '等待路由挂载';
-    case 'missing_adapter':
-      return '未发现虚拟网卡';
-    case 'awaiting_address':
-      return '等待地址下发';
-    case 'ready':
-      return '已挂载';
-    case 'unknown':
-      return '状态未知';
-    default:
-      return localState.localMountState.trim().isEmpty
-          ? '状态未知'
-          : localState.localMountState;
-  }
 }
 
 String _localInterfaceStatusDisplayLabel(
@@ -4413,6 +4401,20 @@ String _localInterfaceStatusDisplayLabel(
     return '已连接但未就绪';
   }
   return '未连通（$tapMediaStatus）';
+}
+
+String _localMediaStatusDisplayLabel(String tapMediaStatus) {
+  final String normalized = tapMediaStatus.trim().toLowerCase();
+  if (normalized.isEmpty || normalized == 'unknown') {
+    return 'Unknown';
+  }
+  if (normalized == 'disconnected' || normalized == 'down') {
+    return 'Disconnected';
+  }
+  if (normalized == 'connected' || normalized == 'up') {
+    return 'Connected';
+  }
+  return tapMediaStatus.trim();
 }
 
 String _localMountStateLabel(ZeroTierNetworkState localState) {
