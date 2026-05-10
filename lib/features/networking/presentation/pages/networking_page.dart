@@ -206,10 +206,14 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             nextEventType == ZeroTierRuntimeEventType.ipAssigned ||
             nextEventType == ZeroTierRuntimeEventType.networkOnline ||
             nextEventType == ZeroTierRuntimeEventType.error;
-        final bool leaveProgressObserved = next.hasActiveLeaveSession ||
+        final bool leaveInFlightObserved = next.hasActiveLeaveSession ||
             next.activeNetworkActionType == 'leave' ||
+            nextEventType == ZeroTierRuntimeEventType.networkLeaving;
+        final bool leaveTerminalObserved =
             nextEventType == ZeroTierRuntimeEventType.networkLeft ||
-            nextEventType == ZeroTierRuntimeEventType.error;
+                nextEventType == ZeroTierRuntimeEventType.error;
+        final bool leaveProgressObserved =
+            leaveInFlightObserved || leaveTerminalObserved;
         if (joinProgressObserved && _isDefaultJoinTransitioning && mounted) {
           setState(() {
             _isDefaultJoinTransitioning = false;
@@ -260,7 +264,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
               DateTime.now().difference(_defaultLeaveTransitionStartedAt!) >=
                   _defaultMountStallTimeout;
           if (defaultNetworkGone ||
-              (localNetworkGone && !leaveProgressObserved) ||
+              localNetworkGone ||
+              leaveTerminalObserved ||
               leaveHasStalled) {
             setState(() {
               _hasDefaultNetworkingIntent = false;
@@ -654,6 +659,13 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       await ref.read(networkingProvider.notifier).leaveDefaultNetwork(
             deviceId: readyConfig.deviceId,
           );
+      ref
+          .read(networkingAgentRuntimeProvider.notifier)
+          .recordSyntheticRuntimeEvent(
+            type: ZeroTierRuntimeEventType.networkLeaving,
+            networkId: networkId,
+            message: '默认网络离网请求已提交，等待本地运行时完成离网。',
+          );
       unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
       await ref.read(networkingProvider.notifier).refresh();
       if (!mounted) {
@@ -754,6 +766,7 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
 
   Future<void> _leaveManagedNetwork(ManagedNetwork? network) async {
     final String networkId = network?.id.trim() ?? '';
+    final String runtimeNetworkId = network?.zeroTierNetworkId?.trim() ?? '';
     if (networkId.isEmpty) {
       _showPageMessage('私有网络信息不完整，无法取消组网。');
       return;
@@ -780,6 +793,13 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       await ref.read(networkingProvider.notifier).leaveManagedNetwork(
             networkId: networkId,
             deviceId: readyConfig.deviceId,
+          );
+      ref
+          .read(networkingAgentRuntimeProvider.notifier)
+          .recordSyntheticRuntimeEvent(
+            type: ZeroTierRuntimeEventType.networkLeaving,
+            networkId: runtimeNetworkId.isEmpty ? null : runtimeNetworkId,
+            message: '组网离开请求已提交，等待本地运行时完成离网。',
           );
       unawaited(ref.read(networkingAgentRuntimeProvider.notifier).refreshNow());
       await ref.read(networkingProvider.notifier).refresh();
@@ -888,6 +908,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       ZeroTierRuntimeEventType.nodeStopped => 'ZeroTier 节点已停止。',
       ZeroTierRuntimeEventType.networkJoining =>
         '正在加入 ZeroTier 网络$networkSuffix。',
+      ZeroTierRuntimeEventType.networkLeaving =>
+        '正在离开 ZeroTier 网络$networkSuffix。',
       ZeroTierRuntimeEventType.networkWaitingAuthorization =>
         '网络$networkSuffix 仍在等待授权。',
       ZeroTierRuntimeEventType.networkOnline => '网络$networkSuffix 已在线。',
@@ -1197,7 +1219,7 @@ class _RuntimeInsightCard extends StatelessWidget {
     );
     return SectionCard(
       title: '运行状态',
-      subtitle: '仅展示当前设备相关网络的运行时事件与适配器诊断，过滤无关网络。',
+      subtitle: '仅展示当前设备相关网络的运行状态与适配器诊断，过滤无关网络。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
@@ -1205,7 +1227,7 @@ class _RuntimeInsightCard extends StatelessWidget {
           const SizedBox(height: 16),
           if (filteredEvents.isEmpty)
             const _EmptyStateBox(
-              message: '当前没有与相关网络直接关联的运行时事件。',
+              message: '当前没有与相关网络直接关联的运行状态事件。',
             )
           else
             _ScopedRuntimeEventsCard(events: filteredEvents),
@@ -1535,8 +1557,12 @@ class _OneClickNetworkingTab extends StatelessWidget {
     final bool hasLocalMapping = localState != null &&
         !isLocalAuthorizationPending &&
         _isLocalNetworkMounted(localState, hasServiceAssignedIp);
-    final bool isClosing =
-        isTransitionLocked || (isMembershipRevoked && localState != null);
+    final bool hasBlockingLeaveTransition = isTransitionLocked &&
+        (localState != null ||
+            agentState.activeNetworkActionType == 'leave' ||
+            agentState.lastRuntimeEvent?.type ==
+                ZeroTierRuntimeEventType.networkLeaving);
+    final bool isClosing = hasBlockingLeaveTransition;
     final bool isGrouped = !isMembershipRevoked &&
         hasLocalMapping &&
         (hasSessionJoinIntent ||
@@ -1650,7 +1676,9 @@ class _OneClickNetworkingTab extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           _VirtualIpPanel(
-            addresses: localState?.assignedAddresses ?? const <String>[],
+            addresses: isConnected
+                ? localState.assignedAddresses
+                : const <String>[],
             onCopy: onCopyIp,
           ),
           if (isExternallyLocked) ...<Widget>[
@@ -2579,7 +2607,7 @@ class _ScopedRuntimeEventsCard extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
         Text(
-          '运行时事件',
+          '运行状态',
           style: Theme.of(context).textTheme.titleSmall?.copyWith(
                 fontWeight: FontWeight.w800,
               ),
@@ -2587,7 +2615,7 @@ class _ScopedRuntimeEventsCard extends StatelessWidget {
         const SizedBox(height: 10),
         if (events.isEmpty)
           const _EmptyStateBox(
-            message: '当前没有与这条虚拟组网直接相关的运行时事件。',
+            message: '当前没有与这条虚拟组网直接相关的运行状态事件。',
           )
         else
           Column(
@@ -3193,7 +3221,7 @@ class _SecondarySectionBar extends StatelessWidget {
           runSpacing: 8,
           children: <Widget>[
             _SectionLinkButton(label: 'Agent 实况', onTap: onTapAgent),
-            _SectionLinkButton(label: '运行时事件', onTap: onTapRuntime),
+            _SectionLinkButton(label: '运行状态', onTap: onTapRuntime),
             _SectionLinkButton(label: '架构联动', onTap: onTapAlignment),
             _SectionLinkButton(label: '本地网络', onTap: onTapLocal),
           ]),
@@ -4182,6 +4210,16 @@ _RuntimeSignal _resolveRuntimeSignal({
           icon: Icons.schedule_rounded,
           background: const Color(0xFFFFF4E8),
           foreground: const Color(0xFFB45309),
+        );
+      case ZeroTierRuntimeEventType.networkLeaving:
+        return _RuntimeSignal(
+          label: '正在离开网络',
+          message: highlightedEvent.message?.trim().isNotEmpty == true
+              ? highlightedEvent.message!
+              : '离网请求已经提交，正在等待本地 ZeroTier 完成离网回收。',
+          icon: Icons.sync_rounded,
+          background: const Color(0xFFEAF2FF),
+          foreground: const Color(0xFF1D4ED8),
         );
       case ZeroTierRuntimeEventType.nodeOffline:
         return _RuntimeSignal(
@@ -5299,6 +5337,12 @@ _RuntimeEventStyle _runtimeEventStyle(ZeroTierRuntimeEventType type) {
         foreground: Color(0xFFB45309),
         icon: Icons.schedule_rounded,
       );
+    case ZeroTierRuntimeEventType.networkLeaving:
+      return const _RuntimeEventStyle(
+        background: Color(0xFFEAF2FF),
+        foreground: Color(0xFF1D4ED8),
+        icon: Icons.sync_rounded,
+      );
     case ZeroTierRuntimeEventType.networkLeft:
       return const _RuntimeEventStyle(
         background: Color(0xFFEAF2FF),
@@ -5357,6 +5401,8 @@ String _runtimeEventTitle(ZeroTierRuntimeEventType type) {
       return '节点已停止';
     case ZeroTierRuntimeEventType.networkJoining:
       return '正在入网';
+    case ZeroTierRuntimeEventType.networkLeaving:
+      return '正在离网';
     case ZeroTierRuntimeEventType.networkWaitingAuthorization:
       return '等待网络授权';
     case ZeroTierRuntimeEventType.networkOnline:
@@ -5375,7 +5421,7 @@ String _runtimeEventFallbackMessage(ZeroTierRuntimeEventType type) {
     case ZeroTierRuntimeEventType.environmentReady:
       return 'ZeroTier 运行时环境已经准备完成。';
     case ZeroTierRuntimeEventType.permissionRequired:
-      return '当前动作仍需要额外权限或手动设置。';
+      return '当前动作仍然需要额外权限或手动设置。';
     case ZeroTierRuntimeEventType.nodeStarted:
       return '本机 ZeroTier 节点已经收到启动动作。';
     case ZeroTierRuntimeEventType.nodeOnline:
@@ -5386,6 +5432,8 @@ String _runtimeEventFallbackMessage(ZeroTierRuntimeEventType type) {
       return '本机 ZeroTier 节点当前已停止。';
     case ZeroTierRuntimeEventType.networkJoining:
       return '已发起入网，正在等待网络侧返回更明确状态。';
+    case ZeroTierRuntimeEventType.networkLeaving:
+      return '离网请求已经提交，正在等待本地 ZeroTier 完成离网。';
     case ZeroTierRuntimeEventType.networkWaitingAuthorization:
       return '当前网络仍在等待授权，暂时还不能视为入网成功。';
     case ZeroTierRuntimeEventType.networkOnline:

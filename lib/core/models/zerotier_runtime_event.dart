@@ -8,6 +8,7 @@ enum ZeroTierRuntimeEventType {
   nodeOffline,
   nodeStopped,
   networkJoining,
+  networkLeaving,
   networkWaitingAuthorization,
   networkOnline,
   networkLeft,

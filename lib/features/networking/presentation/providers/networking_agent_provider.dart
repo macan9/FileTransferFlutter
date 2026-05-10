@@ -305,7 +305,28 @@ class NetworkingAgentRuntimeController
 
   Future<void> activate() async {
     await _ensureStarted();
+    await _primeRuntimeInitializationEventsIfNeeded();
     await refreshNow();
+  }
+
+  void recordSyntheticRuntimeEvent({
+    required ZeroTierRuntimeEventType type,
+    String? networkId,
+    String? message,
+    Map<String, Object?> payload = const <String, Object?>{},
+  }) {
+    _recordRuntimeEvent(
+      ZeroTierRuntimeEvent(
+        type: type,
+        occurredAt: DateTime.now(),
+        networkId: networkId?.trim().isEmpty ?? true ? null : networkId!.trim(),
+        message: message,
+        payload: <String, Object?>{
+          ...payload,
+          'synthetic': true,
+        },
+      ),
+    );
   }
 
   Future<void> _refreshServerReachability() async {
@@ -393,6 +414,14 @@ class NetworkingAgentRuntimeController
       await _zeroTierService.leaveNetwork(
         networkId,
         source: source,
+      );
+      recordSyntheticRuntimeEvent(
+        type: ZeroTierRuntimeEventType.networkLeaving,
+        networkId: networkId,
+        message: '正在离开网络。',
+        payload: <String, Object?>{
+          'leaveSource': source,
+        },
       );
       if (_shouldWaitInDartForNetworkLeave) {
         await _waitForNetworkLeft(networkId);
@@ -1682,11 +1711,21 @@ class NetworkingAgentRuntimeController
       );
       return;
     }
+    _recordRuntimeEvent(event);
+  }
+
+  void _recordRuntimeEvent(ZeroTierRuntimeEvent event) {
+    if (_isDuplicateRuntimeEvent(event)) {
+      debugPrint(
+        'Ignoring duplicate ZeroTier runtime event: '
+        'type=${event.type.name}, networkId=${event.networkId ?? '-'}, '
+        'message=${event.message ?? '-'}',
+      );
+      return;
+    }
     _logJoinRuntimeCheckpoint(event);
-    final List<ZeroTierRuntimeEvent> recentEvents = <ZeroTierRuntimeEvent>[
-      event,
-      ...state.recentRuntimeEvents
-    ].take(8).toList(growable: false);
+    final List<ZeroTierRuntimeEvent> recentEvents =
+        _buildRecentRuntimeEvents(event);
     final String? transitionNetworkId = state.transitioningNetworkId;
     final bool isMatchingTransitionNetwork = transitionNetworkId != null &&
         transitionNetworkId.trim().isNotEmpty &&
@@ -1695,6 +1734,9 @@ class NetworkingAgentRuntimeController
       lastRuntimeEvent: event,
       recentRuntimeEvents: recentEvents,
       networkTransitionLabel: switch (event.type) {
+        ZeroTierRuntimeEventType.networkLeaving
+            when isMatchingTransitionNetwork =>
+          '离网请求已提交，正在等待本地 ZeroTier 完成离网',
         ZeroTierRuntimeEventType.networkLeft when isMatchingTransitionNetwork =>
           '离网事件已完成，正在检查本地 ZeroTier 是否恢复稳定',
         ZeroTierRuntimeEventType.nodeOffline
@@ -1709,6 +1751,7 @@ class NetworkingAgentRuntimeController
         ZeroTierRuntimeEventType.environmentReady ||
         ZeroTierRuntimeEventType.nodeStarted ||
         ZeroTierRuntimeEventType.nodeOnline ||
+        ZeroTierRuntimeEventType.networkLeaving ||
         ZeroTierRuntimeEventType.networkWaitingAuthorization ||
         ZeroTierRuntimeEventType.networkOnline ||
         ZeroTierRuntimeEventType.networkLeft ||
@@ -1720,6 +1763,7 @@ class NetworkingAgentRuntimeController
         ZeroTierRuntimeEventType.environmentReady ||
         ZeroTierRuntimeEventType.nodeStarted ||
         ZeroTierRuntimeEventType.nodeOnline ||
+        ZeroTierRuntimeEventType.networkLeaving ||
         ZeroTierRuntimeEventType.networkWaitingAuthorization ||
         ZeroTierRuntimeEventType.networkOnline ||
         ZeroTierRuntimeEventType.networkLeft ||
@@ -1738,6 +1782,53 @@ class NetworkingAgentRuntimeController
     }
   }
 
+  Future<void> _primeRuntimeInitializationEventsIfNeeded() async {
+    if (state.recentRuntimeEvents.isNotEmpty) {
+      return;
+    }
+    try {
+      final ZeroTierRuntimeStatus status =
+          await _zeroTierService.detectStatus();
+      if (status.cliAvailable && status.permissionState.isGranted) {
+        _recordRuntimeEvent(
+          ZeroTierRuntimeEvent(
+            type: ZeroTierRuntimeEventType.environmentReady,
+            occurredAt: DateTime.now(),
+            message: '本地环境已就绪。',
+          ),
+        );
+      }
+      if (status.hasNodeId || status.isNodeRunning) {
+        _recordRuntimeEvent(
+          ZeroTierRuntimeEvent(
+            type: ZeroTierRuntimeEventType.nodeStarted,
+            occurredAt: DateTime.now(),
+            message: 'ZeroTier 节点已启动。',
+            payload: <String, Object?>{
+              'nodeId': status.nodeId,
+              'synthetic': true,
+            },
+          ),
+        );
+      }
+      if (status.isNodeReady && !status.isNodeOffline) {
+        _recordRuntimeEvent(
+          ZeroTierRuntimeEvent(
+            type: ZeroTierRuntimeEventType.nodeOnline,
+            occurredAt: DateTime.now(),
+            message: 'ZeroTier 节点已在线。',
+            payload: <String, Object?>{
+              'nodeId': status.nodeId,
+              'synthetic': true,
+            },
+          ),
+        );
+      }
+    } catch (_) {
+      // Keep initialization best-effort and never block activation.
+    }
+  }
+
   void _applyRuntimeEventNetworkSnapshot(ZeroTierRuntimeEvent event) {
     if (!Platform.isWindows) {
       return;
@@ -1747,6 +1838,18 @@ class NetworkingAgentRuntimeController
       return;
     }
     switch (event.type) {
+      case ZeroTierRuntimeEventType.networkLeft:
+        final List<ZeroTierNetworkState> networks =
+            List<ZeroTierNetworkState>.from(state.runtimeStatus.joinedNetworks)
+              ..removeWhere(
+                (ZeroTierNetworkState item) =>
+                    item.networkId.trim().toLowerCase() ==
+                    networkId.toLowerCase(),
+              );
+        state = state.copyWith(
+          runtimeStatus: state.runtimeStatus.copyWith(joinedNetworks: networks),
+        );
+        return;
       case ZeroTierRuntimeEventType.networkOnline:
       case ZeroTierRuntimeEventType.ipAssigned:
         break;
@@ -1886,7 +1989,8 @@ class NetworkingAgentRuntimeController
         .toList(growable: false);
   }
 
-  Future<void> _probeRuntimeNetworkStateForEvent(ZeroTierRuntimeEvent event) async {
+  Future<void> _probeRuntimeNetworkStateForEvent(
+      ZeroTierRuntimeEvent event) async {
     final String networkId = event.networkId?.trim() ?? '';
     if (networkId.isEmpty) {
       return;
@@ -2071,6 +2175,186 @@ class NetworkingAgentRuntimeController
     return false;
   }
 
+  bool _isDuplicateRuntimeEvent(ZeroTierRuntimeEvent event) {
+    for (final ZeroTierRuntimeEvent existing in state.recentRuntimeEvents) {
+      final Duration delta =
+          existing.occurredAt.difference(event.occurredAt).abs();
+      if (_isSemanticallyDuplicateRuntimeEvent(existing, event, delta)) {
+        return true;
+      }
+      if (!_isSameRuntimeEventScope(existing, event)) {
+        continue;
+      }
+      if ((existing.message ?? '').trim() != (event.message ?? '').trim()) {
+        continue;
+      }
+      if (!_sameRuntimeEventPayload(existing.payload, event.payload)) {
+        continue;
+      }
+      if (delta <= const Duration(seconds: 2)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  List<ZeroTierRuntimeEvent> _buildRecentRuntimeEvents(
+    ZeroTierRuntimeEvent event,
+  ) {
+    final List<ZeroTierRuntimeEvent> recentEvents = <ZeroTierRuntimeEvent>[
+      event
+    ];
+    for (final ZeroTierRuntimeEvent existing in state.recentRuntimeEvents) {
+      if (_shouldPruneRecentRuntimeEvent(existing, incoming: event)) {
+        continue;
+      }
+      recentEvents.add(existing);
+      if (recentEvents.length >= 8) {
+        break;
+      }
+    }
+    return recentEvents;
+  }
+
+  bool _shouldPruneRecentRuntimeEvent(
+    ZeroTierRuntimeEvent existing, {
+    required ZeroTierRuntimeEvent incoming,
+  }) {
+    if (_isSameRuntimeEventScope(existing, incoming) &&
+        existing.type == incoming.type &&
+        _isSyntheticRuntimeEvent(existing) &&
+        !_isSyntheticRuntimeEvent(incoming)) {
+      return true;
+    }
+    if (!_isSameRuntimeEventNetwork(existing, incoming)) {
+      return false;
+    }
+    switch (incoming.type) {
+      case ZeroTierRuntimeEventType.networkOnline:
+        return existing.type == ZeroTierRuntimeEventType.networkOnline ||
+            existing.type == ZeroTierRuntimeEventType.ipAssigned;
+      case ZeroTierRuntimeEventType.networkLeft:
+        return existing.type == ZeroTierRuntimeEventType.networkLeaving ||
+            existing.type == ZeroTierRuntimeEventType.networkLeft;
+      case ZeroTierRuntimeEventType.networkLeaving:
+        return existing.type == ZeroTierRuntimeEventType.networkLeaving;
+      default:
+        return false;
+    }
+  }
+
+  bool _isSemanticallyDuplicateRuntimeEvent(
+    ZeroTierRuntimeEvent existing,
+    ZeroTierRuntimeEvent incoming,
+    Duration delta,
+  ) {
+    if (_isSameRuntimeEventScope(existing, incoming) &&
+        _shouldSemanticallyDedupe(incoming.type) &&
+        delta <= const Duration(seconds: 5)) {
+      return true;
+    }
+    if (!_isSameRuntimeEventNetwork(existing, incoming) ||
+        delta > const Duration(seconds: 5)) {
+      return false;
+    }
+    if (incoming.type == ZeroTierRuntimeEventType.ipAssigned &&
+        existing.type == ZeroTierRuntimeEventType.networkOnline) {
+      return true;
+    }
+    if (incoming.type == ZeroTierRuntimeEventType.networkLeaving &&
+        existing.type == ZeroTierRuntimeEventType.networkLeft) {
+      return true;
+    }
+    return false;
+  }
+
+  bool _shouldSemanticallyDedupe(ZeroTierRuntimeEventType type) {
+    switch (type) {
+      case ZeroTierRuntimeEventType.environmentReady:
+      case ZeroTierRuntimeEventType.permissionRequired:
+      case ZeroTierRuntimeEventType.nodeStarted:
+      case ZeroTierRuntimeEventType.nodeOnline:
+      case ZeroTierRuntimeEventType.nodeOffline:
+      case ZeroTierRuntimeEventType.nodeStopped:
+      case ZeroTierRuntimeEventType.networkJoining:
+      case ZeroTierRuntimeEventType.networkLeaving:
+      case ZeroTierRuntimeEventType.networkWaitingAuthorization:
+      case ZeroTierRuntimeEventType.networkOnline:
+      case ZeroTierRuntimeEventType.networkLeft:
+      case ZeroTierRuntimeEventType.ipAssigned:
+        return true;
+      case ZeroTierRuntimeEventType.error:
+        return false;
+    }
+  }
+
+  bool _isSyntheticRuntimeEvent(ZeroTierRuntimeEvent event) =>
+      event.payload['synthetic'] == true;
+
+  bool _isSameRuntimeEventScope(
+    ZeroTierRuntimeEvent left,
+    ZeroTierRuntimeEvent right,
+  ) {
+    return left.type == right.type &&
+        _normalizedRuntimeEventNetworkId(left) ==
+            _normalizedRuntimeEventNetworkId(right);
+  }
+
+  bool _isSameRuntimeEventNetwork(
+    ZeroTierRuntimeEvent left,
+    ZeroTierRuntimeEvent right,
+  ) {
+    final String leftId = _normalizedRuntimeEventNetworkId(left);
+    if (leftId.isEmpty) {
+      return false;
+    }
+    return leftId == _normalizedRuntimeEventNetworkId(right);
+  }
+
+  String _normalizedRuntimeEventNetworkId(ZeroTierRuntimeEvent event) =>
+      event.networkId?.trim().toLowerCase() ?? '';
+
+  bool _sameRuntimeEventPayload(
+    Map<String, Object?> left,
+    Map<String, Object?> right,
+  ) {
+    if (left.length != right.length) {
+      return false;
+    }
+    for (final MapEntry<String, Object?> entry in left.entries) {
+      if (!_payloadValueEquals(entry.value, right[entry.key])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool _payloadValueEquals(Object? left, Object? right) {
+    if (left is List && right is List) {
+      if (left.length != right.length) {
+        return false;
+      }
+      for (int index = 0; index < left.length; index++) {
+        if (!_payloadValueEquals(left[index], right[index])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (left is Map && right is Map) {
+      if (left.length != right.length) {
+        return false;
+      }
+      for (final MapEntry<dynamic, dynamic> entry in left.entries) {
+        if (!_payloadValueEquals(entry.value, right[entry.key])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return left == right;
+  }
+
   int? _readEventGeneration(ZeroTierRuntimeEvent event) {
     final Object? raw = event.payload['generation'];
     if (raw is int) {
@@ -2150,6 +2434,7 @@ class NetworkingAgentRuntimeController
       case ZeroTierRuntimeEventType.nodeStarted:
       case ZeroTierRuntimeEventType.nodeOnline:
       case ZeroTierRuntimeEventType.nodeOffline:
+      case ZeroTierRuntimeEventType.networkLeaving:
       case ZeroTierRuntimeEventType.networkOnline:
       case ZeroTierRuntimeEventType.networkLeft:
       case ZeroTierRuntimeEventType.ipAssigned:
@@ -2198,6 +2483,7 @@ class NetworkingAgentRuntimeController
       case ZeroTierRuntimeEventType.nodeOnline:
       case ZeroTierRuntimeEventType.nodeOffline:
       case ZeroTierRuntimeEventType.nodeStopped:
+      case ZeroTierRuntimeEventType.networkLeaving:
       case ZeroTierRuntimeEventType.networkLeft:
         return;
     }
