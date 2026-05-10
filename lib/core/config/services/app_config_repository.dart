@@ -1,6 +1,7 @@
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/config/models/launch_environment.dart';
 import 'package:file_transfer_flutter/core/config/services/app_config_defaults_resolver.dart';
+import 'package:file_transfer_flutter/core/config/services/launch_environment_loader.dart';
 import 'package:hive/hive.dart';
 
 abstract interface class AppConfigRepository {
@@ -11,20 +12,25 @@ abstract interface class AppConfigRepository {
 class HiveAppConfigRepository implements AppConfigRepository {
   HiveAppConfigRepository({
     required Box<dynamic> box,
-    required AppConfigDefaultsResolver defaultsResolver,
-    LaunchEnvironment? launchEnvironment,
+    LaunchEnvironmentLoader? launchEnvironmentLoader,
   })  : _box = box,
-        _defaultsResolver = defaultsResolver;
+        _launchEnvironmentLoader =
+            launchEnvironmentLoader ?? const LaunchEnvironmentLoader(),
+        super();
 
   static const String boxName = 'app_config';
   static const String configKey = 'current';
 
   final Box<dynamic> _box;
-  final AppConfigDefaultsResolver _defaultsResolver;
+  final LaunchEnvironmentLoader _launchEnvironmentLoader;
 
   @override
   Future<AppConfig> load() async {
-    final AppConfig defaults = await _defaultsResolver.resolve();
+    final LaunchEnvironment effectiveEnvironment =
+        await _launchEnvironmentLoader.load();
+    final AppConfig defaults = await AppConfigDefaultsResolver(
+      launchEnvironment: effectiveEnvironment,
+    ).resolve();
     final dynamic raw = _box.get(configKey);
     final AppConfig mergedConfig = _mergePersistedConfig(raw, defaults);
     final AppConfig normalized = mergedConfig.normalized();
@@ -38,7 +44,13 @@ class HiveAppConfigRepository implements AppConfigRepository {
 
   @override
   Future<AppConfig> save(AppConfig config) async {
-    final AppConfig normalized = config.normalized();
+    final LaunchEnvironment effectiveEnvironment =
+        await _launchEnvironmentLoader.load();
+    final AppConfig normalized = config
+        .copyWith(
+          serverUrl: effectiveEnvironment.activeServerUrl,
+        )
+        .normalized();
     await _box.put(configKey, normalized.toJson());
     return normalized;
   }

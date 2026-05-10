@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:file_transfer_flutter/core/config/app_network_config.dart';
 import 'package:file_transfer_flutter/core/config/models/launch_environment.dart';
@@ -9,9 +10,7 @@ class LaunchEnvironmentLoader {
 
   Future<LaunchEnvironment> load() async {
     try {
-      final String raw = await rootBundle.loadString(
-        AppNetworkConfig.launchConfigAssetPath,
-      );
+      final String raw = await _loadRawConfig();
       final dynamic decoded = jsonDecode(raw);
       if (decoded is! Map<String, dynamic>) {
         return _fallbackEnvironment;
@@ -32,6 +31,14 @@ class LaunchEnvironmentLoader {
     } catch (_) {
       return _fallbackEnvironment;
     }
+  }
+
+  Future<String> _loadRawConfig() async {
+    final File diskConfig = File(AppNetworkConfig.launchConfigFileName);
+    if (await diskConfig.exists()) {
+      return diskConfig.readAsString();
+    }
+    return rootBundle.loadString(AppNetworkConfig.launchConfigAssetPath);
   }
 
   String _normalizeOrFallback(String value, String fallback) {

@@ -1794,13 +1794,13 @@ class NetworkingAgentRuntimeController
         connectedFromPayload ||
         previous.isConnected;
     final bool mergedLocalInterfaceReady =
-        (event.payload['localInterfaceReady'] as bool?) == true ||
+        (event.payload['localInterfaceReady'] as bool?) ??
             previous.localInterfaceReady;
     final String mergedMatchedInterfaceName =
         event.payload['matchedInterfaceName']?.toString() ??
             previous.matchedInterfaceName;
     final bool mergedMatchedInterfaceUp =
-        (event.payload['matchedInterfaceUp'] as bool?) == true ||
+        (event.payload['matchedInterfaceUp'] as bool?) ??
             previous.matchedInterfaceUp;
     final String mergedMountDriverKind =
         event.payload['mountDriverKind']?.toString() ??

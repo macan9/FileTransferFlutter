@@ -66,6 +66,12 @@ class AppConfigController extends Notifier<AppConfig> {
     return ref.watch(initialAppConfigProvider);
   }
 
+  Future<AppConfig> reload() async {
+    final AppConfig loaded = await ref.read(appConfigRepositoryProvider).load();
+    state = loaded;
+    return loaded;
+  }
+
   Future<AppConfig> save(AppConfig nextConfig) async {
     final AppConfig savedConfig =
         await ref.read(appConfigRepositoryProvider).save(nextConfig);

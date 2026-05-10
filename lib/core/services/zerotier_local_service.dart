@@ -387,20 +387,19 @@ Get-NetFirewallRule -DisplayName "FileTransferFlutter-$ruleScopeId-*" -ErrorActi
       assignedAddresses: assignedAddresses,
       isAuthorized: isAuthorized,
       isConnected: assignedAddresses.isNotEmpty || status.toUpperCase() == 'OK',
-      localInterfaceReady:
-          assignedAddresses.isNotEmpty || status.toUpperCase() == 'OK',
+      localInterfaceReady: false,
       matchedInterfaceName: '',
-      matchedInterfaceUp: assignedAddresses.isNotEmpty,
+      matchedInterfaceUp: false,
       mountDriverKind: 'unknown',
       mountCandidateNames: const <String>[],
       routeExpected: false,
       expectedRouteCount: 0,
       systemIpBound: assignedAddresses.isNotEmpty,
       systemRouteBound: true,
-      tapMediaStatus: assignedAddresses.isNotEmpty ? 'up' : 'unknown',
+      tapMediaStatus: assignedAddresses.isNotEmpty ? 'disconnected' : 'unknown',
       tapDeviceInstanceId: '',
       tapNetCfgInstanceId: '',
-      localMountState: assignedAddresses.isNotEmpty ? 'ready' : 'unknown',
+      localMountState: assignedAddresses.isNotEmpty ? 'adapter_down' : 'unknown',
     );
   }
 

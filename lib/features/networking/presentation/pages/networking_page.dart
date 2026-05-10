@@ -1364,17 +1364,18 @@ class _AdapterBridgeCard extends StatelessWidget {
                 padding: const EdgeInsets.only(bottom: 10),
                 child: _LabeledBlock(
                   label: adapter.displayName,
-                  value: 'status=${adapter.operStatus} up=${adapter.isUp} '
-                      'virtual=${adapter.isVirtual} '
-                      'mountCandidate=${adapter.isMountCandidate} '
-                      'expectedIp=${adapter.matchesExpectedIp} '
-                      'expectedRoute=${adapter.hasExpectedRoute} '
-                      'driver=${adapter.driverKind} '
-                      'media=${adapter.mediaStatus} '
-                      'ifIndex=${adapter.ifIndex} '
-                      'tapDevId=${adapter.tapDeviceInstanceId.isEmpty ? "-" : adapter.tapDeviceInstanceId} '
-                      'tapCfgId=${adapter.tapNetCfgInstanceId.isEmpty ? "-" : adapter.tapNetCfgInstanceId} '
-                      'ipv4=${adapter.ipv4Addresses.isEmpty ? "-" : adapter.ipv4Addresses.join(", ")}',
+                  value: '运行状态=${_adapterOperStatusLabel(adapter.operStatus)} '
+                      '接口可用=${adapter.isUp ? "是" : "否"} '
+                      '虚拟网卡=${adapter.isVirtual ? "是" : "否"} '
+                      '可挂载候选=${adapter.isMountCandidate ? "是" : "否"} '
+                      '已匹配目标IP=${adapter.matchesExpectedIp ? "是" : "否"} '
+                      '已匹配目标路由=${adapter.hasExpectedRoute ? "是" : "否"} '
+                      '驱动=${_adapterDriverKindLabel(adapter.driverKind)} '
+                      '介质状态=${_adapterMediaStatusLabel(adapter.mediaStatus)} '
+                      '接口索引=${adapter.ifIndex} '
+                      '设备ID=${adapter.tapDeviceInstanceId.isEmpty ? "-" : adapter.tapDeviceInstanceId} '
+                      '配置ID=${adapter.tapNetCfgInstanceId.isEmpty ? "-" : adapter.tapNetCfgInstanceId} '
+                      'IPv4=${adapter.ipv4Addresses.isEmpty ? "-" : adapter.ipv4Addresses.join(", ")}',
                 ),
               ),
             ),
@@ -1382,6 +1383,63 @@ class _AdapterBridgeCard extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+String _adapterOperStatusLabel(String value) {
+  switch (value.trim().toLowerCase()) {
+    case 'up':
+      return '已连接';
+    case 'down':
+      return '未连接';
+    case 'lower_layer_down':
+      return '底层链路未就绪';
+    case 'dormant':
+      return '休眠中';
+    case 'testing':
+      return '检测中';
+    case 'not_present':
+      return '设备不存在';
+    case 'unknown':
+      return '未知';
+    default:
+      return value.trim().isEmpty ? '未知' : value;
+  }
+}
+
+String _adapterMediaStatusLabel(String value) {
+  switch (value.trim().toLowerCase()) {
+    case 'connected':
+      return '已连接';
+    case 'disconnected':
+      return '未连接';
+    case 'unknown':
+      return '未知';
+    default:
+      return value.trim().isEmpty ? '未知' : value;
+  }
+}
+
+String _adapterDriverKindLabel(String value) {
+  switch (value.trim().toLowerCase()) {
+    case 'wintun':
+      return 'Wintun';
+    case 'tap-windows':
+      return 'TAP-Windows';
+    case 'zerotier':
+      return 'ZeroTier';
+    case 'wireguard':
+      return 'WireGuard';
+    case 'openvpn':
+      return 'OpenVPN';
+    case 'ethernet':
+      return '以太网';
+    case 'hypervisor-virtual':
+      return '虚拟化网卡';
+    case 'unknown':
+      return '未知';
+    default:
+      return value.trim().isEmpty ? '未知' : value;
   }
 }
 
@@ -1477,6 +1535,7 @@ class _LocalNetworksCard extends StatelessWidget {
                       child: _LocalNetworkCard(
                         currentDeviceId: currentDeviceId,
                         network: network,
+                        adapterBridge: runtimeStatus.adapterBridge,
                         managedNetwork:
                             _matchManagedNetwork(network, managedNetworks),
                       ),
@@ -2057,16 +2116,29 @@ class _LocalNetworkCard extends StatelessWidget {
   const _LocalNetworkCard({
     required this.currentDeviceId,
     required this.network,
+    required this.adapterBridge,
     required this.managedNetwork,
   });
 
   final String currentDeviceId;
   final ZeroTierNetworkState network;
+  final ZeroTierAdapterBridgeStatus adapterBridge;
   final ManagedNetwork? managedNetwork;
 
   @override
   Widget build(BuildContext context) {
-    final Color accentColor = network.localInterfaceReady
+    final _ResolvedAdapterSnapshot resolvedAdapter =
+        _resolveAdapterSnapshot(network, adapterBridge);
+    final bool effectiveInterfaceUp =
+        resolvedAdapter.matchedInterfaceUp ?? network.matchedInterfaceUp;
+    final String effectiveMediaStatus =
+        resolvedAdapter.tapMediaStatus ?? network.tapMediaStatus;
+    final String effectiveInterfaceName =
+        resolvedAdapter.interfaceName ?? network.matchedInterfaceName;
+    final Color accentColor = _isActuallyMountedLocalNetwork(
+      network,
+      matchedInterfaceUpOverride: effectiveInterfaceUp,
+    )
         ? const Color(0xFF15803D)
         : const Color(0xFFB45309);
     final _NetworkVisualState visualState = _resolveNetworkVisualState(
@@ -2083,7 +2155,26 @@ class _LocalNetworkCard extends StatelessWidget {
       isBusy: false,
       lastError: null,
       runtimeServiceState: 'running',
+      matchedInterfaceUpOverride: effectiveInterfaceUp,
     );
+    final String authorizationLabel = network.isAuthorized ? '已授权' : '未授权';
+    final String controlPlaneLabel = network.isConnected ? '已接入' : '未接入';
+    final String interfaceLabel = effectiveInterfaceName.trim().isEmpty
+        ? '未识别'
+        : effectiveInterfaceName;
+    final String interfaceStatusLabel = _localInterfaceStatusDisplayLabel(
+      effectiveInterfaceUp,
+      effectiveMediaStatus,
+    );
+    final String mountStateLabel = _localMountStateLabel(network);
+    final String driverLabel =
+        network.mountDriverKind.trim().isEmpty ? '-' : network.mountDriverKind;
+    final String deviceIdLabel = network.tapDeviceInstanceId.trim().isEmpty
+        ? '-'
+        : network.tapDeviceInstanceId;
+    final String configIdLabel = network.tapNetCfgInstanceId.trim().isEmpty
+        ? '-'
+        : network.tapNetCfgInstanceId;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
@@ -2121,39 +2212,74 @@ class _LocalNetworkCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: visualState.background,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Icon(visualState.icon, color: visualState.foreground, size: 20),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    !effectiveInterfaceUp
+                        ? '${visualState.message}\n接口状态：Disconnected\n实际网卡状态：${effectiveMediaStatus.trim().isEmpty ? "Disconnected" : effectiveMediaStatus}'
+                        : visualState.message,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: visualState.foreground,
+                          fontWeight: FontWeight.w600,
+                        ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
           Wrap(
             spacing: 10,
             runSpacing: 10,
             children: <Widget>[
-              _InfoPill(label: '网络 ID', value: network.networkId),
-              _InfoPill(
-                label: '已授权',
-                value: network.isAuthorized ? '是' : '否',
-              ),
-              _InfoPill(
-                label: '已连接',
-                value: network.isConnected ? '是' : '否',
-              ),
-              _InfoPill(
-                label: '本地挂载',
-                value: network.localMountState,
-              ),
-              if (network.matchedInterfaceName.trim().isNotEmpty)
-                _InfoPill(
-                  label: '接口',
-                  value: network.matchedInterfaceName,
-                ),
-              if (managedNetwork != null)
-                _InfoPill(label: '服务端网络', value: managedNetwork!.name),
+              _InfoPill(label: '授权状态', value: authorizationLabel),
+              _InfoPill(label: '控制面', value: controlPlaneLabel),
+              _InfoPill(label: '本地挂载', value: mountStateLabel),
+              _InfoPill(label: '接口', value: interfaceLabel),
+              _InfoPill(label: '接口状态', value: interfaceStatusLabel),
             ],
           ),
+            _LabeledBlock(
+              label: '实际网卡状态',
+              value: effectiveMediaStatus.trim().isEmpty
+                  ? 'Disconnected'
+                  : effectiveMediaStatus,
+            ),
+          ],
+          if (!effectiveInterfaceUp && network.assignedAddresses.isNotEmpty)
+            ...<Widget>[
+              const SizedBox(height: 12),
+              _LabeledBlock(
+                label: '当前判断',
+                value:
+                    '当前已经收到虚拟地址，但本地虚拟网卡还未真正连通，因此不能视为组网在线。',
+              ),
+            ],
+          if (driverLabel != '-' || deviceIdLabel != '-' || configIdLabel != '-')
+            ...<Widget>[
+              const SizedBox(height: 12),
+              _LabeledBlock(
+                label: '挂载诊断',
+                value:
+                    '驱动=$driverLabel 设备ID=$deviceIdLabel 配置ID=$configIdLabel',
+              ),
+            ],
           const SizedBox(height: 12),
           if (network.assignedAddresses.isEmpty)
             const Text('暂无可展示的虚拟 IP。')
           else ...<Widget>[
-            _NetworkSegmentPanel(addresses: network.assignedAddresses),
-            const SizedBox(height: 12),
-            _AddressWrap(addresses: network.assignedAddresses),
+            _NetworkSegmentPanel(addresses: _dedupeAddresses(network.assignedAddresses)),
           ],
         ],
       ),
@@ -2901,40 +3027,6 @@ class _CapabilityItem extends StatelessWidget {
           ),
         ],
       ),
-    );
-  }
-}
-
-class _AddressWrap extends StatelessWidget {
-  const _AddressWrap({
-    required this.addresses,
-  });
-
-  final List<String> addresses;
-
-  @override
-  Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: addresses
-          .map(
-            (String address) => Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: const Color(0xFFEAF2FF),
-                borderRadius: BorderRadius.circular(999),
-              ),
-              child: Text(
-                address,
-                style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                      color: const Color(0xFF1D4ED8),
-                      fontWeight: FontWeight.w700,
-                    ),
-              ),
-            ),
-          )
-          .toList(),
     );
   }
 }
@@ -3956,6 +4048,7 @@ _NetworkVisualState _resolveNetworkVisualState({
   required bool isBusy,
   required String? lastError,
   required String runtimeServiceState,
+  bool? matchedInterfaceUpOverride,
 }) {
   if (_isAuthorizationPendingLocalNetwork(localState)) {
     return const _NetworkVisualState(
@@ -4058,7 +4151,11 @@ _NetworkVisualState _resolveNetworkVisualState({
     );
   }
 
-  if (_isLocalNetworkMounted(localState, hasServiceAssignedIp)) {
+  if (_isLocalNetworkMounted(
+    localState,
+    hasServiceAssignedIp,
+    matchedInterfaceUpOverride: matchedInterfaceUpOverride,
+  )) {
     return const _NetworkVisualState(
       label: '网络已在线',
       message: '本机已经接入这条网络，当前可以继续查看托管地址与可达性。',
@@ -4103,6 +4200,18 @@ _NetworkVisualState _resolveNetworkVisualState({
   }
 
   if (localState.localMountState == 'adapter_down') {
+    return _NetworkVisualState(
+      label: '虚拟网卡未连通',
+      message: localState.matchedInterfaceName.trim().isNotEmpty
+          ? '已识别到虚拟网卡 ${localState.matchedInterfaceName}，但它当前未处于可用连接状态。若系统中显示为 Disconnected，通常表示隧道设备已创建，但数据链路尚未真正建立。'
+          : '已识别到本地虚拟网卡，但它当前未处于可用连接状态，通常表示隧道设备已创建但链路尚未建立。',
+      icon: Icons.portable_wifi_off_rounded,
+      background: const Color(0xFFFFF4E8),
+      foreground: const Color(0xFFB45309),
+    );
+  }
+
+  if (localState.localMountState == 'adapter_down_legacy_copy') {
     return _NetworkVisualState(
       label: '接口未就绪',
       message: localState.matchedInterfaceName.trim().isNotEmpty
@@ -4172,9 +4281,15 @@ bool _isAuthorizationPendingLocalNetwork(ZeroTierNetworkState? localState) {
 
 bool _isLocalNetworkMounted(
   ZeroTierNetworkState localState,
-  bool hasServiceAssignedIp,
-) {
+  bool hasServiceAssignedIp, {
+  bool? matchedInterfaceUpOverride,
+}) {
+  final bool matchedInterfaceUp =
+      matchedInterfaceUpOverride ?? localState.matchedInterfaceUp;
   if (!localState.isAuthorized) {
+    return false;
+  }
+  if (!matchedInterfaceUp) {
     return false;
   }
   if (localState.localInterfaceReady) {
@@ -4185,13 +4300,148 @@ bool _isLocalNetworkMounted(
   }
   if (localState.isConnected &&
       localState.assignedAddresses.isNotEmpty &&
-      localState.matchedInterfaceUp) {
+      matchedInterfaceUp) {
     return true;
   }
   return localState.status == 'OK' &&
       localState.isConnected &&
       hasServiceAssignedIp &&
       localState.localMountState == 'ready';
+}
+
+bool _isActuallyMountedLocalNetwork(
+  ZeroTierNetworkState localState, {
+  bool? matchedInterfaceUpOverride,
+}) {
+  final bool matchedInterfaceUp =
+      matchedInterfaceUpOverride ?? localState.matchedInterfaceUp;
+  if (!localState.isAuthorized) {
+    return false;
+  }
+  if (!matchedInterfaceUp) {
+    return false;
+  }
+  return localState.localInterfaceReady ||
+      (localState.localMountState == 'ready' &&
+          localState.status == 'OK' &&
+          localState.assignedAddresses.isNotEmpty);
+}
+
+List<String> _dedupeAddresses(List<String> addresses) {
+  final Set<String> seen = <String>{};
+  final List<String> result = <String>[];
+  for (final String address in addresses) {
+    final String normalized = address.trim();
+    if (normalized.isEmpty) {
+      continue;
+    }
+    if (seen.add(normalized)) {
+      result.add(normalized);
+    }
+  }
+  return result;
+}
+
+class _ResolvedAdapterSnapshot {
+  const _ResolvedAdapterSnapshot({
+    this.interfaceName,
+    this.matchedInterfaceUp,
+    this.tapMediaStatus,
+  });
+
+  final String? interfaceName;
+  final bool? matchedInterfaceUp;
+  final String? tapMediaStatus;
+}
+
+_ResolvedAdapterSnapshot _resolveAdapterSnapshot(
+  ZeroTierNetworkState network,
+  ZeroTierAdapterBridgeStatus adapterBridge,
+) {
+  for (final ZeroTierAdapterRecord adapter in adapterBridge.adapters) {
+    final bool sameName = network.matchedInterfaceName.trim().isNotEmpty &&
+        adapter.displayName.trim() == network.matchedInterfaceName.trim();
+    final bool sameIp = adapter.ipv4Addresses.any(
+      (String item) => network.assignedAddresses.contains(item),
+    );
+    if (!sameName && !sameIp) {
+      continue;
+    }
+    return _ResolvedAdapterSnapshot(
+      interfaceName: adapter.displayName,
+      matchedInterfaceUp: adapter.isUp,
+      tapMediaStatus: adapter.mediaStatus,
+    );
+  }
+  return const _ResolvedAdapterSnapshot();
+}
+
+String _localMountStateDisplayLabel(ZeroTierNetworkState localState) {
+  if (localState.localMountState == 'ready' && !localState.matchedInterfaceUp) {
+    return '已挂载，但网卡未连通';
+  }
+  switch (localState.localMountState) {
+    case 'adapter_down':
+      return '网卡未连通';
+    case 'ip_not_bound':
+      return '等待 IP 挂载';
+    case 'route_not_bound':
+      return '等待路由挂载';
+    case 'missing_adapter':
+      return '未发现虚拟网卡';
+    case 'awaiting_address':
+      return '等待地址下发';
+    case 'ready':
+      return '已挂载';
+    case 'unknown':
+      return '状态未知';
+    default:
+      return localState.localMountState.trim().isEmpty
+          ? '状态未知'
+          : localState.localMountState;
+  }
+}
+
+String _localInterfaceStatusDisplayLabel(
+  bool matchedInterfaceUp,
+  String tapMediaStatus,
+) {
+  if (matchedInterfaceUp) {
+    return '已连通';
+  }
+  final String normalized = tapMediaStatus.trim().toLowerCase();
+  if (normalized.isEmpty || normalized == 'unknown') {
+    return '未连通';
+  }
+  if (normalized == 'disconnected' || normalized == 'down') {
+    return 'Disconnected';
+  }
+  if (normalized == 'connected' || normalized == 'up') {
+    return '已连接但未就绪';
+  }
+  return '未连通（$tapMediaStatus）';
+}
+
+String _localMountStateLabel(ZeroTierNetworkState localState) {
+  if (localState.localMountState == 'ready' && !localState.matchedInterfaceUp) {
+    return 'ready（网卡未连通）';
+  }
+  switch (localState.localMountState) {
+    case 'adapter_down':
+      return '网卡未连通';
+    case 'ip_not_bound':
+      return '等待 IP 挂载';
+    case 'route_not_bound':
+      return '等待路由挂载';
+    case 'missing_adapter':
+      return '未发现虚拟网卡';
+    case 'awaiting_address':
+      return '等待地址下发';
+    case 'ready':
+      return '已挂载';
+    default:
+      return localState.localMountState;
+  }
 }
 
 bool _isProblematicLocalMountState(ZeroTierNetworkState? localState) {
