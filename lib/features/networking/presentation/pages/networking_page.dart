@@ -86,8 +86,10 @@ class NetworkingSectionPage extends ConsumerWidget {
                 },
         );
       case NetworkingSection.runtime:
-        title = '运行时事件';
+        title = '运行状态';
         child = _RuntimeInsightCard(
+          currentDeviceId: config.deviceId,
+          managedNetworks: dashboard.managedNetworks,
           runtimeStatus: runtimeStatus,
           recentEvents: agentState.recentRuntimeEvents,
           lastError: agentState.lastError,
@@ -1153,12 +1155,16 @@ class _HeroStatusCard extends StatelessWidget {
 
 class _RuntimeInsightCard extends StatelessWidget {
   const _RuntimeInsightCard({
+    required this.currentDeviceId,
+    required this.managedNetworks,
     required this.runtimeStatus,
     required this.recentEvents,
     required this.lastError,
     required this.onRefresh,
   });
 
+  final String currentDeviceId;
+  final List<ManagedNetwork> managedNetworks;
   final ZeroTierRuntimeStatus runtimeStatus;
   final List<ZeroTierRuntimeEvent> recentEvents;
   final String? lastError;
@@ -1166,53 +1172,43 @@ class _RuntimeInsightCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final _RuntimeSignal signal = _resolveRuntimeSignal(
+    final List<ManagedNetwork> relevantManagedNetworks =
+        _relevantManagedNetworksForCurrentDevice(
+      managedNetworks: managedNetworks,
+      currentDeviceId: currentDeviceId,
+      runtimeStatus: runtimeStatus,
+    );
+    final List<String> relevantNetworkIds = _relevantNetworkIds(
+      managedNetworks: relevantManagedNetworks,
       runtimeStatus: runtimeStatus,
       recentEvents: recentEvents,
-      lastError: lastError,
+    );
+    final List<ZeroTierRuntimeEvent> filteredEvents =
+        _filterEventsByRelevantNetworks(
+      recentEvents,
+      relevantNetworkIds: relevantNetworkIds,
+    );
+    final _ScopedAdapterBridge scopedAdapterBridge =
+        _buildRuntimeScopedAdapterBridge(
+      adapterBridge: runtimeStatus.adapterBridge,
+      runtimeStatus: runtimeStatus,
+      managedNetworks: relevantManagedNetworks,
+      currentDeviceId: currentDeviceId,
     );
     return SectionCard(
-      title: '运行时事件回流',
-      subtitle: '以下事件来自 Windows 原生 EventChannel，反映 libzt 节点生命周期与网络状态变化。',
+      title: '运行状态',
+      subtitle: '仅展示当前设备相关网络的运行时事件与适配器诊断，过滤无关网络。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: <Widget>[
-              _InfoPill(label: '运行时', value: _serviceStateLabel(runtimeStatus)),
-              _InfoPill(
-                  label: 'libzt 节点', value: _nodeStateLabel(runtimeStatus)),
-              _InfoPill(
-                label: '最近更新',
-                value: _timeOrDash(runtimeStatus.updatedAt),
-              ),
-              _InfoPill(
-                label: '最近错误',
-                value: runtimeStatus.lastError ?? '无',
-              ),
-              _InfoPill(label: '当前信号', value: signal.label),
-            ],
-          ),
+          _ScopedAdapterBridgeCard(bridge: scopedAdapterBridge),
           const SizedBox(height: 16),
-          _AdapterBridgeCard(adapterBridge: runtimeStatus.adapterBridge),
-          const SizedBox(height: 16),
-          if (recentEvents.isEmpty)
-            _EmptyStateBox(
-              message: '当前还没有收到运行时事件。可以先点击“立即同步”，或发起一次入网联调。',
+          if (filteredEvents.isEmpty)
+            const _EmptyStateBox(
+              message: '当前没有与相关网络直接关联的运行时事件。',
             )
           else
-            Column(
-              children: recentEvents
-                  .map(
-                    (ZeroTierRuntimeEvent event) => Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: _RuntimeEventTile(event: event),
-                    ),
-                  )
-                  .toList(),
-            ),
+            _ScopedRuntimeEventsCard(events: filteredEvents),
           const SizedBox(height: 8),
           TextButton.icon(
             onPressed: () => onRefresh(),
@@ -1275,111 +1271,6 @@ class _PairingSessionRelayCard extends StatelessWidget {
               ),
             ],
           ),
-        ],
-      ),
-    );
-  }
-}
-
-class _AdapterBridgeCard extends StatelessWidget {
-  const _AdapterBridgeCard({
-    required this.adapterBridge,
-  });
-
-  final ZeroTierAdapterBridgeStatus adapterBridge;
-
-  @override
-  Widget build(BuildContext context) {
-    final List<ZeroTierAdapterRecord> highlightedAdapters =
-        adapterBridge.adapters
-            .where(
-              (ZeroTierAdapterRecord item) =>
-                  item.isVirtual ||
-                  item.matchesExpectedIp ||
-                  item.isMountCandidate ||
-                  item.hasExpectedRoute,
-            )
-            .toList(growable: false);
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFFE5E7EB)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: <Widget>[
-              _InfoPill(
-                label: '适配器探测',
-                value: adapterBridge.initialized ? '就绪' : '等待中',
-              ),
-              _InfoPill(
-                label: '虚拟适配器',
-                value: adapterBridge.hasVirtualAdapter ? '已发现' : '缺失',
-              ),
-              _InfoPill(
-                label: '挂载候选',
-                value: adapterBridge.hasMountCandidate ? '已发现' : '缺失',
-              ),
-              _InfoPill(
-                label: '目标 IP',
-                value: adapterBridge.hasExpectedNetworkIp ? '已绑定' : '未绑定',
-              ),
-              _InfoPill(
-                label: '目标路由',
-                value: adapterBridge.hasExpectedRoute ? '已绑定' : '未绑定',
-              ),
-            ],
-          ),
-          if (adapterBridge.mountCandidateNames.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 12),
-            _LabeledBlock(
-              label: '挂载候选列表',
-              value: adapterBridge.mountCandidateNames.join(', '),
-            ),
-          ],
-          if (adapterBridge.matchedAdapterNames.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 12),
-            _LabeledBlock(
-              label: '匹配适配器',
-              value: adapterBridge.matchedAdapterNames.join(', '),
-            ),
-          ],
-          const SizedBox(height: 12),
-          _LabeledBlock(
-            label: '适配器摘要',
-            value: adapterBridge.summary ?? '暂无适配器诊断信息。',
-          ),
-          if (highlightedAdapters.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 12),
-            ...highlightedAdapters.map(
-              (ZeroTierAdapterRecord adapter) => Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: _LabeledBlock(
-                  label: adapter.displayName,
-                  value: '运行状态=${_adapterOperStatusLabel(adapter.operStatus)} '
-                      '接口可用=${adapter.isUp ? "是" : "否"} '
-                      '虚拟网卡=${adapter.isVirtual ? "是" : "否"} '
-                      '可挂载候选=${adapter.isMountCandidate ? "是" : "否"} '
-                      '已匹配目标IP=${adapter.matchesExpectedIp ? "是" : "否"} '
-                      '已匹配目标路由=${adapter.hasExpectedRoute ? "是" : "否"} '
-                      '驱动=${_adapterDriverKindLabel(adapter.driverKind)} '
-                      '介质状态=${_adapterMediaStatusLabel(adapter.mediaStatus)} '
-                      '接口索引=${adapter.ifIndex} '
-                      '设备ID=${adapter.tapDeviceInstanceId.isEmpty ? "-" : adapter.tapDeviceInstanceId} '
-                      '配置ID=${adapter.tapNetCfgInstanceId.isEmpty ? "-" : adapter.tapNetCfgInstanceId} '
-                      'IPv4=${adapter.ipv4Addresses.isEmpty ? "-" : adapter.ipv4Addresses.join(", ")}',
-                ),
-              ),
-            ),
-          ],
         ],
       ),
     );
@@ -2085,6 +1976,17 @@ class _PrivateNetworkingTab extends StatelessWidget {
             addresses: addresses,
             onCopy: (String value) => onCopyValue(value, '已复制虚拟 IP'),
           ),
+          if (activeNetwork != null || localState != null) ...<Widget>[
+            const SizedBox(height: 16),
+            _PrivateNetworkDiagnosticsPanel(
+              currentDeviceId: currentDeviceId,
+              network: activeNetwork,
+              localState: localState,
+              runtimeStatus: runtimeStatus,
+              adapterBridge: runtimeStatus.adapterBridge,
+              recentEvents: agentState.recentRuntimeEvents,
+            ),
+          ],
           if (isExternallyLocked) ...<Widget>[
             const SizedBox(height: 16),
             _InlineHint(message: externalLockMessage),
@@ -2109,6 +2011,144 @@ class _PrivateNetworkingTab extends StatelessWidget {
       }
     }
     return null;
+  }
+}
+
+class _PrivateNetworkDiagnosticsPanel extends StatelessWidget {
+  const _PrivateNetworkDiagnosticsPanel({
+    required this.currentDeviceId,
+    required this.network,
+    required this.localState,
+    required this.runtimeStatus,
+    required this.adapterBridge,
+    required this.recentEvents,
+  });
+
+  final String currentDeviceId;
+  final ManagedNetwork? network;
+  final ZeroTierNetworkState? localState;
+  final ZeroTierRuntimeStatus runtimeStatus;
+  final ZeroTierAdapterBridgeStatus adapterBridge;
+  final List<ZeroTierRuntimeEvent> recentEvents;
+
+  @override
+  Widget build(BuildContext context) {
+    final String? managedStatus =
+        _currentMembershipStatus(network, currentDeviceId);
+    final bool hasServiceAssignedIp =
+        _hasCurrentServiceAssignedIp(network, currentDeviceId);
+    final List<ZeroTierRuntimeEvent> scopedEvents =
+        _filterRelevantRuntimeEvents(
+      recentEvents,
+      targetNetworkId: _resolveTargetNetworkId(network, localState),
+    );
+    final _ScopedAdapterBridge scopedAdapterBridge = _buildScopedAdapterBridge(
+      adapterBridge: adapterBridge,
+      localState: localState,
+      expectedIpv4Addresses: _expectedNetworkIpv4Addresses(
+        network: network,
+        currentDeviceId: currentDeviceId,
+        localState: localState,
+      ),
+    );
+    final List<_DiagnosticStatusItem> statusItems = <_DiagnosticStatusItem>[
+      _DiagnosticStatusItem(
+        group: '服务端',
+        label: '成员资格',
+        value: _managedMembershipStatusLabel(managedStatus),
+      ),
+      _DiagnosticStatusItem(
+        group: '服务端',
+        label: '已分配虚拟 IP',
+        value: hasServiceAssignedIp ? '已分配' : '未分配',
+      ),
+      _DiagnosticStatusItem(
+        group: '服务端',
+        label: '网络角色',
+        value: network == null
+            ? '未识别'
+            : (_isHostManagedNetwork(network!, currentDeviceId)
+                ? '主持网络'
+                : '加入网络'),
+      ),
+      _DiagnosticStatusItem(
+        group: 'ZeroTier',
+        label: '运行时',
+        value: _serviceStateLabel(runtimeStatus),
+      ),
+      _DiagnosticStatusItem(
+        group: 'ZeroTier',
+        label: '网络状态',
+        value: _localNetworkStatusLabel(localState),
+      ),
+      _DiagnosticStatusItem(
+        group: 'ZeroTier',
+        label: '授权状态',
+        value: localState == null
+            ? '未发现本地网络'
+            : (localState!.isAuthorized ? '已授权' : '待授权'),
+      ),
+      _DiagnosticStatusItem(
+        group: '本地挂载',
+        label: '挂载状态',
+        value: localState == null ? '未开始' : _localMountStateLabel(localState!),
+      ),
+      _DiagnosticStatusItem(
+        group: '本地挂载',
+        label: '接口状态',
+        value: localState == null
+            ? '未识别'
+            : _localInterfaceStatusDisplayLabel(
+                localState!.matchedInterfaceUp,
+                localState!.tapMediaStatus,
+              ),
+      ),
+      _DiagnosticStatusItem(
+        group: '本地挂载',
+        label: '路由状态',
+        value: localState == null
+            ? '未识别'
+            : (localState!.routeExpected
+                ? (localState!.systemRouteBound ? '已挂载' : '未挂载')
+                : '无需路由'),
+      ),
+    ];
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: const Color(0xFFE5E7EB)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            '当前网络诊断',
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '只展示当前虚拟组网目标网络，已过滤其它网络事件与适配器。',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: const Color(0xFF64748B),
+                ),
+          ),
+          const SizedBox(height: 14),
+          _GroupedStatusSummary(items: statusItems),
+          if (scopedAdapterBridge.summary.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 16),
+            _ScopedAdapterBridgeCard(bridge: scopedAdapterBridge),
+          ],
+          const SizedBox(height: 16),
+          _ScopedRuntimeEventsCard(events: scopedEvents),
+        ],
+      ),
+    );
   }
 }
 
@@ -2161,9 +2201,8 @@ class _LocalNetworkCard extends StatelessWidget {
     );
     final String authorizationLabel = network.isAuthorized ? '已授权' : '未授权';
     final String controlPlaneLabel = network.isConnected ? '已接入' : '未接入';
-    final String interfaceLabel = effectiveInterfaceName.trim().isEmpty
-        ? '未识别'
-        : effectiveInterfaceName;
+    final String interfaceLabel =
+        effectiveInterfaceName.trim().isEmpty ? '未识别' : effectiveInterfaceName;
     final String interfaceStatusLabel = _localInterfaceStatusDisplayLabel(
       effectiveInterfaceUp,
       effectiveMediaStatus,
@@ -2258,29 +2297,29 @@ class _LocalNetworkCard extends StatelessWidget {
                 ),
             ],
           ),
-          if (!effectiveInterfaceUp && network.assignedAddresses.isNotEmpty)
-            ...<Widget>[
-              const SizedBox(height: 12),
-              _LabeledBlock(
-                label: '当前判断',
-                value:
-                    '当前已经收到虚拟地址，但本地虚拟网卡还未真正连通，因此不能视为组网在线。',
-              ),
-            ],
-          if (driverLabel != '-' || deviceIdLabel != '-' || configIdLabel != '-')
-            ...<Widget>[
-              const SizedBox(height: 12),
-              _LabeledBlock(
-                label: '挂载诊断',
-                value:
-                    '驱动=$driverLabel 设备ID=$deviceIdLabel 配置ID=$configIdLabel',
-              ),
-            ],
+          if (!effectiveInterfaceUp &&
+              network.assignedAddresses.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            _LabeledBlock(
+              label: '当前判断',
+              value: '当前已经收到虚拟地址，但本地虚拟网卡还未真正连通，因此不能视为组网在线。',
+            ),
+          ],
+          if (driverLabel != '-' ||
+              deviceIdLabel != '-' ||
+              configIdLabel != '-') ...<Widget>[
+            const SizedBox(height: 12),
+            _LabeledBlock(
+              label: '挂载诊断',
+              value: '驱动=$driverLabel 设备ID=$deviceIdLabel 配置ID=$configIdLabel',
+            ),
+          ],
           const SizedBox(height: 12),
           if (network.assignedAddresses.isEmpty)
             const Text('暂无可展示的虚拟 IP。')
           else ...<Widget>[
-            _NetworkSegmentPanel(addresses: _dedupeAddresses(network.assignedAddresses)),
+            _NetworkSegmentPanel(
+                addresses: _dedupeAddresses(network.assignedAddresses)),
           ],
         ],
       ),
@@ -2343,6 +2382,229 @@ class _RuntimeEventTile extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _GroupedStatusSummary extends StatelessWidget {
+  const _GroupedStatusSummary({
+    required this.items,
+  });
+
+  final List<_DiagnosticStatusItem> items;
+
+  @override
+  Widget build(BuildContext context) {
+    final List<String> groups = items
+        .map(((_DiagnosticStatusItem item) => item.group))
+        .toSet()
+        .toList(growable: false);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: groups.map((String group) {
+        final List<_DiagnosticStatusItem> groupItems = items
+            .where(((_DiagnosticStatusItem item) => item.group == group))
+            .toList(growable: false);
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                group,
+                style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                      color: const Color(0xFF0F172A),
+                      fontWeight: FontWeight.w800,
+                    ),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: groupItems
+                    .map(
+                      (_DiagnosticStatusItem item) => _InfoPill(
+                        label: item.label,
+                        value: item.value,
+                      ),
+                    )
+                    .toList(growable: false),
+              ),
+            ],
+          ),
+        );
+      }).toList(growable: false),
+    );
+  }
+}
+
+class _ScopedAdapterBridgeCard extends StatelessWidget {
+  const _ScopedAdapterBridgeCard({
+    required this.bridge,
+  });
+
+  final _ScopedAdapterBridge bridge;
+  static const int _maxVisibleAdapters = 3;
+
+  @override
+  Widget build(BuildContext context) {
+    final List<ZeroTierAdapterRecord> visibleAdapters =
+        bridge.adapters.take(_maxVisibleAdapters).toList(growable: false);
+    final int hiddenCount = bridge.adapters.length > _maxVisibleAdapters
+        ? bridge.adapters.length - _maxVisibleAdapters
+        : 0;
+    final bool hasVirtualAdapter = bridge.adapters.any(
+      (ZeroTierAdapterRecord adapter) => adapter.isVirtual,
+    );
+    final bool hasMountCandidate = bridge.adapters.any(
+      (ZeroTierAdapterRecord adapter) => adapter.isMountCandidate,
+    );
+    final bool hasExpectedIp = bridge.adapters.any(
+      (ZeroTierAdapterRecord adapter) => adapter.matchesExpectedIp,
+    );
+    final bool hasExpectedRoute = bridge.adapters.any(
+      (ZeroTierAdapterRecord adapter) => adapter.hasExpectedRoute,
+    );
+    final List<String> matchedAdapterNames = bridge.adapters
+        .where(
+          (ZeroTierAdapterRecord adapter) =>
+              adapter.matchesExpectedIp || adapter.hasExpectedRoute,
+        )
+        .map((ZeroTierAdapterRecord adapter) => adapter.displayName)
+        .toSet()
+        .toList(growable: false);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFFE5E7EB)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            '适配器摘要',
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: <Widget>[
+              _InfoPill(
+                label: '适配器探测',
+                value: bridge.adapters.isNotEmpty ? '已过滤' : '未命中',
+              ),
+              _InfoPill(
+                label: '虚拟适配器',
+                value: hasVirtualAdapter ? '已发现' : '缺失',
+              ),
+              _InfoPill(
+                label: '挂载候选',
+                value: hasMountCandidate ? '已发现' : '缺失',
+              ),
+              _InfoPill(
+                label: '目标 IP',
+                value: hasExpectedIp ? '已绑定' : '未绑定',
+              ),
+              _InfoPill(
+                label: '目标路由',
+                value: hasExpectedRoute ? '已绑定' : '未绑定',
+              ),
+            ],
+          ),
+          if (matchedAdapterNames.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            _LabeledBlock(
+              label: '匹配适配器',
+              value: matchedAdapterNames.join(', '),
+            ),
+          ],
+          const SizedBox(height: 12),
+          _LabeledBlock(
+            label: '摘要',
+            value: bridge.summary,
+          ),
+          if (visibleAdapters.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 12),
+            ...visibleAdapters.map(
+              (ZeroTierAdapterRecord adapter) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _LabeledBlock(
+                  label: adapter.displayName,
+                  value: '运行状态=${_adapterOperStatusLabel(adapter.operStatus)} '
+                      '接口可用=${adapter.isUp ? "是" : "否"} '
+                      '虚拟网卡=${adapter.isVirtual ? "是" : "否"} '
+                      '挂载候选=${adapter.isMountCandidate ? "是" : "否"} '
+                      '匹配目标IP=${adapter.matchesExpectedIp ? "是" : "否"} '
+                      '匹配目标路由=${adapter.hasExpectedRoute ? "是" : "否"} '
+                      '驱动=${_adapterDriverKindLabel(adapter.driverKind)} '
+                      '介质状态=${_adapterMediaStatusLabel(adapter.mediaStatus)} '
+                      '接口索引=${adapter.ifIndex} '
+                      'IPv4=${adapter.ipv4Addresses.isEmpty ? "-" : adapter.ipv4Addresses.join(", ")}',
+                ),
+              ),
+            ),
+            if (hiddenCount > 0)
+              _InlineHint(message: '另有 $hiddenCount 个相关适配器已折叠显示。'),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ScopedRuntimeEventsCard extends StatelessWidget {
+  const _ScopedRuntimeEventsCard({
+    required this.events,
+  });
+
+  final List<ZeroTierRuntimeEvent> events;
+  static const int _maxVisibleEvents = 8;
+
+  @override
+  Widget build(BuildContext context) {
+    final List<ZeroTierRuntimeEvent> visibleEvents =
+        events.take(_maxVisibleEvents).toList(growable: false);
+    final int hiddenCount = events.length > _maxVisibleEvents
+        ? events.length - _maxVisibleEvents
+        : 0;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          '运行时事件',
+          style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w800,
+              ),
+        ),
+        const SizedBox(height: 10),
+        if (events.isEmpty)
+          const _EmptyStateBox(
+            message: '当前没有与这条虚拟组网直接相关的运行时事件。',
+          )
+        else
+          Column(
+            children: visibleEvents
+                .map(
+                  (ZeroTierRuntimeEvent event) => Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: _RuntimeEventTile(event: event),
+                  ),
+                )
+                .toList(growable: false),
+          ),
+        if (hiddenCount > 0) ...<Widget>[
+          const SizedBox(height: 8),
+          _InlineHint(message: '另有 $hiddenCount 条较早事件已折叠显示。'),
+        ],
+      ],
     );
   }
 }
@@ -4364,13 +4626,34 @@ class _ResolvedAdapterSnapshot {
   final String? tapMediaStatus;
 }
 
+class _DiagnosticStatusItem {
+  const _DiagnosticStatusItem({
+    required this.group,
+    required this.label,
+    required this.value,
+  });
+
+  final String group;
+  final String label;
+  final String value;
+}
+
+class _ScopedAdapterBridge {
+  const _ScopedAdapterBridge({
+    required this.summary,
+    required this.adapters,
+  });
+
+  final String summary;
+  final List<ZeroTierAdapterRecord> adapters;
+}
+
 _ResolvedAdapterSnapshot _resolveAdapterSnapshot(
   ZeroTierNetworkState network,
   ZeroTierAdapterBridgeStatus adapterBridge,
 ) {
   for (final ZeroTierAdapterRecord adapter in adapterBridge.adapters) {
-    final bool sameIfIndex =
-        network.matchedInterfaceIfIndex > 0 &&
+    final bool sameIfIndex = network.matchedInterfaceIfIndex > 0 &&
         adapter.ifIndex == network.matchedInterfaceIfIndex;
     final bool sameName = network.matchedInterfaceName.trim().isNotEmpty &&
         adapter.displayName.trim() == network.matchedInterfaceName.trim();
@@ -4388,6 +4671,273 @@ _ResolvedAdapterSnapshot _resolveAdapterSnapshot(
     );
   }
   return const _ResolvedAdapterSnapshot();
+}
+
+String? _resolveTargetNetworkId(
+  ManagedNetwork? network,
+  ZeroTierNetworkState? localState,
+) {
+  final String localId = localState?.networkId.trim() ?? '';
+  if (localId.isNotEmpty) {
+    return localId.toLowerCase();
+  }
+  final String managedId = network?.zeroTierNetworkId?.trim() ?? '';
+  if (managedId.isNotEmpty) {
+    return managedId.toLowerCase();
+  }
+  return null;
+}
+
+List<ZeroTierRuntimeEvent> _filterRelevantRuntimeEvents(
+  List<ZeroTierRuntimeEvent> events, {
+  required String? targetNetworkId,
+}) {
+  final String normalizedTarget = targetNetworkId?.trim().toLowerCase() ?? '';
+  final List<ZeroTierRuntimeEvent> filtered =
+      events.where((ZeroTierRuntimeEvent event) {
+    final String eventNetworkId = event.networkId?.trim().toLowerCase() ?? '';
+    if (eventNetworkId.isEmpty) {
+      return true;
+    }
+    if (normalizedTarget.isEmpty) {
+      return false;
+    }
+    return eventNetworkId == normalizedTarget;
+  }).toList(growable: false);
+  if (filtered.length <= 24) {
+    return filtered;
+  }
+  return filtered.take(24).toList(growable: false);
+}
+
+List<String> _expectedNetworkIpv4Addresses({
+  required ManagedNetwork? network,
+  required String currentDeviceId,
+  required ZeroTierNetworkState? localState,
+}) {
+  final Set<String> addresses = <String>{};
+  final ManagedNetworkMembership? membership =
+      _findCurrentMembership(network, currentDeviceId);
+  final String serviceIp = membership?.zeroTierAssignedIp?.trim() ?? '';
+  if (serviceIp.isNotEmpty) {
+    addresses.add(serviceIp);
+  }
+  for (final String address
+      in localState?.assignedAddresses ?? const <String>[]) {
+    final String normalized = address.split('/').first.trim();
+    if (normalized.contains('.')) {
+      addresses.add(normalized);
+    }
+  }
+  return addresses.toList(growable: false);
+}
+
+_ScopedAdapterBridge _buildScopedAdapterBridge({
+  required ZeroTierAdapterBridgeStatus adapterBridge,
+  required ZeroTierNetworkState? localState,
+  required List<String> expectedIpv4Addresses,
+}) {
+  final Set<String> expectedIpSet = expectedIpv4Addresses
+      .map((String item) => item.trim())
+      .where((String item) => item.isNotEmpty)
+      .toSet();
+  final List<ZeroTierAdapterRecord> adapters = adapterBridge.adapters.where((
+    ZeroTierAdapterRecord adapter,
+  ) {
+    final bool sameIfIndex = localState != null &&
+        localState.matchedInterfaceIfIndex > 0 &&
+        adapter.ifIndex == localState.matchedInterfaceIfIndex;
+    final bool sameName = localState != null &&
+        localState.matchedInterfaceName.trim().isNotEmpty &&
+        adapter.displayName.trim() == localState.matchedInterfaceName.trim();
+    final bool sameIp = adapter.ipv4Addresses.any((String ip) {
+      final String normalizedIp = ip.split('/').first.trim();
+      return expectedIpSet.contains(normalizedIp);
+    });
+    return sameIfIndex || sameName || sameIp;
+  }).toList(growable: false);
+
+  if (adapters.isEmpty) {
+    return const _ScopedAdapterBridge(
+      summary: '',
+      adapters: <ZeroTierAdapterRecord>[],
+    );
+  }
+
+  final List<String> names = adapters
+      .map((ZeroTierAdapterRecord item) => item.displayName)
+      .toList(growable: false);
+  final int upCount =
+      adapters.where((ZeroTierAdapterRecord item) => item.isUp).length;
+  final int ipMatchedCount = adapters
+      .where((ZeroTierAdapterRecord item) => item.matchesExpectedIp)
+      .length;
+  final int routeMatchedCount = adapters
+      .where((ZeroTierAdapterRecord item) => item.hasExpectedRoute)
+      .length;
+
+  return _ScopedAdapterBridge(
+    summary: '已过滤为当前网络相关适配器 ${adapters.length} 个：${names.join("、")}；'
+        '其中接口可用 $upCount 个，命中目标 IP $ipMatchedCount 个，命中目标路由 $routeMatchedCount 个。',
+    adapters: adapters,
+  );
+}
+
+List<ManagedNetwork> _relevantManagedNetworksForCurrentDevice({
+  required List<ManagedNetwork> managedNetworks,
+  required String currentDeviceId,
+  required ZeroTierRuntimeStatus runtimeStatus,
+}) {
+  final Set<String> runtimeIds = runtimeStatus.joinedNetworks
+      .map((ZeroTierNetworkState item) => item.networkId.trim().toLowerCase())
+      .where((String item) => item.isNotEmpty)
+      .toSet();
+  return managedNetworks.where((ManagedNetwork network) {
+    final ManagedNetworkMembership? membership =
+        _findCurrentMembership(network, currentDeviceId);
+    if (membership == null) {
+      return false;
+    }
+    final String networkId =
+        network.zeroTierNetworkId?.trim().toLowerCase() ?? '';
+    return runtimeIds.contains(networkId) ||
+        membership.status.trim().isNotEmpty ||
+        (membership.zeroTierAssignedIp?.trim().isNotEmpty ?? false);
+  }).toList(growable: false);
+}
+
+List<String> _relevantNetworkIds({
+  required List<ManagedNetwork> managedNetworks,
+  required ZeroTierRuntimeStatus runtimeStatus,
+  required List<ZeroTierRuntimeEvent> recentEvents,
+}) {
+  final Set<String> ids = managedNetworks
+      .map((ManagedNetwork network) =>
+          network.zeroTierNetworkId?.trim().toLowerCase() ?? '')
+      .where((String item) => item.isNotEmpty)
+      .toSet();
+  for (final ZeroTierNetworkState network in runtimeStatus.joinedNetworks) {
+    final String id = network.networkId.trim().toLowerCase();
+    if (id.isNotEmpty) {
+      ids.add(id);
+    }
+  }
+  for (final ZeroTierRuntimeEvent event in recentEvents) {
+    final String id = event.networkId?.trim().toLowerCase() ?? '';
+    if (id.isNotEmpty) {
+      ids.add(id);
+    }
+  }
+  return ids.toList(growable: false);
+}
+
+List<ZeroTierRuntimeEvent> _filterEventsByRelevantNetworks(
+  List<ZeroTierRuntimeEvent> events, {
+  required List<String> relevantNetworkIds,
+}) {
+  final Set<String> idSet = relevantNetworkIds.toSet();
+  final List<ZeroTierRuntimeEvent> filtered =
+      events.where((ZeroTierRuntimeEvent event) {
+    final String eventNetworkId = event.networkId?.trim().toLowerCase() ?? '';
+    if (eventNetworkId.isEmpty) {
+      return true;
+    }
+    return idSet.contains(eventNetworkId);
+  }).toList(growable: false);
+  if (filtered.length <= 24) {
+    return filtered;
+  }
+  return filtered.take(24).toList(growable: false);
+}
+
+_ScopedAdapterBridge _buildRuntimeScopedAdapterBridge({
+  required ZeroTierAdapterBridgeStatus adapterBridge,
+  required ZeroTierRuntimeStatus runtimeStatus,
+  required List<ManagedNetwork> managedNetworks,
+  required String currentDeviceId,
+}) {
+  final Set<String> expectedIpSet = <String>{};
+  final Set<String> networkIds = managedNetworks
+      .map((ManagedNetwork network) =>
+          network.zeroTierNetworkId?.trim().toLowerCase() ?? '')
+      .where((String item) => item.isNotEmpty)
+      .toSet();
+  for (final ManagedNetwork network in managedNetworks) {
+    final ManagedNetworkMembership? membership =
+        _findCurrentMembership(network, currentDeviceId);
+    final String serviceIp = membership?.zeroTierAssignedIp?.trim() ?? '';
+    if (serviceIp.isNotEmpty) {
+      expectedIpSet.add(serviceIp);
+    }
+  }
+  for (final ZeroTierNetworkState network in runtimeStatus.joinedNetworks) {
+    if (networkIds.isNotEmpty &&
+        !networkIds.contains(network.networkId.trim().toLowerCase())) {
+      continue;
+    }
+    for (final String address in network.assignedAddresses) {
+      final String normalized = address.split('/').first.trim();
+      if (normalized.contains('.')) {
+        expectedIpSet.add(normalized);
+      }
+    }
+  }
+  final List<ZeroTierAdapterRecord> adapters =
+      adapterBridge.adapters.where((ZeroTierAdapterRecord adapter) {
+    final bool sameIp = adapter.ipv4Addresses.any((String ip) {
+      final String normalizedIp = ip.split('/').first.trim();
+      return expectedIpSet.contains(normalizedIp);
+    });
+    return sameIp || adapter.matchesExpectedIp || adapter.hasExpectedRoute;
+  }).toList(growable: false);
+  if (adapters.isEmpty) {
+    return const _ScopedAdapterBridge(
+        summary: '未发现相关适配器。', adapters: <ZeroTierAdapterRecord>[]);
+  }
+  final List<String> names = adapters
+      .map((ZeroTierAdapterRecord item) => item.displayName)
+      .toList(growable: false);
+  return _ScopedAdapterBridge(
+    summary: '已按当前设备相关网络过滤出 ${adapters.length} 个适配器：${names.join("、")}。',
+    adapters: adapters,
+  );
+}
+
+String _managedMembershipStatusLabel(String? status) {
+  final String normalized = status?.trim().toLowerCase() ?? '';
+  switch (normalized) {
+    case 'authorized':
+    case 'active':
+      return '已接纳';
+    case 'pending':
+      return '待处理';
+    case 'revoked':
+      return '已回收';
+    case 'rejected':
+      return '已拒绝';
+    default:
+      return status?.trim().isNotEmpty == true ? status!.trim() : '未识别';
+  }
+}
+
+String _localNetworkStatusLabel(ZeroTierNetworkState? localState) {
+  if (localState == null) {
+    return '未发现本地网络';
+  }
+  switch (localState.status.trim().toUpperCase()) {
+    case 'OK':
+      return '已接入';
+    case 'REQUESTING_CONFIGURATION':
+      return '请求配置中';
+    case 'ACCESS_DENIED':
+      return '等待授权';
+    case 'NETWORK_DOWN':
+      return '网络不可用';
+    case 'UNKNOWN':
+      return '状态回传中';
+    default:
+      return localState.status.trim().isEmpty ? '未知' : localState.status;
+  }
 }
 
 String _localInterfaceStatusDisplayLabel(

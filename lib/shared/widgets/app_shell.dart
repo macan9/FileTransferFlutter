@@ -17,27 +17,26 @@ class AppShell extends ConsumerStatefulWidget {
 
   final StatefulNavigationShell navigationShell;
 
-  static const List<NavigationDestination> _destinations =
-      <NavigationDestination>[
-    NavigationDestination(
-      icon: Icon(Icons.folder_open_outlined),
-      selectedIcon: Icon(Icons.folder_open),
-      label: '\u4e91\u6587\u4ef6',
+  static const List<_BottomNavItemData> _destinations = <_BottomNavItemData>[
+    _BottomNavItemData(
+      icon: Icons.folder_open_outlined,
+      selectedIcon: Icons.folder_open,
+      label: '云文件',
     ),
-    NavigationDestination(
-      icon: Icon(Icons.sync_alt_outlined),
-      selectedIcon: Icon(Icons.sync_alt),
-      label: '\u5b9e\u65f6\u4f20\u8f93',
+    _BottomNavItemData(
+      icon: Icons.sync_alt_outlined,
+      selectedIcon: Icons.sync_alt,
+      label: '实时传输',
     ),
-    NavigationDestination(
-      icon: Icon(Icons.hub_outlined),
-      selectedIcon: Icon(Icons.hub),
-      label: '\u5185\u7f51\u7a7f\u900f',
+    _BottomNavItemData(
+      icon: Icons.hub_outlined,
+      selectedIcon: Icons.hub,
+      label: '虚拟组网',
     ),
-    NavigationDestination(
-      icon: Icon(Icons.settings_outlined),
-      selectedIcon: Icon(Icons.settings),
-      label: '\u8bbe\u7f6e',
+    _BottomNavItemData(
+      icon: Icons.settings_outlined,
+      selectedIcon: Icons.settings,
+      label: '设置',
     ),
   ];
 
@@ -89,10 +88,10 @@ class _AppShellState extends ConsumerState<AppShell> {
         bottom: false,
         child: content,
       ),
-      bottomNavigationBar: NavigationBar(
+      bottomNavigationBar: _BottomNavigationBar(
         selectedIndex: widget.navigationShell.currentIndex,
         destinations: AppShell._destinations,
-        onDestinationSelected: (int index) {
+        onSelected: (int index) {
           widget.navigationShell.goBranch(
             index,
             initialLocation: index == widget.navigationShell.currentIndex,
@@ -110,6 +109,140 @@ class _AppShellState extends ConsumerState<AppShell> {
     unawaited(action.catchError((Object error, StackTrace stackTrace) {
       // Presence errors are reflected in the presence state when possible.
     }));
+  }
+}
+
+class _BottomNavItemData {
+  const _BottomNavItemData({
+    required this.icon,
+    required this.selectedIcon,
+    required this.label,
+  });
+
+  final IconData icon;
+  final IconData selectedIcon;
+  final String label;
+}
+
+class _BottomNavigationBar extends StatelessWidget {
+  const _BottomNavigationBar({
+    required this.selectedIndex,
+    required this.destinations,
+    required this.onSelected,
+  });
+
+  final int selectedIndex;
+  final List<_BottomNavItemData> destinations;
+  final ValueChanged<int> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+
+    return Material(
+      color: theme.colorScheme.surface,
+      elevation: 8,
+      child: SafeArea(
+        top: false,
+        child: Container(
+          decoration: BoxDecoration(
+            border: Border(
+              top: BorderSide(color: theme.colorScheme.outlineVariant),
+            ),
+          ),
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+          child: Row(
+            children: List<Widget>.generate(destinations.length, (int index) {
+              final _BottomNavItemData item = destinations[index];
+              return Expanded(
+                child: _BottomNavigationButton(
+                  data: item,
+                  selected: index == selectedIndex,
+                  onTap: () => onSelected(index),
+                ),
+              );
+            }),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _BottomNavigationButton extends StatefulWidget {
+  const _BottomNavigationButton({
+    required this.data,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final _BottomNavItemData data;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  State<_BottomNavigationButton> createState() =>
+      _BottomNavigationButtonState();
+}
+
+class _BottomNavigationButtonState extends State<_BottomNavigationButton> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final bool highlighted = widget.selected || _hovered;
+    final Color foreground = widget.selected
+        ? theme.colorScheme.primary
+        : theme.colorScheme.onSurfaceVariant;
+    final Color background = widget.selected
+        ? theme.colorScheme.primaryContainer.withValues(alpha: 0.9)
+        : theme.colorScheme.primary.withValues(alpha: 0.08);
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(18),
+            onTap: widget.onTap,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOutCubic,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: highlighted ? background : Colors.transparent,
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Icon(
+                    widget.selected
+                        ? widget.data.selectedIcon
+                        : widget.data.icon,
+                    color: foreground,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    widget.data.label,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: foreground,
+                      fontWeight:
+                          widget.selected ? FontWeight.w800 : FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -341,9 +474,8 @@ class _DesktopTitleBar extends ConsumerWidget {
               isClose: true,
               onPressed: () async {
                 if (Platform.isWindows) {
-                  final bool minimizeToTray = ref
-                      .read(appConfigProvider)
-                      .minimizeToTrayOnClose;
+                  final bool minimizeToTray =
+                      ref.read(appConfigProvider).minimizeToTrayOnClose;
                   if (minimizeToTray) {
                     await DesktopTrayService.hideToTray();
                   } else {
