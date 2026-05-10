@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "native/zerotier/zerotier_windows_adapter_bridge.h"
 
@@ -20,6 +21,7 @@ class ZeroTierWindowsTapBackend {
 
   virtual bool EnsureAdapterPresent(
       const ZeroTierWindowsAdapterBridge::ProbeResult& probe_result,
+      const std::vector<uint64_t>& network_ids,
       const std::vector<std::string>& expected_ipv4_addresses,
       std::string* action_summary) = 0;
 };
@@ -35,6 +37,7 @@ class ZeroTierWindowsWintunTapBackend : public ZeroTierWindowsTapBackend {
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
   bool EnsureAdapterPresent(
       const ZeroTierWindowsAdapterBridge::ProbeResult& probe_result,
+      const std::vector<uint64_t>& network_ids,
       const std::vector<std::string>& expected_ipv4_addresses,
       std::string* action_summary) override;
 
@@ -66,6 +69,7 @@ class ZeroTierWindowsZtTapBackend : public ZeroTierWindowsTapBackend {
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
   bool EnsureAdapterPresent(
       const ZeroTierWindowsAdapterBridge::ProbeResult& probe_result,
+      const std::vector<uint64_t>& network_ids,
       const std::vector<std::string>& expected_ipv4_addresses,
       std::string* action_summary) override;
 
@@ -84,6 +88,7 @@ class ZeroTierWindowsAutoTapBackend : public ZeroTierWindowsTapBackend {
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter) const override;
   bool EnsureAdapterPresent(
       const ZeroTierWindowsAdapterBridge::ProbeResult& probe_result,
+      const std::vector<uint64_t>& network_ids,
       const std::vector<std::string>& expected_ipv4_addresses,
       std::string* action_summary) override;
 

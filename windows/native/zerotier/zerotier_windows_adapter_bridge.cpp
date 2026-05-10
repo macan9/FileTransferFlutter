@@ -85,7 +85,9 @@ bool LooksLikeMountCandidateAdapter(const std::string& text) {
   }
   if (ContainsSubstring(lowered,
                         {"vmware", "hyper-v", "vethernet", "virtualbox",
-                         "bluetooth", "loopback", "pseudo-interface"})) {
+                         "bluetooth", "loopback", "pseudo-interface",
+                         "lightweight filter", "npcap", "packet scheduler",
+                         "packet driver"})) {
     return false;
   }
   return ContainsSubstring(
@@ -181,17 +183,30 @@ std::string ClassifyDriverKind(const std::string& friendly_name,
   const std::string merged =
       ToLower(friendly_name + " " + description + " " + adapter_name + " " +
               device_instance_id + " " + driver_service_name);
+  const std::string lowered_description = ToLower(description);
+  const std::string lowered_device_instance = ToLower(device_instance_id);
+  const std::string lowered_service_name = ToLower(driver_service_name);
   if (ContainsSubstring(merged, {"zerotier"})) {
     return "zerotier";
   }
   if (ContainsSubstring(merged, {"tap-windows", "tap windows", "tap adapter"})) {
     return "tap-windows";
   }
+  if (ContainsSubstring(merged,
+                        {"lightweight filter", "npcap", "packet scheduler",
+                         "packet driver"})) {
+    return "filter-driver";
+  }
   if (ContainsSubstring(merged, {"wintun"})) {
     return "wintun";
   }
   if (ContainsSubstring(merged, {"filetransferflutter"})) {
-    return "wintun";
+    if (ContainsSubstring(lowered_service_name, {"wintun"}) ||
+        ContainsSubstring(lowered_device_instance, {"swd\\wintun"}) ||
+        ContainsSubstring(lowered_description,
+                          {"wintun userspace tunnel", "wireguard tunnel"})) {
+      return "wintun";
+    }
   }
   if (ContainsSubstring(merged, {"wireguard"})) {
     return "wireguard";

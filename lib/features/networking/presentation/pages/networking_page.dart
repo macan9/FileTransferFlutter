@@ -2250,13 +2250,6 @@ class _LocalNetworkCard extends StatelessWidget {
               _InfoPill(label: '接口状态', value: interfaceStatusLabel),
             ],
           ),
-            _LabeledBlock(
-              label: '实际网卡状态',
-              value: effectiveMediaStatus.trim().isEmpty
-                  ? 'Disconnected'
-                  : effectiveMediaStatus,
-            ),
-          ],
           if (!effectiveInterfaceUp && network.assignedAddresses.isNotEmpty)
             ...<Widget>[
               const SizedBox(height: 12),

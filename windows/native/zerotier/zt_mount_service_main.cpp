@@ -15,6 +15,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -41,6 +43,9 @@ using WintunOpenAdapterFn = WintunAdapterHandle(WINAPI*)(const wchar_t*);
 using WintunCloseAdapterFn = void(WINAPI*)(WintunAdapterHandle);
 using WintunGetAdapterLuidFn = void(WINAPI*)(WintunAdapterHandle, NET_LUID*);
 
+std::mutex g_wintun_adapter_mutex;
+std::map<uint64_t, WintunAdapterHandle> g_pinned_wintun_adapters;
+
 struct WintunApi {
   HMODULE module = nullptr;
   std::wstring loaded_from;
@@ -57,8 +62,19 @@ struct WintunApi {
   }
 };
 
-WintunAdapterHandle g_pinned_wintun_handle = nullptr;
-bool g_pinned_wintun_created = false;
+void ReleasePinnedWintunAdapters(WintunApi* api) {
+  if (api == nullptr || api->close_adapter == nullptr) {
+    return;
+  }
+  std::scoped_lock lock(g_wintun_adapter_mutex);
+  for (auto& entry : g_pinned_wintun_adapters) {
+    if (entry.second != nullptr) {
+      api->close_adapter(entry.second);
+      entry.second = nullptr;
+    }
+  }
+  g_pinned_wintun_adapters.clear();
+}
 
 void SetServiceState(DWORD state, DWORD win32_exit_code, DWORD wait_hint) {
   if (g_status_handle == nullptr) {
@@ -81,6 +97,35 @@ void SafeCopyMessage(const std::string& source, char* destination,
   memset(destination, 0, destination_size);
   const size_t copy_len = std::min(source.size(), destination_size - 1);
   memcpy(destination, source.data(), copy_len);
+}
+
+std::string FormatNetworkIdHex(uint64_t network_id) {
+  std::ostringstream stream;
+  stream << std::hex << std::nouppercase << network_id;
+  return stream.str();
+}
+
+std::wstring BuildWintunAdapterNameForNetwork(uint64_t network_id) {
+  const std::string suffix = FormatNetworkIdHex(network_id);
+  return std::wstring(L"FileTransferFlutter-") +
+         std::wstring(suffix.begin(), suffix.end());
+}
+
+std::wstring BuildWintunTunnelType() {
+  return L"FileTransferFlutter";
+}
+
+GUID BuildWintunAdapterGuidForNetwork(uint64_t network_id) {
+  GUID guid = {0x9f0f6f21, 0x2a6b, 0x4bbf,
+               {0xb9, 0x30, 0x7a, 0xe2, 0x63, 0x85, 0x5d, 0x11}};
+  guid.Data1 ^= static_cast<unsigned long>(network_id & 0xffffffffULL);
+  guid.Data2 ^= static_cast<unsigned short>((network_id >> 32) & 0xffffULL);
+  guid.Data3 ^= static_cast<unsigned short>((network_id >> 48) & 0xffffULL);
+  for (int index = 0; index < 8; ++index) {
+    guid.Data4[index] ^= static_cast<unsigned char>(
+        (network_id >> ((index % 8) * 8)) & 0xffULL);
+  }
+  return guid;
 }
 
 uint32_t PrefixMaskNetworkOrder(uint8_t prefix_length) {
@@ -418,8 +463,7 @@ bool LooksLikeNamedWintunAdapter(const std::string& desired_name,
       _stricmp(description.c_str(), desired_name.c_str()) == 0) {
     return true;
   }
-  return _stricmp(description.c_str(), "wintun userspace tunnel") == 0 ||
-         _stricmp(description.c_str(), "wireguard tunnel") == 0;
+  return false;
 }
 
 bool ResolveWintunAdapterByName(const std::string& desired_name,
@@ -1376,10 +1420,10 @@ Response HandleEnsureWintunAdapterRequest(const Request& request) {
   response.protocol_version = ztwin::privileged_mount::kProtocolVersion;
   response.request_id = request.request_id;
 
-  constexpr const wchar_t* kAdapterName = L"FileTransferFlutter";
-  constexpr const wchar_t* kTunnelType = L"FileTransferFlutter";
-  const GUID kAdapterGuid = {0x9f0f6f21, 0x2a6b, 0x4bbf,
-                             {0xb9, 0x30, 0x7a, 0xe2, 0x63, 0x85, 0x5d, 0x11}};
+  const uint64_t network_id = request.network_id;
+  const std::wstring adapter_name = BuildWintunAdapterNameForNetwork(network_id);
+  const std::wstring tunnel_type = BuildWintunTunnelType();
+  const GUID adapter_guid = BuildWintunAdapterGuidForNetwork(network_id);
 
   std::string load_message;
   WintunApi* api = GetSharedWintunApi(&load_message);
@@ -1390,21 +1434,34 @@ Response HandleEnsureWintunAdapterRequest(const Request& request) {
     return response;
   }
 
-  WintunAdapterHandle handle = g_pinned_wintun_handle;
+  WintunAdapterHandle handle = nullptr;
   bool created = false;
   DWORD open_error = NO_ERROR;
   DWORD create_error = NO_ERROR;
-  if (handle == nullptr) {
-    handle = api->open_adapter(kAdapterName);
-    open_error = handle == nullptr ? GetLastError() : NO_ERROR;
-    if (handle == nullptr) {
-      handle = api->create_adapter(kAdapterName, kTunnelType, &kAdapterGuid);
-      created = handle != nullptr;
-      create_error = handle == nullptr ? GetLastError() : NO_ERROR;
+  {
+    std::scoped_lock lock(g_wintun_adapter_mutex);
+    const auto pinned_it = g_pinned_wintun_adapters.find(network_id);
+    if (pinned_it != g_pinned_wintun_adapters.end() && pinned_it->second != nullptr) {
+      handle = pinned_it->second;
     }
-    if (handle != nullptr) {
-      g_pinned_wintun_handle = handle;
-      g_pinned_wintun_created = created;
+  }
+  if (handle == nullptr) {
+    handle = api->open_adapter(adapter_name.c_str());
+  }
+  open_error = handle == nullptr ? GetLastError() : NO_ERROR;
+  if (handle == nullptr) {
+    handle =
+        api->create_adapter(adapter_name.c_str(), tunnel_type.c_str(), &adapter_guid);
+    created = handle != nullptr;
+    create_error = handle == nullptr ? GetLastError() : NO_ERROR;
+    if (created) {
+      std::scoped_lock lock(g_wintun_adapter_mutex);
+      g_pinned_wintun_adapters[network_id] = handle;
+    }
+  } else {
+    std::scoped_lock lock(g_wintun_adapter_mutex);
+    if (g_pinned_wintun_adapters.find(network_id) == g_pinned_wintun_adapters.end()) {
+      g_pinned_wintun_adapters[network_id] = handle;
     }
   }
 
@@ -1433,7 +1490,7 @@ Response HandleEnsureWintunAdapterRequest(const Request& request) {
   WintunAdapterResolution resolved;
   std::string resolve_detail;
   const bool stable = WaitForStableWintunAdapterByName(
-      "FileTransferFlutter", 24, 250, &resolved, &resolve_detail);
+      WideToUtf8(adapter_name.c_str()), 24, 250, &resolved, &resolve_detail);
 
   if (stable) {
     response.result = static_cast<uint32_t>(created ? Result::kSuccess
@@ -1446,9 +1503,9 @@ Response HandleEnsureWintunAdapterRequest(const Request& request) {
             << " if_index=" << resolved.if_index
             << " luid=" << resolved.luid.Value
             << " oper=" << resolved.oper_status
+            << " pinned=true"
             << " load=" << WideToUtf8(api->loaded_from.c_str())
-            << " resolve=" << resolve_detail
-            << " pinned_created=" << (g_pinned_wintun_created ? "true" : "false");
+            << " resolve=" << resolve_detail;
     SafeCopyMessage(TruncateForMessage(message.str(), 191), response.message,
                     sizeof(response.message));
     return response;
@@ -1462,8 +1519,22 @@ Response HandleEnsureWintunAdapterRequest(const Request& request) {
   message << "wintun_not_stable if_index=" << if_index
           << " luid=" << luid.Value
           << " convert_error=" << convert_error
-          << " resolve=" << resolve_detail
-          << " pinned_created=" << (g_pinned_wintun_created ? "true" : "false");
+          << " resolve=" << resolve_detail;
+  if (handle != nullptr) {
+    std::scoped_lock lock(g_wintun_adapter_mutex);
+    auto pinned_it = g_pinned_wintun_adapters.find(network_id);
+    const bool is_pinned =
+        pinned_it != g_pinned_wintun_adapters.end() && pinned_it->second == handle;
+    if (is_pinned) {
+      g_pinned_wintun_adapters.erase(pinned_it);
+    }
+    if (!is_pinned) {
+      api->close_adapter(handle);
+    }
+  } else if (created) {
+    std::scoped_lock lock(g_wintun_adapter_mutex);
+    g_pinned_wintun_adapters.erase(network_id);
+  }
   SafeCopyMessage(TruncateForMessage(message.str(), 191), response.message,
                   sizeof(response.message));
   return response;
@@ -1820,6 +1891,7 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
 
   SetServiceState(SERVICE_RUNNING, NO_ERROR, 0);
   ServiceLoop();
+  ReleasePinnedWintunAdapters(GetSharedWintunApi(nullptr));
   SetServiceState(SERVICE_STOPPED, NO_ERROR, 0);
 
   CloseHandle(g_stop_event);
@@ -1832,6 +1904,7 @@ int RunConsoleMode() {
     return 2;
   }
   ServiceLoop();
+  ReleasePinnedWintunAdapters(GetSharedWintunApi(nullptr));
   CloseHandle(g_stop_event);
   g_stop_event = nullptr;
   return 0;

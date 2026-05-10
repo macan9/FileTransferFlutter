@@ -7,8 +7,8 @@
 
 namespace ztwin::privileged_mount {
 
-constexpr uint32_t kProtocolVersion = 1;
-constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV1";
+constexpr uint32_t kProtocolVersion = 3;
+constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV3";
 
 enum class Command : uint32_t {
   kInvalid = 0,

@@ -664,9 +664,17 @@ std::filesystem::path StandaloneMountHelperPath() {
     return {};
   }
   const std::filesystem::path helper_dir = current.parent_path();
-  const std::filesystem::path preferred = helper_dir / L"zt_mount_helper.exe";
+  const std::filesystem::path preferred = helper_dir / L"zt_mount_helper_v3.exe";
   if (std::filesystem::exists(preferred)) {
     return preferred;
+  }
+  const std::filesystem::path prior = helper_dir / L"zt_mount_helper_v2.exe";
+  if (std::filesystem::exists(prior)) {
+    return prior;
+  }
+  const std::filesystem::path legacy = helper_dir / L"zt_mount_helper.exe";
+  if (std::filesystem::exists(legacy)) {
+    return legacy;
   }
   return helper_dir / L"zt_mount_service.exe";
 }
@@ -3446,9 +3454,15 @@ bool ZeroTierWindowsRuntime::EnsurePrepared(std::string* error_message) {
   }
   adapter_probe_ = adapter_bridge_.LastProbe();
   if (tap_backend_ != nullptr) {
+    LoadKnownNetworkIdsLocked();
+    std::vector<uint64_t> prepare_network_ids;
+    prepare_network_ids.reserve(known_network_ids_.size());
+    for (const uint64_t network_id : known_network_ids_) {
+      prepare_network_ids.push_back(network_id);
+    }
     std::string backend_action;
-    const bool backend_changed =
-        tap_backend_->EnsureAdapterPresent(adapter_probe_, {}, &backend_action);
+    const bool backend_changed = tap_backend_->EnsureAdapterPresent(
+        adapter_probe_, prepare_network_ids, {}, &backend_action);
     if (backend_changed) {
       std::ostringstream stream;
       stream << "tap_backend_ensure_adapter"
@@ -4744,9 +4758,14 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
   ZeroTierWindowsAdapterBridge::ProbeResult adapter_probe =
       adapter_bridge_.Refresh(expected_addresses);
   if (tap_backend_ != nullptr) {
+    std::vector<uint64_t> active_network_ids;
+    active_network_ids.reserve(refreshed_networks.size());
+    for (const auto& entry : refreshed_networks) {
+      active_network_ids.push_back(entry.first);
+    }
     std::string backend_action;
     const bool backend_changed = tap_backend_->EnsureAdapterPresent(
-        adapter_probe, expected_addresses, &backend_action);
+        adapter_probe, active_network_ids, expected_addresses, &backend_action);
     if (backend_changed) {
       std::ostringstream stream;
       stream << "tap_backend_ensure_adapter"
@@ -4948,29 +4967,28 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
       }
     }
 
+    bool selected_adapter_admin_ready = false;
     if (selected_adapter != nullptr && selected_adapter->if_index != 0 &&
         !record.matched_interface_up) {
-      if (EnsureInterfaceAdminUp(selected_adapter->if_index)) {
-        record.matched_interface_up = true;
-        record.tap_media_status = "up";
-        std::ostringstream stream;
-        stream << "adapter_probe_admin_up"
-               << " network_id=" << ToHexNetworkId(network_id)
-               << " if_index=" << selected_adapter->if_index
-               << " result=success";
-        LogNodeTrace(stream.str());
-      } else {
-        std::ostringstream stream;
-        stream << "adapter_probe_admin_up"
-               << " network_id=" << ToHexNetworkId(network_id)
-               << " if_index=" << selected_adapter->if_index
-               << " result=failed";
-        LogNodeTrace(stream.str());
-      }
+      selected_adapter_admin_ready =
+          EnsureInterfaceAdminUp(selected_adapter->if_index);
+      std::ostringstream stream;
+      stream << "adapter_probe_admin_up"
+             << " network_id=" << ToHexNetworkId(network_id)
+             << " if_index=" << selected_adapter->if_index
+             << " result="
+             << (selected_adapter_admin_ready ? "success" : "failed")
+             << " oper_status_preserved="
+             << (record.matched_interface_up ? "up" : "down")
+             << " media_status=" << record.tap_media_status;
+      LogNodeTrace(stream.str());
     }
 
+    const bool adapter_available_for_mount =
+        record.matched_interface_up || selected_adapter_admin_ready;
+
     if (!record.system_ip_bound && selected_adapter != nullptr &&
-        selected_adapter->if_index != 0 && record.matched_interface_up) {
+        selected_adapter->if_index != 0 && adapter_available_for_mount) {
       if (!can_attempt_privileged_mount) {
         const std::string message =
             "permission_denied_for_ip_mount: Windows IP mounting requires administrator privileges.";
@@ -4994,7 +5012,9 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         }
         if (ip_bound) {
           record.system_ip_bound = true;
-          if (selected_exact_match || !record.matched_interface_name.empty()) {
+          if (record.matched_interface_up &&
+              (selected_exact_match ||
+               !record.matched_interface_name.empty())) {
             record.local_interface_ready = true;
           }
         } else {
@@ -5014,7 +5034,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     }
     if (record.route_expected && !record.system_route_bound &&
         record.system_ip_bound && selected_adapter != nullptr &&
-        selected_adapter->if_index != 0 && record.matched_interface_up) {
+        selected_adapter->if_index != 0 && adapter_available_for_mount) {
       if (!can_attempt_privileged_mount) {
         const std::string message =
             "permission_denied_for_route_mount: Windows route mounting requires administrator privileges.";

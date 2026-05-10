@@ -92,8 +92,9 @@ private:
 		std::wstring loadedFrom;
 	};
 
-	static std::wstring defaultAdapterName();
+	static std::wstring defaultAdapterName(uint64_t nwid);
 	static std::wstring defaultTunnelType();
+	static GUID adapterGuid(uint64_t nwid);
 	static bool loadWintunApi(WintunApi &api,std::string &error);
 	static bool bringInterfaceAdminUp(NET_IFINDEX ifIndex);
 

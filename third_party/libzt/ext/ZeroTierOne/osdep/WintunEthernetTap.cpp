@@ -172,7 +172,7 @@ std::string ipv4ToString(uint32_t ip)
 
 } // namespace
 
-std::wstring WintunEthernetTap::defaultAdapterName()
+std::wstring WintunEthernetTap::defaultAdapterName(uint64_t nwid)
 {
 	char *envValue = nullptr;
 	size_t envSize = 0;
@@ -183,7 +183,9 @@ std::wstring WintunEthernetTap::defaultAdapterName()
 			return configured;
 		}
 	}
-	return L"FileTransferFlutter";
+	std::wstringstream stream;
+	stream << L"FileTransferFlutter-" << std::hex << std::nouppercase << nwid;
+	return stream.str();
 }
 
 std::wstring WintunEthernetTap::defaultTunnelType()
@@ -198,6 +200,18 @@ std::wstring WintunEthernetTap::defaultTunnelType()
 		}
 	}
 	return L"FileTransferFlutter";
+}
+
+GUID WintunEthernetTap::adapterGuid(uint64_t nwid)
+{
+	GUID guid = { 0x9f0f6f21, 0x2a6b, 0x4bbf, { 0xb9, 0x30, 0x7a, 0xe2, 0x63, 0x85, 0x5d, 0x11 } };
+	guid.Data1 ^= static_cast<unsigned long>(nwid & 0xffffffffULL);
+	guid.Data2 ^= static_cast<unsigned short>((nwid >> 32) & 0xffffULL);
+	guid.Data3 ^= static_cast<unsigned short>((nwid >> 48) & 0xffffULL);
+	for (int i = 0; i < 8; ++i) {
+		guid.Data4[i] ^= static_cast<unsigned char>((nwid >> ((i % 8) * 8)) & 0xffULL);
+	}
+	return guid;
 }
 
 bool WintunEthernetTap::loadWintunApi(WintunApi &api,std::string &error)
@@ -260,7 +274,7 @@ WintunEthernetTap::WintunEthernetTap(
 	const char *friendlyName,
 	void (*handler)(void *,void *,uint64_t,const MAC &,const MAC &,unsigned int,unsigned int,const void *,unsigned int),
 	void *arg)
-	: _adapterNameWide(defaultAdapterName())
+	: _adapterNameWide(defaultAdapterName(nwid))
 	, _adapterName(wideToUtf8(_adapterNameWide))
 	, _friendlyName((friendlyName && *friendlyName) ? friendlyName : _adapterName)
 	, _mtu(mtu)
@@ -290,7 +304,8 @@ void WintunEthernetTap::openOrCreateAdapter()
 
 	_adapter = _api.openAdapter(_adapterNameWide.c_str());
 	if (_adapter == nullptr) {
-		_adapter = _api.createAdapter(_adapterNameWide.c_str(),defaultTunnelType().c_str(),nullptr);
+		const GUID requestedGuid = adapterGuid(_nwid);
+		_adapter = _api.createAdapter(_adapterNameWide.c_str(),defaultTunnelType().c_str(),&requestedGuid);
 	}
 	if (_adapter == nullptr) {
 		std::ostringstream stream;

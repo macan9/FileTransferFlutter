@@ -37,7 +37,7 @@ add_executable(zt_mount_service
   "../native/zerotier/zerotier_windows_privileged_mount_ipc.cpp"
   "../native/zerotier/zt_mount_service_main.cpp"
 )
-set_target_properties(zt_mount_service PROPERTIES OUTPUT_NAME "zt_mount_helper")
+set_target_properties(zt_mount_service PROPERTIES OUTPUT_NAME "zt_mount_helper_v3")
 
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
