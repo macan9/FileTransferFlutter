@@ -15,6 +15,7 @@ import 'package:file_transfer_flutter/core/services/networking_service.dart';
 import 'package:file_transfer_flutter/core/services/zerotier_facade.dart';
 import 'package:file_transfer_flutter/core/services/zerotier_local_service.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_providers.dart';
+import 'package:file_transfer_flutter/features/networking/presentation/support/networking_debug_log.dart';
 import 'package:file_transfer_flutter/shared/providers/p2p_transport_providers.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -315,6 +316,16 @@ class NetworkingAgentRuntimeController
     String? message,
     Map<String, Object?> payload = const <String, Object?>{},
   }) {
+    unawaited(
+      NetworkingDebugLog.write(
+        'runtime_event_synthetic',
+        fields: <String, Object?>{
+          'type': type.name,
+          'networkId': networkId,
+          'message': message,
+        },
+      ),
+    );
     _recordRuntimeEvent(
       ZeroTierRuntimeEvent(
         type: type,
@@ -881,7 +892,32 @@ class NetworkingAgentRuntimeController
         return;
       }
 
-      for (final NetworkAgentCommand command in commands) {
+      final List<MapEntry<int, NetworkAgentCommand>> orderedCommands =
+          commands.asMap().entries.toList(growable: false)
+            ..sort(
+              (
+                MapEntry<int, NetworkAgentCommand> left,
+                MapEntry<int, NetworkAgentCommand> right,
+              ) {
+                final DateTime? leftCreatedAt = left.value.createdAt;
+                final DateTime? rightCreatedAt = right.value.createdAt;
+                if (leftCreatedAt != null && rightCreatedAt != null) {
+                  final int createdAtCompare =
+                      leftCreatedAt.compareTo(rightCreatedAt);
+                  if (createdAtCompare != 0) {
+                    return createdAtCompare;
+                  }
+                } else if (leftCreatedAt == null && rightCreatedAt != null) {
+                  return -1;
+                } else if (leftCreatedAt != null && rightCreatedAt == null) {
+                  return 1;
+                }
+                return left.key.compareTo(right.key);
+              },
+            );
+
+      for (final MapEntry<int, NetworkAgentCommand> entry in orderedCommands) {
+        final NetworkAgentCommand command = entry.value;
         if (command.isSkipped) {
           state = state.copyWith(
             lastCommandAt: DateTime.now(),
@@ -929,6 +965,17 @@ class NetworkingAgentRuntimeController
               'networkId=$networkId commandId=${command.id} '
               'sessionId=${command.sessionId ?? '-'}',
             );
+            unawaited(
+              NetworkingDebugLog.write(
+                'runtime_command_start',
+                fields: <String, Object?>{
+                  'type': command.type,
+                  'commandId': command.id,
+                  'networkId': networkId,
+                  'sessionId': command.sessionId,
+                },
+              ),
+            );
             activeActionType = 'join';
             activeActionNetworkId = networkId;
             _beginNetworkActionSession(activeActionType, activeActionNetworkId);
@@ -957,20 +1004,28 @@ class NetworkingAgentRuntimeController
               'networkId=$networkId commandId=${command.id} '
               'sessionId=${command.sessionId ?? '-'} source=$leaveSource',
             );
-            if (await _shouldSuppressLeaveCommand(
-              config,
-              command: command,
-              networkId: networkId,
-            )) {
-              debugPrint(
-                'Skipping stale leave command: id=${command.id}, '
-                'networkId=$networkId because a newer join command is pending.',
-              );
-              break;
-            }
+            unawaited(
+              NetworkingDebugLog.write(
+                'runtime_command_start',
+                fields: <String, Object?>{
+                  'type': command.type,
+                  'commandId': command.id,
+                  'networkId': networkId,
+                  'sessionId': command.sessionId,
+                  'source': leaveSource,
+                },
+              ),
+            );
             activeActionType = 'leave';
             activeActionNetworkId = networkId;
             _beginNetworkActionSession(activeActionType, activeActionNetworkId);
+            recordSyntheticRuntimeEvent(
+              type: ZeroTierRuntimeEventType.networkLeaving,
+              networkId: networkId,
+              payload: <String, Object?>{
+                'leaveSource': leaveSource,
+              },
+            );
             await _zeroTierService.leaveNetwork(
               networkId,
               source: leaveSource,
@@ -978,6 +1033,10 @@ class NetworkingAgentRuntimeController
             if (_shouldWaitInDartForNetworkLeave) {
               await _waitForNetworkLeft(networkId);
             }
+            await _finalizeRuntimeRecoveryAfterLeave(
+              networkId,
+              deactivateWhenIdle: false,
+            );
             await _refreshRuntimeStatus();
             await ref.read(networkingProvider.notifier).refresh();
             _endNetworkActionSession(
@@ -1039,12 +1098,33 @@ class NetworkingAgentRuntimeController
         lastCommandSummary: 'Executed ${command.type}',
         clearLastError: true,
       );
+      unawaited(
+        NetworkingDebugLog.write(
+          'runtime_command_success',
+          fields: <String, Object?>{
+            'type': command.type,
+            'commandId': command.id,
+            'networkId': command.payload['networkId']?.toString(),
+          },
+        ),
+      );
       debugPrint(
         'Agent command completed: id=${command.id}, type=${command.type}, '
         'status=acknowledged',
       );
     } catch (error, stackTrace) {
       debugPrint('networking command failed: $error\n$stackTrace');
+      unawaited(
+        NetworkingDebugLog.write(
+          'runtime_command_error',
+          fields: <String, Object?>{
+            'type': command.type,
+            'commandId': command.id,
+            'networkId': command.payload['networkId']?.toString(),
+            'message': error.toString(),
+          },
+        ),
+      );
       await _networkingService.ackAgentCommand(
         commandId: command.id,
         deviceId: config.deviceId,
@@ -1073,6 +1153,15 @@ class NetworkingAgentRuntimeController
       activeNetworkActionNetworkId: networkId,
       activeNetworkActionStartedAt: DateTime.now(),
     );
+    unawaited(
+      NetworkingDebugLog.write(
+        'runtime_action_session_begin',
+        fields: <String, Object?>{
+          'actionType': actionType,
+          'networkId': networkId,
+        },
+      ),
+    );
   }
 
   void _endNetworkActionSession({
@@ -1098,6 +1187,16 @@ class NetworkingAgentRuntimeController
       clearActiveNetworkActionNetworkId: true,
       clearActiveNetworkActionStartedAt: true,
     );
+    unawaited(
+      NetworkingDebugLog.write(
+        'runtime_action_session_end',
+        fields: <String, Object?>{
+          'actionType': targetType.isEmpty ? currentType : targetType,
+          'networkId':
+              targetNetworkId.isEmpty ? currentNetworkId : targetNetworkId,
+        },
+      ),
+    );
   }
 
   Future<void> _refreshRuntimeStatus() async {
@@ -1113,6 +1212,18 @@ class NetworkingAgentRuntimeController
         status = status.copyWith(clearLastError: true);
       }
       _logRuntimeStatusChange(previous, status);
+      unawaited(
+        NetworkingDebugLog.write(
+          'runtime_status_refresh',
+          fields: <String, Object?>{
+            'serviceState': status.serviceState,
+            'joinedCount': status.joinedNetworks.length,
+            'lastError': status.lastError,
+            'activeActionType': state.activeNetworkActionType,
+            'activeActionNetworkId': state.activeNetworkActionNetworkId,
+          },
+        ),
+      );
       state = state.copyWith(
         runtimeStatus: status,
         lastError: status.lastError,
@@ -1228,43 +1339,16 @@ class NetworkingAgentRuntimeController
     }
   }
 
-  Future<bool> _shouldSuppressLeaveCommand(
-    AppConfig config, {
-    required NetworkAgentCommand command,
-    required String networkId,
-  }) async {
-    final List<NetworkAgentCommand> latestCommands =
-        await _networkingService.fetchAgentCommands(
-      deviceId: config.deviceId,
-      agentToken: config.agentToken,
-    );
-    final DateTime commandCreatedAt =
-        command.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
-    for (final NetworkAgentCommand candidate in latestCommands) {
-      if (candidate.type != 'join_zerotier_network' ||
-          candidate.isSkipped ||
-          candidate.isFinal) {
-        continue;
-      }
-      final String candidateNetworkId =
-          candidate.payload['networkId']?.toString() ?? '';
-      if (candidateNetworkId.trim() != networkId.trim()) {
-        continue;
-      }
-      final DateTime candidateCreatedAt =
-          candidate.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
-      if (!candidateCreatedAt.isBefore(commandCreatedAt)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   ZeroTierRuntimeStatus _stabilizeTransientWindowsStatus(
     ZeroTierRuntimeStatus previous,
     ZeroTierRuntimeStatus next,
   ) {
     if (!Platform.isWindows) {
+      return next;
+    }
+    final String activeActionType = state.activeNetworkActionType?.trim() ?? '';
+    final String transitionActionType = activeActionType.toLowerCase();
+    if (transitionActionType == 'leave') {
       return next;
     }
     final ZeroTierRuntimeStatus merged = _mergeTransientRegressedNetworks(
@@ -1317,6 +1401,10 @@ class NetworkingAgentRuntimeController
     ZeroTierRuntimeStatus previous,
     ZeroTierRuntimeStatus next,
   ) {
+    final String activeActionType = state.activeNetworkActionType?.trim() ?? '';
+    if (activeActionType.toLowerCase() == 'leave') {
+      return next;
+    }
     if (previous.joinedNetworks.isEmpty || next.joinedNetworks.isEmpty) {
       return next;
     }
@@ -1723,6 +1811,17 @@ class NetworkingAgentRuntimeController
       );
       return;
     }
+    unawaited(
+      NetworkingDebugLog.write(
+        'runtime_event',
+        fields: <String, Object?>{
+          'type': event.type.name,
+          'networkId': event.networkId,
+          'message': event.message,
+          'synthetic': event.payload['synthetic'] == true,
+        },
+      ),
+    );
     _logJoinRuntimeCheckpoint(event);
     final List<ZeroTierRuntimeEvent> recentEvents =
         _buildRecentRuntimeEvents(event);

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:equatable/equatable.dart';
 import 'package:file_transfer_flutter/core/config/models/app_config.dart';
 import 'package:file_transfer_flutter/core/models/managed_network.dart';
@@ -6,6 +8,7 @@ import 'package:file_transfer_flutter/core/models/pairing_session.dart';
 import 'package:file_transfer_flutter/core/models/private_network_creation_result.dart';
 import 'package:file_transfer_flutter/core/models/realtime_error.dart';
 import 'package:file_transfer_flutter/core/services/networking_service.dart';
+import 'package:file_transfer_flutter/features/networking/presentation/support/networking_debug_log.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -305,16 +308,46 @@ class NetworkingController extends AsyncNotifier<NetworkingDashboardState> {
         activeAction: action,
       ),
     );
+    unawaited(
+      NetworkingDebugLog.write(
+        'dashboard_action_start',
+        fields: <String, Object?>{
+          'action': action,
+          'defaultNetworkId': current.defaultNetwork?.zeroTierNetworkId,
+          'isSubmitting': true,
+        },
+      ),
+    );
 
     try {
       await run();
       final NetworkingDashboardState reloaded = await _load();
       state = AsyncValue.data(reloaded);
+      unawaited(
+        NetworkingDebugLog.write(
+          'dashboard_action_success',
+          fields: <String, Object?>{
+            'action': action,
+            'defaultNetworkId': reloaded.defaultNetwork?.zeroTierNetworkId,
+            'isSubmitting': reloaded.isSubmitting,
+          },
+        ),
+      );
     } on RealtimeError {
       state = AsyncValue.data(
         current.copyWith(
           isSubmitting: false,
           clearActiveAction: true,
+        ),
+      );
+      unawaited(
+        NetworkingDebugLog.write(
+          'dashboard_action_error',
+          fields: <String, Object?>{
+            'action': action,
+            'defaultNetworkId': current.defaultNetwork?.zeroTierNetworkId,
+            'kind': 'RealtimeError',
+          },
         ),
       );
       rethrow;
@@ -323,6 +356,17 @@ class NetworkingController extends AsyncNotifier<NetworkingDashboardState> {
         current.copyWith(
           isSubmitting: false,
           clearActiveAction: true,
+        ),
+      );
+      unawaited(
+        NetworkingDebugLog.write(
+          'dashboard_action_error',
+          fields: <String, Object?>{
+            'action': action,
+            'defaultNetworkId': current.defaultNetwork?.zeroTierNetworkId,
+            'kind': error.runtimeType.toString(),
+            'message': error.toString(),
+          },
         ),
       );
       throw RealtimeError('$error');

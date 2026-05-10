@@ -14,6 +14,7 @@ import 'package:file_transfer_flutter/core/models/zerotier_runtime_event.dart';
 import 'package:file_transfer_flutter/core/models/zerotier_runtime_status.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_agent_provider.dart';
 import 'package:file_transfer_flutter/features/networking/presentation/providers/networking_providers.dart';
+import 'package:file_transfer_flutter/features/networking/presentation/support/networking_debug_log.dart';
 import 'package:file_transfer_flutter/shared/providers/service_providers.dart';
 import 'package:file_transfer_flutter/shared/widgets/section_card.dart';
 import 'package:flutter/material.dart';
@@ -168,8 +169,11 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
   bool _isDefaultLeaveTransitioning = false;
   DateTime? _defaultJoinTransitionStartedAt;
   DateTime? _defaultLeaveTransitionStartedAt;
+  String? _defaultLeaveTargetNetworkId;
+  bool _hasObservedDefaultRuntimeLeaveSession = false;
   int _selectedPrimaryTab = 0;
   int _selectedPrivateTab = 0;
+  String? _lastDefaultFlowLogSignature;
 
   @override
   void initState() {
@@ -198,6 +202,15 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
           NetworkingAgentRuntimeState next) {
         final ZeroTierRuntimeEventType? nextEventType =
             next.lastRuntimeEvent?.type;
+        final String defaultLeaveTargetNetworkId =
+            _defaultLeaveTargetNetworkId?.trim().toLowerCase() ?? '';
+        final String activeActionNetworkId =
+            next.activeNetworkActionNetworkId?.trim().toLowerCase() ?? '';
+        final bool leaveSessionMatchesDefault =
+            defaultLeaveTargetNetworkId.isNotEmpty &&
+                (next.activeNetworkActionType == 'leave' ||
+                    next.hasActiveLeaveSession) &&
+                activeActionNetworkId == defaultLeaveTargetNetworkId;
         final bool joinProgressObserved = next.hasActiveJoinSession ||
             next.activeNetworkActionType == 'join' ||
             nextEventType == ZeroTierRuntimeEventType.networkJoining ||
@@ -206,14 +219,15 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             nextEventType == ZeroTierRuntimeEventType.ipAssigned ||
             nextEventType == ZeroTierRuntimeEventType.networkOnline ||
             nextEventType == ZeroTierRuntimeEventType.error;
-        final bool leaveInFlightObserved = next.hasActiveLeaveSession ||
-            next.activeNetworkActionType == 'leave' ||
-            nextEventType == ZeroTierRuntimeEventType.networkLeaving;
+        final bool leaveInFlightObserved = leaveSessionMatchesDefault;
         final bool leaveTerminalObserved =
             nextEventType == ZeroTierRuntimeEventType.networkLeft ||
                 nextEventType == ZeroTierRuntimeEventType.error;
         final bool leaveProgressObserved =
             leaveInFlightObserved || leaveTerminalObserved;
+        if (leaveSessionMatchesDefault) {
+          _hasObservedDefaultRuntimeLeaveSession = true;
+        }
         if (joinProgressObserved && _isDefaultJoinTransitioning && mounted) {
           setState(() {
             _isDefaultJoinTransitioning = false;
@@ -234,6 +248,11 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         final String currentDefaultNetworkId =
             currentDefaultNetwork?.zeroTierNetworkId?.trim().toLowerCase() ??
                 '';
+        final bool hasAnyDefaultActionInFlight =
+            currentDefaultNetworkId.isNotEmpty &&
+                activeActionNetworkId == currentDefaultNetworkId &&
+                (next.activeNetworkActionType == 'leave' ||
+                    next.activeNetworkActionType == 'join');
         if (currentDefaultNetworkId.isNotEmpty) {
           for (final ZeroTierNetworkState state
               in next.runtimeStatus.joinedNetworks) {
@@ -256,6 +275,11 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
               currentDeviceId: currentConfig.deviceId,
               runtimeStatus: next.runtimeStatus,
             );
+        _logDefaultFlowSnapshot(
+          next,
+          currentDefaultNetworkId: currentDefaultNetworkId,
+          isOnline: currentDefaultOnline,
+        );
         if (_defaultFlowState == _DefaultNetworkingUiState.closing && mounted) {
           final bool defaultNetworkGone = currentDefaultNetwork == null;
           final bool localNetworkGone = currentDefaultLocalState == null;
@@ -263,16 +287,22 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
                   null &&
               DateTime.now().difference(_defaultLeaveTransitionStartedAt!) >=
                   _defaultMountStallTimeout;
-          if (defaultNetworkGone ||
-              localNetworkGone ||
-              leaveTerminalObserved ||
-              leaveHasStalled) {
+          final bool canCompleteAfterRuntimeLeaveObserved =
+              _hasObservedDefaultRuntimeLeaveSession &&
+                  !hasAnyDefaultActionInFlight &&
+                  !leaveSessionMatchesDefault &&
+                  (defaultNetworkGone || localNetworkGone);
+          if (leaveTerminalObserved ||
+              leaveHasStalled ||
+              canCompleteAfterRuntimeLeaveObserved) {
             setState(() {
               _hasDefaultNetworkingIntent = false;
               _isDefaultLeaveTransitioning = false;
               _defaultFlowState = _DefaultNetworkingUiState.idle;
               _defaultJoinTransitionStartedAt = null;
               _defaultLeaveTransitionStartedAt = null;
+              _defaultLeaveTargetNetworkId = null;
+              _hasObservedDefaultRuntimeLeaveSession = false;
             });
           }
         }
@@ -555,6 +585,15 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
     }
 
     try {
+      unawaited(
+        NetworkingDebugLog.write(
+          'page_join_default_click',
+          fields: <String, Object?>{
+            'deviceId': readyConfig.deviceId,
+            'flowState': _defaultFlowState.name,
+          },
+        ),
+      );
       if (mounted) {
         setState(() {
           _hasDefaultNetworkingIntent = true;
@@ -646,6 +685,16 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       if (!_ensureRegistered(readyConfig)) {
         return;
       }
+      unawaited(
+        NetworkingDebugLog.write(
+          'page_leave_default_click',
+          fields: <String, Object?>{
+            'deviceId': readyConfig.deviceId,
+            'networkId': networkId,
+            'flowState': _defaultFlowState.name,
+          },
+        ),
+      );
       if (mounted) {
         setState(() {
           _isDefaultLeaveTransitioning = true;
@@ -653,6 +702,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
           _defaultFlowState = _DefaultNetworkingUiState.closing;
           _defaultJoinTransitionStartedAt = null;
           _defaultLeaveTransitionStartedAt = DateTime.now();
+          _defaultLeaveTargetNetworkId = networkId;
+          _hasObservedDefaultRuntimeLeaveSession = false;
         });
       }
 
@@ -671,13 +722,6 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _hasDefaultNetworkingIntent = false;
-        _isDefaultLeaveTransitioning = false;
-        _defaultFlowState = _DefaultNetworkingUiState.idle;
-        _defaultJoinTransitionStartedAt = null;
-        _defaultLeaveTransitionStartedAt = null;
-      });
       _showPageMessage('已取消默认网络组网。');
     } on RealtimeError catch (error) {
       if (!mounted) {
@@ -692,6 +736,8 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         }
         _defaultJoinTransitionStartedAt = null;
         _defaultLeaveTransitionStartedAt = null;
+        _defaultLeaveTargetNetworkId = null;
+        _hasObservedDefaultRuntimeLeaveSession = false;
       });
       _showPageMessage(error.message);
     } catch (error) {
@@ -707,9 +753,51 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
         }
         _defaultJoinTransitionStartedAt = null;
         _defaultLeaveTransitionStartedAt = null;
+        _defaultLeaveTargetNetworkId = null;
+        _hasObservedDefaultRuntimeLeaveSession = false;
       });
       _showPageMessage('$error');
     }
+  }
+
+  void _logDefaultFlowSnapshot(
+    NetworkingAgentRuntimeState agentState, {
+    required String currentDefaultNetworkId,
+    required bool isOnline,
+  }) {
+    final String signature = <String>[
+      _defaultFlowState.name,
+      _hasDefaultNetworkingIntent ? 'intent1' : 'intent0',
+      _isDefaultJoinTransitioning ? 'join1' : 'join0',
+      _isDefaultLeaveTransitioning ? 'leave1' : 'leave0',
+      currentDefaultNetworkId,
+      agentState.activeNetworkActionType ?? '-',
+      agentState.activeNetworkActionNetworkId ?? '-',
+      agentState.networkTransitionLabel ?? '-',
+      agentState.lastRuntimeEvent?.type.name ?? '-',
+      isOnline ? 'online1' : 'online0',
+    ].join('|');
+    if (signature == _lastDefaultFlowLogSignature) {
+      return;
+    }
+    _lastDefaultFlowLogSignature = signature;
+    unawaited(
+      NetworkingDebugLog.write(
+        'page_default_flow',
+        fields: <String, Object?>{
+          'flowState': _defaultFlowState.name,
+          'hasIntent': _hasDefaultNetworkingIntent,
+          'joinTransitioning': _isDefaultJoinTransitioning,
+          'leaveTransitioning': _isDefaultLeaveTransitioning,
+          'networkId': currentDefaultNetworkId,
+          'activeActionType': agentState.activeNetworkActionType,
+          'activeActionNetworkId': agentState.activeNetworkActionNetworkId,
+          'transitionLabel': agentState.networkTransitionLabel,
+          'lastRuntimeEvent': agentState.lastRuntimeEvent?.type.name,
+          'isOnline': isOnline,
+        },
+      ),
+    );
   }
 
   Future<void> _joinByInviteCode() async {
@@ -1636,7 +1724,7 @@ class _OneClickNetworkingTab extends StatelessWidget {
       _DefaultNetworkingUiState.success =>
         _NetworkingPageState._debugHoldDefaultNetworkOrchestrating
             ? debugFlowState
-            : _DefaultNetworkFlowState.online,
+            : debugFlowState,
       _DefaultNetworkingUiState.closing => _DefaultNetworkFlowState.closing,
     };
     final _DefaultNetworkFlowPresentation flowPresentation =
@@ -1676,9 +1764,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           _VirtualIpPanel(
-            addresses: isConnected
-                ? localState.assignedAddresses
-                : const <String>[],
+            addresses:
+                isConnected ? localState.assignedAddresses : const <String>[],
             onCopy: onCopyIp,
           ),
           if (isExternallyLocked) ...<Widget>[
