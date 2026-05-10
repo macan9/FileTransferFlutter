@@ -52,12 +52,10 @@ Future<void> main() async {
     windowButtonVisibility: false,
   );
 
-  windowManager.waitUntilReadyToShow(windowOptions, () async {
+  await windowManager.waitUntilReadyToShow(windowOptions, () async {
     windowStateService.attach();
     await windowStateService.restoreAfterShow(launchOptions);
     await windowManager.setTitle(AppConstants.appName);
-    await windowManager.show();
-    await windowManager.focus();
   });
 
   runApp(
@@ -71,6 +69,11 @@ Future<void> main() async {
       child: const FileTransferApp(),
     ),
   );
+
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    await windowManager.show();
+    await windowManager.focus();
+  });
 
   await DesktopTrayService.initialize();
 }

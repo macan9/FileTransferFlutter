@@ -14,6 +14,7 @@
 #include <flutter/standard_method_codec.h>
 
 #include <algorithm>
+#include <cmath>
 #include <codecvt>
 #include <map>
 #include <memory>
@@ -66,6 +67,27 @@ struct OwnerDrawMenuItem {
   bool separator = false;
 };
 
+float GetWindowScaleFactor(HWND hwnd) {
+  UINT dpi = 96;
+  HMODULE user32 = GetModuleHandleW(L"user32.dll");
+  if (user32 != nullptr) {
+    using GetDpiForWindowProc = UINT(WINAPI*)(HWND);
+    auto get_dpi_for_window = reinterpret_cast<GetDpiForWindowProc>(
+        GetProcAddress(user32, "GetDpiForWindow"));
+    if (get_dpi_for_window != nullptr && hwnd != nullptr) {
+      dpi = get_dpi_for_window(hwnd);
+    }
+  }
+  if (dpi == 0) {
+    dpi = 96;
+  }
+  return static_cast<float>(dpi) / 96.0f;
+}
+
+int ScaleForWindow(HWND hwnd, int value) {
+  return std::max(1, static_cast<int>(std::lround(value * GetWindowScaleFactor(hwnd))));
+}
+
 class TrayManagerPlugin : public flutter::Plugin {
  public:
   static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
@@ -104,6 +126,8 @@ class TrayManagerPlugin : public flutter::Plugin {
   bool TrayManagerPlugin::_DrawOwnerDrawMenuItem(DRAWITEMSTRUCT* draw);
   HWND TrayManagerPlugin::_GetMenuOwnerWindow();
   HWND TrayManagerPlugin::_GetCustomMenuWindow();
+  float TrayManagerPlugin::_GetMenuScale();
+  int TrayManagerPlugin::_ScaleMenuValue(int value);
   SIZE TrayManagerPlugin::_MeasureCustomMenu();
   int TrayManagerPlugin::_HitTestCustomMenu(int y);
   void TrayManagerPlugin::_PaintCustomMenu(HWND hwnd);
@@ -285,6 +309,18 @@ HWND TrayManagerPlugin::_GetCustomMenuWindow() {
   return custom_menu_window;
 }
 
+float TrayManagerPlugin::_GetMenuScale() {
+  HWND reference_window = custom_menu_window != nullptr ? custom_menu_window
+                                                        : GetMainWindow();
+  return GetWindowScaleFactor(reference_window);
+}
+
+int TrayManagerPlugin::_ScaleMenuValue(int value) {
+  HWND reference_window = custom_menu_window != nullptr ? custom_menu_window
+                                                        : GetMainWindow();
+  return ScaleForWindow(reference_window, value);
+}
+
 LRESULT CALLBACK TrayManagerPlugin::_CustomMenuWndProc(HWND hwnd, UINT message,
                                                        WPARAM wparam,
                                                        LPARAM lparam) {
@@ -455,7 +491,7 @@ bool TrayManagerPlugin::_MeasureOwnerDrawMenuItem(
 
   if (item->separator) {
     measure->itemWidth = 1;
-    measure->itemHeight = 9;
+    measure->itemHeight = _ScaleMenuValue(9);
     return true;
   }
 
@@ -468,13 +504,13 @@ bool TrayManagerPlugin::_MeasureOwnerDrawMenuItem(
   SelectObject(hdc, old_font);
   ReleaseDC(nullptr, hdc);
 
-  const UINT icon_left = 10;
-  const UINT icon_size = 20;
-  const UINT text_gap = 7;
-  const UINT text_right_padding = 18;
+  const UINT icon_left = _ScaleMenuValue(10);
+  const UINT icon_size = _ScaleMenuValue(20);
+  const UINT text_gap = _ScaleMenuValue(7);
+  const UINT text_right_padding = _ScaleMenuValue(18);
   measure->itemWidth =
       icon_left + icon_size + text_gap + text_size.cx + text_right_padding;
-  measure->itemHeight = 30;
+  measure->itemHeight = _ScaleMenuValue(30);
   return true;
 }
 
@@ -497,10 +533,10 @@ bool TrayManagerPlugin::_DrawOwnerDrawMenuItem(DRAWITEMSTRUCT* draw) {
 
   if (item->separator) {
     RECT line_rect = rect;
-    line_rect.left += 10;
-    line_rect.right -= 8;
+    line_rect.left += _ScaleMenuValue(10);
+    line_rect.right -= _ScaleMenuValue(8);
     line_rect.top += (rect.bottom - rect.top) / 2;
-    line_rect.bottom = line_rect.top + 1;
+    line_rect.bottom = line_rect.top + std::max(1, _ScaleMenuValue(1));
     HBRUSH line_brush = CreateSolidBrush(RGB(225, 225, 225));
     FillRect(hdc, &line_rect, line_brush);
     DeleteObject(line_brush);
@@ -510,16 +546,16 @@ bool TrayManagerPlugin::_DrawOwnerDrawMenuItem(DRAWITEMSTRUCT* draw) {
   const bool selected = (draw->itemState & ODS_SELECTED) != 0;
   if (selected && !item->disabled) {
     RECT selected_rect = rect;
-    selected_rect.left += 3;
-    selected_rect.right -= 3;
+    selected_rect.left += _ScaleMenuValue(3);
+    selected_rect.right -= _ScaleMenuValue(3);
     HBRUSH selected_brush = CreateSolidBrush(RGB(238, 238, 238));
     FillRect(hdc, &selected_rect, selected_brush);
     DeleteObject(selected_brush);
   }
 
   const int item_height = rect.bottom - rect.top;
-  const int icon_size = 20;
-  const int icon_left = rect.left + 10;
+  const int icon_size = _ScaleMenuValue(20);
+  const int icon_left = rect.left + _ScaleMenuValue(10);
   const int icon_top = rect.top + (item_height - icon_size) / 2;
 
   if (!item->icon_path.empty() && gdiplus_token != 0) {
@@ -536,9 +572,9 @@ bool TrayManagerPlugin::_DrawOwnerDrawMenuItem(DRAWITEMSTRUCT* draw) {
   }
 
   RECT text_rect = rect;
-  text_rect.left = rect.left + 37;
-  text_rect.right -= 14;
-  text_rect.top += 1;
+  text_rect.left = rect.left + _ScaleMenuValue(37);
+  text_rect.right -= _ScaleMenuValue(14);
+  text_rect.top += _ScaleMenuValue(1);
 
   HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
   HFONT old_font = static_cast<HFONT>(SelectObject(hdc, font));
@@ -556,19 +592,19 @@ bool TrayManagerPlugin::_DrawOwnerDrawMenuItem(DRAWITEMSTRUCT* draw) {
 }
 
 SIZE TrayManagerPlugin::_MeasureCustomMenu() {
-  const int icon_left = 12;
-  const int icon_size = 28;
-  const int text_gap = 4;
-  const int right_padding = 20;
-  const int min_width = 150;
-  SIZE size = {min_width, 12};
+  const int icon_left = _ScaleMenuValue(12);
+  const int icon_size = _ScaleMenuValue(28);
+  const int text_gap = _ScaleMenuValue(4);
+  const int right_padding = _ScaleMenuValue(20);
+  const int min_width = _ScaleMenuValue(150);
+  SIZE size = {min_width, _ScaleMenuValue(12)};
 
   HDC hdc = GetDC(nullptr);
   HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
   HFONT old_font = static_cast<HFONT>(SelectObject(hdc, font));
   for (const auto& item : owner_draw_menu_items) {
     if (item->separator) {
-      size.cy += 9;
+      size.cy += _ScaleMenuValue(9);
       continue;
     }
 
@@ -578,7 +614,7 @@ SIZE TrayManagerPlugin::_MeasureCustomMenu() {
     size.cx = std::max(size.cx,
                        icon_left + icon_size + text_gap + text_size.cx +
                            right_padding);
-    size.cy += 34;
+    size.cy += _ScaleMenuValue(34);
   }
   SelectObject(hdc, old_font);
   ReleaseDC(nullptr, hdc);
@@ -587,10 +623,10 @@ SIZE TrayManagerPlugin::_MeasureCustomMenu() {
 }
 
 int TrayManagerPlugin::_HitTestCustomMenu(int y) {
-  int top = 6;
+  int top = _ScaleMenuValue(6);
   for (size_t index = 0; index < owner_draw_menu_items.size(); index++) {
     const auto& item = owner_draw_menu_items[index];
-    int height = item->separator ? 9 : 34;
+    int height = item->separator ? _ScaleMenuValue(9) : _ScaleMenuValue(34);
     if (y >= top && y < top + height) {
       if (item->separator || item->disabled) {
         return -1;
@@ -622,31 +658,37 @@ void TrayManagerPlugin::_PaintCustomMenu(HWND hwnd) {
   graphics.Clear(Gdiplus::Color(248, 250, 252));
 
   Gdiplus::SolidBrush background(Gdiplus::Color(248, 250, 252));
+  const float scale = _GetMenuScale();
   FillRoundedRectangle(&graphics, &background, 0.0f, 0.0f,
                        static_cast<Gdiplus::REAL>(width),
-                       static_cast<Gdiplus::REAL>(height), 10.0f);
+                       static_cast<Gdiplus::REAL>(height), 10.0f * scale);
 
-  int top = 6;
-  const int icon_left = 12;
-  const int icon_size = 28;
-  const int text_left = icon_left + icon_size + 4;
+  int top = _ScaleMenuValue(6);
+  const int icon_left = _ScaleMenuValue(12);
+  const int icon_size = _ScaleMenuValue(28);
+  const int text_left = icon_left + icon_size + _ScaleMenuValue(4);
 
   for (size_t index = 0; index < owner_draw_menu_items.size(); index++) {
     const auto& item = owner_draw_menu_items[index];
     if (item->separator) {
       Gdiplus::SolidBrush line_brush(Gdiplus::Color(226, 232, 240));
-      graphics.FillRectangle(&line_brush, 10, top + 4, width - 20, 1);
-      top += 9;
+      graphics.FillRectangle(&line_brush, _ScaleMenuValue(10),
+                             top + _ScaleMenuValue(4), width - _ScaleMenuValue(20),
+                             std::max(1, _ScaleMenuValue(1)));
+      top += _ScaleMenuValue(9);
       continue;
     }
 
-    const int item_height = 34;
+    const int item_height = _ScaleMenuValue(34);
     const bool selected = static_cast<int>(index) == custom_menu_hover_index;
     if (selected) {
       Gdiplus::SolidBrush selected_brush(Gdiplus::Color(235, 239, 244));
-      FillRoundedRectangle(&graphics, &selected_brush, 5.0f,
+      FillRoundedRectangle(&graphics, &selected_brush,
+                           static_cast<Gdiplus::REAL>(_ScaleMenuValue(5)),
                            static_cast<float>(top),
-                           static_cast<float>(width - 10), 30.0f, 7.0f);
+                           static_cast<float>(width - _ScaleMenuValue(10)),
+                           static_cast<Gdiplus::REAL>(_ScaleMenuValue(30)),
+                           7.0f * scale);
     }
 
     if (!item->icon_path.empty() && gdiplus_token != 0) {
@@ -662,7 +704,8 @@ void TrayManagerPlugin::_PaintCustomMenu(HWND hwnd) {
       }
     }
 
-    RECT text_rect = {text_left, top, width - 16, top + item_height};
+    RECT text_rect = {text_left, top, width - _ScaleMenuValue(16),
+                      top + item_height};
     HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     HFONT old_font = static_cast<HFONT>(SelectObject(buffer_hdc, font));
     int old_bk_mode = SetBkMode(buffer_hdc, TRANSPARENT);
@@ -709,7 +752,9 @@ void TrayManagerPlugin::_ShowCustomMenu(int x, int y) {
   left = std::max(left, static_cast<int>(monitor_info.rcWork.left));
   top = std::max(top, static_cast<int>(monitor_info.rcWork.top));
 
-  HRGN region = CreateRoundRectRgn(0, 0, size.cx + 1, size.cy + 1, 12, 12);
+  const int corner_radius = _ScaleMenuValue(12);
+  HRGN region = CreateRoundRectRgn(0, 0, size.cx + 1, size.cy + 1,
+                                   corner_radius, corner_radius);
   SetWindowRgn(hwnd, region, TRUE);
   custom_menu_hover_index = -1;
   SetWindowPos(hwnd, HWND_TOPMOST, left, top, size.cx, size.cy,
