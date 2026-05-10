@@ -1,8 +1,10 @@
 #include "WintunEthernetTap.hpp"
 
 #include <iphlpapi.h>
+#include <shellapi.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -22,6 +24,47 @@ const size_t kMaxPendingIpv4Packets = 512;
 const uint64_t kPendingIpv4RetryInterval = 1000;
 const uint64_t kPendingIpv4MaxAge = 15000;
 const uint64_t kStatsLogInterval = 10000;
+const DWORD kPrivilegedMountProtocolVersion = 4;
+const DWORD kPrivilegedMountTimeoutMs = 5000;
+const wchar_t kPrivilegedMountPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV4";
+const wchar_t kPrivilegedMountHelperName[] = L"zt_mount_helper_v4.exe";
+const DWORD kEnsureWintunAdapterCommand = 6;
+const DWORD kStartWintunProxySessionCommand = 8;
+const DWORD kStopWintunProxySessionCommand = 9;
+const DWORD kResultSuccess = 1;
+const DWORD kResultAlreadyExists = 2;
+
+#pragma pack(push, 1)
+struct PrivilegedMountRequest
+{
+	uint32_t protocol_version = kPrivilegedMountProtocolVersion;
+	uint32_t command = 0;
+	uint64_t request_id = 0;
+	uint64_t network_id = 0;
+	uint64_t session_id = 0;
+	uint32_t if_index = 0;
+	uint8_t prefix_length = 0;
+	uint8_t reserved[3] = { 0, 0, 0 };
+	char value[260] = { 0 };
+};
+
+struct PrivilegedMountResponse
+{
+	uint32_t protocol_version = kPrivilegedMountProtocolVersion;
+	uint32_t result = 0;
+	uint32_t native_error = 0;
+	uint32_t service_error = 0;
+	uint32_t adapter_if_index = 0;
+	uint32_t reserved = 0;
+	uint64_t adapter_luid = 0;
+	uint64_t request_id = 0;
+	uint64_t session_id = 0;
+	char message[192] = { 0 };
+};
+#pragma pack(pop)
+
+static_assert(sizeof(PrivilegedMountRequest) == 300,"Unexpected privileged mount request size");
+static_assert(sizeof(PrivilegedMountResponse) == 240,"Unexpected privileged mount response size");
 
 std::string wideToUtf8(const std::wstring &value)
 {
@@ -152,6 +195,331 @@ MAC ipv4MulticastToMac(uint32_t ip)
 bool isIpv6Multicast(const BYTE *packet,DWORD packetSize)
 {
 	return packetSize >= 40 && packet[24] == 0xff;
+}
+
+bool isProcessElevated()
+{
+	HANDLE token = nullptr;
+	if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token)) {
+		return false;
+	}
+	TOKEN_ELEVATION elevation = {};
+	DWORD bytesReturned = 0;
+	const BOOL ok = GetTokenInformation(token,TokenElevation,&elevation,sizeof(elevation),&bytesReturned);
+	CloseHandle(token);
+	return ok && elevation.TokenIsElevated != 0;
+}
+
+bool parseTruthyEnvValue(const char *value)
+{
+	if (!value) {
+		return false;
+	}
+	std::string normalized(value);
+	std::transform(
+		normalized.begin(),
+		normalized.end(),
+		normalized.begin(),
+		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return normalized == "1" || normalized == "true" || normalized == "yes" ||
+		normalized == "on";
+}
+
+bool isPrivilegedWintunBootstrapEnabled()
+{
+	char *raw = nullptr;
+	size_t rawSize = 0;
+	if ((_dupenv_s(&raw,&rawSize,"ZT_WIN_ENABLE_PRIVILEGED_WINTUN_BOOTSTRAP") != 0) ||
+		raw == nullptr) {
+		return true;
+	}
+	const bool enabled = parseTruthyEnvValue(raw);
+	free(raw);
+	return enabled;
+}
+
+bool waitForPrivilegedMountPipe(DWORD timeoutMs,DWORD *errorCode)
+{
+	const DWORD started = GetTickCount();
+	DWORD lastError = ERROR_FILE_NOT_FOUND;
+	while ((GetTickCount() - started) < timeoutMs) {
+		if (WaitNamedPipeW(kPrivilegedMountPipeName,250)) {
+			if (errorCode) {
+				*errorCode = NO_ERROR;
+			}
+			return true;
+		}
+		lastError = GetLastError();
+		Sleep(100);
+	}
+	if (errorCode) {
+		*errorCode = lastError;
+	}
+	return false;
+}
+
+bool launchPrivilegedMountHelper(std::string &detail,DWORD *launchError)
+{
+	if (launchError) {
+		*launchError = NO_ERROR;
+	}
+	const std::wstring helperPath = joinPath(currentExecutableDirectory(),kPrivilegedMountHelperName);
+	if (helperPath.empty()) {
+		if (launchError) {
+			*launchError = ERROR_PATH_NOT_FOUND;
+		}
+		detail = "helper_path_missing";
+		return false;
+	}
+	const DWORD attributes = GetFileAttributesW(helperPath.c_str());
+	if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+		if (launchError) {
+			*launchError = ERROR_FILE_NOT_FOUND;
+		}
+		detail = "helper_missing path=" + wideToUtf8(helperPath);
+		return false;
+	}
+
+	SHELLEXECUTEINFOW info;
+	memset(&info,0,sizeof(info));
+	info.cbSize = sizeof(info);
+	info.fMask = SEE_MASK_NOCLOSEPROCESS;
+	info.hwnd = nullptr;
+	info.lpVerb = L"runas";
+	info.lpFile = helperPath.c_str();
+	info.nShow = SW_HIDE;
+	if (!ShellExecuteExW(&info)) {
+		const DWORD error = GetLastError();
+		if (launchError) {
+			*launchError = error;
+		}
+		std::ostringstream stream;
+		stream << "helper_launch_failed error=" << error << " path=" << wideToUtf8(helperPath);
+		detail = stream.str();
+		return false;
+	}
+	if (info.hProcess != nullptr) {
+		CloseHandle(info.hProcess);
+	}
+
+	DWORD readyError = NO_ERROR;
+	const bool ready = waitForPrivilegedMountPipe(kPrivilegedMountTimeoutMs,&readyError);
+	std::ostringstream stream;
+	stream << "helper_launched path=" << wideToUtf8(helperPath)
+		   << " pipe_ready=" << (ready ? "true" : "false")
+		   << " pipe_error=" << readyError;
+	detail = stream.str();
+	if (!ready && launchError) {
+		*launchError = readyError;
+	}
+	return ready;
+}
+
+bool sendPrivilegedMountRequest(const PrivilegedMountRequest &request,PrivilegedMountResponse &response,DWORD timeoutMs,DWORD *transportError)
+{
+	memset(&response,0,sizeof(response));
+	if (transportError) {
+		*transportError = ERROR_GEN_FAILURE;
+	}
+	if (!WaitNamedPipeW(kPrivilegedMountPipeName,timeoutMs)) {
+		if (transportError) {
+			*transportError = GetLastError();
+		}
+		return false;
+	}
+	HANDLE pipe = CreateFileW(
+		kPrivilegedMountPipeName,
+		GENERIC_READ | GENERIC_WRITE,
+		0,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+	if (pipe == INVALID_HANDLE_VALUE) {
+		if (transportError) {
+			*transportError = GetLastError();
+		}
+		return false;
+	}
+	DWORD mode = PIPE_READMODE_MESSAGE;
+	SetNamedPipeHandleState(pipe,&mode,nullptr,nullptr);
+	DWORD bytesWritten = 0;
+	const bool wrote =
+		WriteFile(pipe,&request,sizeof(request),&bytesWritten,nullptr) != 0 &&
+		bytesWritten == sizeof(request);
+	if (!wrote) {
+		if (transportError) {
+			*transportError = GetLastError();
+		}
+		CloseHandle(pipe);
+		return false;
+	}
+	DWORD bytesRead = 0;
+	const bool read =
+		ReadFile(pipe,&response,sizeof(response),&bytesRead,nullptr) != 0 &&
+		bytesRead == sizeof(response);
+	if (!read) {
+		if (transportError) {
+			*transportError = GetLastError();
+		}
+		CloseHandle(pipe);
+		return false;
+	}
+	CloseHandle(pipe);
+	if (transportError) {
+		*transportError = NO_ERROR;
+	}
+	return true;
+}
+
+bool ensureWintunAdapterViaPrivilegedService(uint64_t nwid,std::string &detail,DWORD *nativeError,DWORD *serviceError)
+{
+	if (nativeError) {
+		*nativeError = NO_ERROR;
+	}
+	if (serviceError) {
+		*serviceError = ERROR_GEN_FAILURE;
+	}
+	detail.clear();
+
+	PrivilegedMountRequest request = {};
+	request.command = kEnsureWintunAdapterCommand;
+	request.request_id = (static_cast<uint64_t>(GetTickCount64()) << 16) ^ 0x57544EULL;
+	request.network_id = nwid;
+
+	PrivilegedMountResponse response = {};
+	DWORD transportError = NO_ERROR;
+	if (!sendPrivilegedMountRequest(request,response,2000,&transportError)) {
+		DWORD launchError = NO_ERROR;
+		std::string launchDetail;
+		if (!launchPrivilegedMountHelper(launchDetail,&launchError) ||
+			!sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError)) {
+			std::ostringstream stream;
+			stream << "service_pipe_unavailable transport_error=" << transportError;
+			if (!launchDetail.empty()) {
+				stream << " " << launchDetail;
+			}
+			detail = stream.str();
+			if (serviceError) {
+				*serviceError = transportError != NO_ERROR ? transportError : launchError;
+			}
+			return false;
+		}
+		detail = launchDetail;
+	}
+
+	if (nativeError) {
+		*nativeError = response.native_error;
+	}
+	if (serviceError) {
+		*serviceError = response.service_error;
+	}
+	const std::string message(response.message,strnlen_s(response.message,sizeof(response.message)));
+	if (!detail.empty() && !message.empty()) {
+		detail.append(" ");
+	}
+	detail.append(message);
+	return response.result == kResultSuccess || response.result == kResultAlreadyExists;
+}
+
+bool startWintunProxySessionViaPrivilegedService(uint64_t nwid,uint64_t *sessionId,std::string &detail,DWORD *nativeError,DWORD *serviceError)
+{
+	if (sessionId) {
+		*sessionId = 0;
+	}
+	if (nativeError) {
+		*nativeError = NO_ERROR;
+	}
+	if (serviceError) {
+		*serviceError = ERROR_GEN_FAILURE;
+	}
+	detail.clear();
+
+	PrivilegedMountRequest request = {};
+	request.command = kStartWintunProxySessionCommand;
+	request.request_id = (static_cast<uint64_t>(GetTickCount64()) << 16) ^ 0x575053ULL;
+	request.network_id = nwid;
+
+	PrivilegedMountResponse response = {};
+	DWORD transportError = NO_ERROR;
+	if (!sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError)) {
+		DWORD launchError = NO_ERROR;
+		std::string launchDetail;
+		if (!launchPrivilegedMountHelper(launchDetail,&launchError) ||
+			!sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError)) {
+			std::ostringstream stream;
+			stream << "proxy_service_pipe_unavailable transport_error=" << transportError;
+			if (!launchDetail.empty()) {
+				stream << " " << launchDetail;
+			}
+			detail = stream.str();
+			if (serviceError) {
+				*serviceError = transportError != NO_ERROR ? transportError : launchError;
+			}
+			return false;
+		}
+		detail = launchDetail;
+	}
+
+	if (nativeError) {
+		*nativeError = response.native_error;
+	}
+	if (serviceError) {
+		*serviceError = response.service_error;
+	}
+	if (sessionId) {
+		*sessionId = response.session_id;
+	}
+	const std::string message(response.message,strnlen_s(response.message,sizeof(response.message)));
+	if (!detail.empty() && !message.empty()) {
+		detail.append(" ");
+	}
+	detail.append(message);
+	return response.result == kResultSuccess || response.result == kResultAlreadyExists;
+}
+
+bool stopWintunProxySessionViaPrivilegedService(uint64_t sessionId,std::string &detail,DWORD *nativeError,DWORD *serviceError)
+{
+	if (nativeError) {
+		*nativeError = NO_ERROR;
+	}
+	if (serviceError) {
+		*serviceError = ERROR_GEN_FAILURE;
+	}
+	detail.clear();
+	if (sessionId == 0) {
+		if (serviceError) {
+			*serviceError = ERROR_INVALID_PARAMETER;
+		}
+		detail = "invalid_proxy_session_id";
+		return false;
+	}
+
+	PrivilegedMountRequest request = {};
+	request.command = kStopWintunProxySessionCommand;
+	request.request_id = (static_cast<uint64_t>(GetTickCount64()) << 16) ^ 0x575054ULL;
+	request.network_id = _UI64_MAX;
+	request.session_id = sessionId;
+
+	PrivilegedMountResponse response = {};
+	DWORD transportError = NO_ERROR;
+	if (!sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError)) {
+		if (serviceError) {
+			*serviceError = transportError;
+		}
+		std::ostringstream stream;
+		stream << "proxy_stop_transport_failed error=" << transportError;
+		detail = stream.str();
+		return false;
+	}
+	if (nativeError) {
+		*nativeError = response.native_error;
+	}
+	if (serviceError) {
+		*serviceError = response.service_error;
+	}
+	detail.assign(response.message,strnlen_s(response.message,sizeof(response.message)));
+	return response.result == kResultSuccess || response.result == kResultAlreadyExists;
 }
 
 MAC ipv6MulticastToMac(const BYTE *packet)
@@ -303,13 +671,44 @@ void WintunEthernetTap::openOrCreateAdapter()
 	}
 
 	_adapter = _api.openAdapter(_adapterNameWide.c_str());
+	const DWORD openError = _adapter == nullptr ? GetLastError() : NO_ERROR;
 	if (_adapter == nullptr) {
 		const GUID requestedGuid = adapterGuid(_nwid);
 		_adapter = _api.createAdapter(_adapterNameWide.c_str(),defaultTunnelType().c_str(),&requestedGuid);
 	}
+	const DWORD createError = _adapter == nullptr ? GetLastError() : NO_ERROR;
+	std::string helperDetail;
+	DWORD helperNativeError = NO_ERROR;
+	DWORD helperServiceError = NO_ERROR;
+	bool helperAttempted = false;
+	bool helperSucceeded = false;
+	if (_adapter == nullptr &&
+		(openError == ERROR_ACCESS_DENIED || createError == ERROR_ACCESS_DENIED) &&
+		!isProcessElevated() &&
+		isPrivilegedWintunBootstrapEnabled()) {
+		helperAttempted = true;
+		helperSucceeded = ensureWintunAdapterViaPrivilegedService(
+			_nwid,helperDetail,&helperNativeError,&helperServiceError);
+		if (helperSucceeded) {
+			Sleep(250);
+			_adapter = _api.openAdapter(_adapterNameWide.c_str());
+		}
+	}
 	if (_adapter == nullptr) {
 		std::ostringstream stream;
-		stream << "WintunEthernetTap: open/create adapter failed error=" << GetLastError();
+		stream << "WintunEthernetTap: open/create adapter failed"
+			   << " open_error=" << openError
+			   << " create_error=" << createError
+			   << " final_error=" << GetLastError()
+			   << " helper_attempted=" << (helperAttempted ? "true" : "false")
+			   << " helper_succeeded=" << (helperSucceeded ? "true" : "false");
+		if (helperAttempted) {
+			stream << " helper_service_error=" << helperServiceError
+				   << " helper_native_error=" << helperNativeError;
+			if (!helperDetail.empty()) {
+				stream << " helper_detail=" << helperDetail;
+			}
+		}
 		throw std::runtime_error(stream.str());
 	}
 
@@ -344,10 +743,30 @@ void WintunEthernetTap::startSession()
 	_session = _api.startSession(_adapter,ringCapacity);
 	if (_session == nullptr) {
 		const DWORD error = GetLastError();
+		std::string helperDetail;
+		DWORD helperNativeError = NO_ERROR;
+		DWORD helperServiceError = NO_ERROR;
+		uint64_t helperSessionId = 0;
+		if (!isProcessElevated() &&
+			isPrivilegedWintunBootstrapEnabled() &&
+			startWintunProxySessionViaPrivilegedService(
+				_nwid,&helperSessionId,helperDetail,&helperNativeError,&helperServiceError)) {
+			_helperProxyEnabled = true;
+			_helperProxySessionId = helperSessionId;
+			_sessionStarted = true;
+			fprintf(stderr,"[ZT/WINTUN] helper_proxy_session_started name=%s sessionId=%llu detail=%s\n",
+				_adapterName.c_str(),
+				static_cast<unsigned long long>(_helperProxySessionId),
+				helperDetail.c_str());
+			return;
+		}
 		CloseHandle(_stopEvent);
 		_stopEvent = nullptr;
 		std::ostringstream stream;
-		stream << "WintunEthernetTap: WintunStartSession failed error=" << error;
+		stream << "WintunEthernetTap: WintunStartSession failed error=" << error
+			   << " helper_service_error=" << helperServiceError
+			   << " helper_native_error=" << helperNativeError
+			   << " helper_detail=" << helperDetail;
 		throw std::runtime_error(stream.str());
 	}
 
@@ -372,6 +791,21 @@ void WintunEthernetTap::startSession()
 void WintunEthernetTap::stopSession()
 {
 	_sessionStarted = false;
+	if (_helperProxyEnabled) {
+		std::string helperDetail;
+		DWORD helperNativeError = NO_ERROR;
+		DWORD helperServiceError = NO_ERROR;
+		stopWintunProxySessionViaPrivilegedService(
+			_helperProxySessionId,helperDetail,&helperNativeError,&helperServiceError);
+		fprintf(stderr,"[ZT/WINTUN] helper_proxy_session_stopped name=%s sessionId=%llu service_error=%lu native_error=%lu detail=%s\n",
+			_adapterName.c_str(),
+			static_cast<unsigned long long>(_helperProxySessionId),
+			static_cast<unsigned long>(helperServiceError),
+			static_cast<unsigned long>(helperNativeError),
+			helperDetail.c_str());
+		_helperProxyEnabled = false;
+		_helperProxySessionId = 0;
+	}
 	if (_stopEvent != nullptr) {
 		SetEvent(_stopEvent);
 	}
@@ -664,6 +1098,9 @@ bool WintunEthernetTap::sendPacketToWintun(const void *data,unsigned int len)
 		return false;
 	}
 	if ((!_sessionStarted)||(_session == nullptr)) {
+		if (_helperProxyEnabled) {
+			return true;
+		}
 		++_dropNoSessionPackets;
 		++_droppedPackets;
 		return false;

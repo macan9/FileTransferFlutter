@@ -749,7 +749,7 @@ std::filesystem::path StandaloneMountHelperPath() {
   if (current.empty()) {
     return {};
   }
-  const std::filesystem::path preferred = current / L"zt_mount_helper_v3.exe";
+  const std::filesystem::path preferred = current / L"zt_mount_helper_v4.exe";
   if (std::filesystem::exists(preferred)) {
     return preferred;
   }

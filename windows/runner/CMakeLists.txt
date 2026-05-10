@@ -37,7 +37,7 @@ add_executable(zt_mount_service
   "../native/zerotier/zerotier_windows_privileged_mount_ipc.cpp"
   "../native/zerotier/zt_mount_service_main.cpp"
 )
-set_target_properties(zt_mount_service PROPERTIES OUTPUT_NAME "zt_mount_helper_v3")
+set_target_properties(zt_mount_service PROPERTIES OUTPUT_NAME "zt_mount_helper_v4")
 
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
@@ -102,11 +102,24 @@ add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
   VERBATIM
 )
 
+add_custom_command(TARGET zt_runtime_smoke POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:zt-shared>
+    $<TARGET_FILE_DIR:zt_runtime_smoke>
+  VERBATIM
+)
+
 if(EXISTS "${WINTUN_DLL_PATH}")
   add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${WINTUN_DLL_PATH}"
       "$<TARGET_FILE_DIR:${BINARY_NAME}>/wintun.dll"
+    VERBATIM
+  )
+  add_custom_command(TARGET zt_runtime_smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${WINTUN_DLL_PATH}"
+      "$<TARGET_FILE_DIR:zt_runtime_smoke>/wintun.dll"
     VERBATIM
   )
 else()

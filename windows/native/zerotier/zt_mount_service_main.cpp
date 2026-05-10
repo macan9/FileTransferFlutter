@@ -42,9 +42,24 @@ using WintunCreateAdapterFn =
 using WintunOpenAdapterFn = WintunAdapterHandle(WINAPI*)(const wchar_t*);
 using WintunCloseAdapterFn = void(WINAPI*)(WintunAdapterHandle);
 using WintunGetAdapterLuidFn = void(WINAPI*)(WintunAdapterHandle, NET_LUID*);
+using WintunSessionHandle = void*;
+using WintunStartSessionFn = WintunSessionHandle(WINAPI*)(WintunAdapterHandle, DWORD);
+using WintunEndSessionFn = void(WINAPI*)(WintunSessionHandle);
 
 std::mutex g_wintun_adapter_mutex;
 std::map<uint64_t, WintunAdapterHandle> g_pinned_wintun_adapters;
+std::mutex g_wintun_proxy_mutex;
+
+struct WintunProxySession {
+  uint64_t session_id = 0;
+  uint64_t network_id = 0;
+  WintunAdapterHandle adapter = nullptr;
+  WintunSessionHandle session = nullptr;
+  NET_LUID luid = {};
+  NET_IFINDEX if_index = 0;
+};
+
+std::map<uint64_t, WintunProxySession> g_wintun_proxy_sessions;
 
 struct WintunApi {
   HMODULE module = nullptr;
@@ -53,6 +68,8 @@ struct WintunApi {
   WintunOpenAdapterFn open_adapter = nullptr;
   WintunCloseAdapterFn close_adapter = nullptr;
   WintunGetAdapterLuidFn get_adapter_luid = nullptr;
+  WintunStartSessionFn start_session = nullptr;
+  WintunEndSessionFn end_session = nullptr;
 
   ~WintunApi() {
     if (module != nullptr) {
@@ -560,8 +577,13 @@ WintunApi* GetSharedWintunApi(std::string* load_message) {
           GetProcAddress(module, "WintunCloseAdapter"));
       api.get_adapter_luid = reinterpret_cast<WintunGetAdapterLuidFn>(
           GetProcAddress(module, "WintunGetAdapterLUID"));
+      api.start_session = reinterpret_cast<WintunStartSessionFn>(
+          GetProcAddress(module, "WintunStartSession"));
+      api.end_session = reinterpret_cast<WintunEndSessionFn>(
+          GetProcAddress(module, "WintunEndSession"));
       if (api.create_adapter != nullptr && api.open_adapter != nullptr &&
-          api.close_adapter != nullptr && api.get_adapter_luid != nullptr) {
+          api.close_adapter != nullptr && api.get_adapter_luid != nullptr &&
+          api.start_session != nullptr && api.end_session != nullptr) {
         break;
       }
       FreeLibrary(module);
@@ -1540,6 +1562,147 @@ Response HandleEnsureWintunAdapterRequest(const Request& request) {
   return response;
 }
 
+Response HandleStartWintunProxySessionRequest(const Request& request) {
+  Response response = {};
+  response.protocol_version = ztwin::privileged_mount::kProtocolVersion;
+  response.request_id = request.request_id;
+
+  const uint64_t network_id = request.network_id;
+  if (network_id == 0) {
+    response.result = static_cast<uint32_t>(Result::kInvalidRequest);
+    response.service_error = ERROR_INVALID_PARAMETER;
+    SafeCopyMessage("invalid_wintun_proxy_start_request", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  Request ensure_request = {};
+  ensure_request.protocol_version = request.protocol_version;
+  ensure_request.command =
+      static_cast<uint32_t>(Command::kEnsureWintunAdapter);
+  ensure_request.request_id = request.request_id;
+  ensure_request.network_id = network_id;
+  Response ensure_response = HandleEnsureWintunAdapterRequest(ensure_request);
+  if (static_cast<Result>(ensure_response.result) != Result::kSuccess &&
+      static_cast<Result>(ensure_response.result) != Result::kAlreadyExists) {
+    return ensure_response;
+  }
+
+  std::string load_message;
+  WintunApi* api = GetSharedWintunApi(&load_message);
+  if (api == nullptr || api->start_session == nullptr || api->end_session == nullptr) {
+    response.result = static_cast<uint32_t>(Result::kUnavailable);
+    response.service_error = ERROR_MOD_NOT_FOUND;
+    SafeCopyMessage("wintun_session_exports_missing", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  WintunAdapterHandle adapter = nullptr;
+  {
+    std::scoped_lock lock(g_wintun_adapter_mutex);
+    const auto pinned_it = g_pinned_wintun_adapters.find(network_id);
+    if (pinned_it != g_pinned_wintun_adapters.end()) {
+      adapter = pinned_it->second;
+    }
+  }
+  if (adapter == nullptr) {
+    response.result = static_cast<uint32_t>(Result::kNotFound);
+    response.service_error = ERROR_NOT_FOUND;
+    SafeCopyMessage("wintun_proxy_adapter_not_found", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  const uint64_t session_id =
+      (static_cast<uint64_t>(GetTickCount64()) << 16) ^ network_id;
+  const DWORD ring_capacity = 0x400000;
+  WintunSessionHandle session = api->start_session(adapter, ring_capacity);
+  if (session == nullptr) {
+    response.result = static_cast<uint32_t>(Result::kFailed);
+    response.native_error = GetLastError();
+    SafeCopyMessage("wintun_proxy_start_session_failed", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  WintunProxySession proxy_session = {};
+  proxy_session.session_id = session_id;
+  proxy_session.network_id = network_id;
+  proxy_session.adapter = adapter;
+  proxy_session.session = session;
+  proxy_session.if_index = ensure_response.adapter_if_index;
+  proxy_session.luid.Value = ensure_response.adapter_luid;
+  {
+    std::scoped_lock lock(g_wintun_proxy_mutex);
+    const auto existing_it = g_wintun_proxy_sessions.find(session_id);
+    if (existing_it != g_wintun_proxy_sessions.end() &&
+        existing_it->second.session != nullptr &&
+        api->end_session != nullptr) {
+      api->end_session(existing_it->second.session);
+    }
+    g_wintun_proxy_sessions[session_id] = proxy_session;
+  }
+
+  response.result = static_cast<uint32_t>(Result::kSuccess);
+  response.session_id = session_id;
+  response.adapter_if_index = ensure_response.adapter_if_index;
+  response.adapter_luid = ensure_response.adapter_luid;
+  SafeCopyMessage("wintun_proxy_session_started", response.message,
+                  sizeof(response.message));
+  return response;
+}
+
+Response HandleStopWintunProxySessionRequest(const Request& request) {
+  Response response = {};
+  response.protocol_version = ztwin::privileged_mount::kProtocolVersion;
+  response.request_id = request.request_id;
+  response.session_id = request.session_id;
+
+  if (request.session_id == 0) {
+    response.result = static_cast<uint32_t>(Result::kInvalidRequest);
+    response.service_error = ERROR_INVALID_PARAMETER;
+    SafeCopyMessage("invalid_wintun_proxy_stop_request", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  std::string load_message;
+  WintunApi* api = GetSharedWintunApi(&load_message);
+  if (api == nullptr || api->end_session == nullptr) {
+    response.result = static_cast<uint32_t>(Result::kUnavailable);
+    response.service_error = ERROR_MOD_NOT_FOUND;
+    SafeCopyMessage("wintun_session_exports_missing", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  WintunProxySession proxy_session = {};
+  {
+    std::scoped_lock lock(g_wintun_proxy_mutex);
+    const auto session_it = g_wintun_proxy_sessions.find(request.session_id);
+    if (session_it == g_wintun_proxy_sessions.end()) {
+      response.result = static_cast<uint32_t>(Result::kNotFound);
+      response.service_error = ERROR_NOT_FOUND;
+      SafeCopyMessage("wintun_proxy_session_not_found", response.message,
+                      sizeof(response.message));
+      return response;
+    }
+    proxy_session = session_it->second;
+    g_wintun_proxy_sessions.erase(session_it);
+  }
+
+  if (proxy_session.session != nullptr) {
+    api->end_session(proxy_session.session);
+  }
+  response.result = static_cast<uint32_t>(Result::kSuccess);
+  response.adapter_if_index = proxy_session.if_index;
+  response.adapter_luid = proxy_session.luid.Value;
+  SafeCopyMessage("wintun_proxy_session_stopped", response.message,
+                  sizeof(response.message));
+  return response;
+}
+
 Response HandleRequest(const Request& request) {
   Response response = {};
   response.protocol_version = ztwin::privileged_mount::kProtocolVersion;
@@ -1563,6 +1726,12 @@ Response HandleRequest(const Request& request) {
     }
     case Command::kEnsureWintunAdapter: {
       return HandleEnsureWintunAdapterRequest(request);
+    }
+    case Command::kStartWintunProxySession: {
+      return HandleStartWintunProxySessionRequest(request);
+    }
+    case Command::kStopWintunProxySession: {
+      return HandleStopWintunProxySessionRequest(request);
     }
     case Command::kEnsureFirewallHostExe: {
       if (value.empty()) {

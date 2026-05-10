@@ -115,6 +115,9 @@ private:
 	void sendArpQuery(uint32_t sourceIp,uint32_t targetIp);
 	void maybeLogStats(bool force = false);
 	bool sendPacketToWintun(const void *data,unsigned int len);
+	bool startHelperProxySession();
+	void stopHelperProxySession();
+	bool helperProxyEnabled() const { return _helperProxyEnabled; }
 
 	static DWORD WINAPI receiveThreadEntry(LPVOID context);
 
@@ -171,6 +174,8 @@ private:
 	volatile unsigned long long _dropUnsupportedPackets = 0;
 	volatile unsigned long long _droppedPackets = 0;
 	uint64_t _lastStatsLogAt = 0;
+	uint64_t _helperProxySessionId = 0;
+	volatile bool _helperProxyEnabled = false;
 	volatile unsigned int _mtu = 0;
 	MAC _mac;
 	uint64_t _nwid = 0;

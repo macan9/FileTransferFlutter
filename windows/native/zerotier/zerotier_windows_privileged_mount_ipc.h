@@ -7,8 +7,8 @@
 
 namespace ztwin::privileged_mount {
 
-constexpr uint32_t kProtocolVersion = 3;
-constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV3";
+constexpr uint32_t kProtocolVersion = 4;
+constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV4";
 
 enum class Command : uint32_t {
   kInvalid = 0,
@@ -19,6 +19,8 @@ enum class Command : uint32_t {
   kRemoveRouteV4 = 5,
   kEnsureWintunAdapter = 6,
   kEnsureFirewallHostExe = 7,
+  kStartWintunProxySession = 8,
+  kStopWintunProxySession = 9,
 };
 
 enum class Result : uint32_t {
@@ -37,6 +39,7 @@ struct Request {
   uint32_t command = 0;
   uint64_t request_id = 0;
   uint64_t network_id = 0;
+  uint64_t session_id = 0;
   uint32_t if_index = 0;
   uint8_t prefix_length = 0;
   uint8_t reserved[3] = {0, 0, 0};
@@ -52,12 +55,13 @@ struct Response {
   uint32_t reserved = 0;
   uint64_t adapter_luid = 0;
   uint64_t request_id = 0;
+  uint64_t session_id = 0;
   char message[192] = {0};
 };
 #pragma pack(pop)
 
-static_assert(sizeof(Request) == 292, "Unexpected privileged mount request size");
-static_assert(sizeof(Response) == 232, "Unexpected privileged mount response size");
+static_assert(sizeof(Request) == 300, "Unexpected privileged mount request size");
+static_assert(sizeof(Response) == 240, "Unexpected privileged mount response size");
 
 bool SendRequest(const Request& request, Response* response, DWORD timeout_ms,
                  DWORD* transport_error);

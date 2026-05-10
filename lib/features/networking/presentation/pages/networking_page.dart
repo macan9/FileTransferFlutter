@@ -4290,13 +4290,14 @@ bool _isLocalNetworkMounted(
   if (!localState.isAuthorized) {
     return false;
   }
-  if (!matchedInterfaceUp) {
-    return false;
-  }
   if (localState.localInterfaceReady) {
     return true;
   }
-  if (localState.localMountState == 'ready' && localState.status == 'OK') {
+  if (localState.localMountState == 'ready' &&
+      localState.status == 'OK' &&
+      localState.systemIpBound &&
+      (!localState.routeExpected || localState.systemRouteBound) &&
+      localState.assignedAddresses.isNotEmpty) {
     return true;
   }
   if (localState.isConnected &&
@@ -4319,13 +4320,19 @@ bool _isActuallyMountedLocalNetwork(
   if (!localState.isAuthorized) {
     return false;
   }
-  if (!matchedInterfaceUp) {
-    return false;
+  if (localState.localInterfaceReady) {
+    return true;
   }
-  return localState.localInterfaceReady ||
-      (localState.localMountState == 'ready' &&
-          localState.status == 'OK' &&
-          localState.assignedAddresses.isNotEmpty);
+  if (localState.localMountState == 'ready' &&
+      localState.status == 'OK' &&
+      localState.systemIpBound &&
+      (!localState.routeExpected || localState.systemRouteBound) &&
+      localState.assignedAddresses.isNotEmpty) {
+    return true;
+  }
+  return matchedInterfaceUp &&
+      localState.status == 'OK' &&
+      localState.assignedAddresses.isNotEmpty;
 }
 
 List<String> _dedupeAddresses(List<String> addresses) {
