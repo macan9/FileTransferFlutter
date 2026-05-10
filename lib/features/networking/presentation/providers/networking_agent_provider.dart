@@ -1729,6 +1729,9 @@ class NetworkingAgentRuntimeController
       },
     );
     _applyRuntimeEventNetworkSnapshot(event);
+    if (Platform.isWindows) {
+      unawaited(_probeRuntimeNetworkStateForEvent(event));
+    }
     unawaited(_refreshRuntimeStatus());
     if (_shouldRefreshDashboard(event)) {
       unawaited(ref.read(networkingProvider.notifier).refresh());
@@ -1881,6 +1884,46 @@ class NetworkingAgentRuntimeController
         .map((Object? item) => item?.toString() ?? '')
         .where((String item) => item.trim().isNotEmpty)
         .toList(growable: false);
+  }
+
+  Future<void> _probeRuntimeNetworkStateForEvent(ZeroTierRuntimeEvent event) async {
+    final String networkId = event.networkId?.trim() ?? '';
+    if (networkId.isEmpty) {
+      return;
+    }
+    switch (event.type) {
+      case ZeroTierRuntimeEventType.networkOnline:
+      case ZeroTierRuntimeEventType.ipAssigned:
+      case ZeroTierRuntimeEventType.networkJoining:
+      case ZeroTierRuntimeEventType.networkWaitingAuthorization:
+        break;
+      default:
+        return;
+    }
+
+    try {
+      final ZeroTierNetworkState? probed =
+          await _zeroTierService.probeNetworkStateNow(networkId);
+      if (probed == null) {
+        return;
+      }
+      final List<ZeroTierNetworkState> networks =
+          List<ZeroTierNetworkState>.from(state.runtimeStatus.joinedNetworks);
+      final int existingIndex = networks.indexWhere(
+        (ZeroTierNetworkState item) =>
+            item.networkId.trim().toLowerCase() == networkId.toLowerCase(),
+      );
+      if (existingIndex >= 0) {
+        networks[existingIndex] = probed;
+      } else {
+        networks.add(probed);
+      }
+      state = state.copyWith(
+        runtimeStatus: state.runtimeStatus.copyWith(joinedNetworks: networks),
+      );
+    } catch (_) {
+      // Keep event-path updates best-effort so native runtime events are never blocked.
+    }
   }
 
   Future<AppConfig> _alignIdentityWithRuntimeNode(AppConfig config) async {

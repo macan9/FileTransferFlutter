@@ -659,6 +659,11 @@ class _FakeZeroTierPlatformApi implements ZeroTierPlatformApi {
   }
 
   @override
+  Future<ZeroTierNetworkState?> probeNetworkStateNow(String networkId) async {
+    return getNetworkDetail(networkId);
+  }
+
+  @override
   Future<void> applyFirewallRules({
     required String ruleScopeId,
     required String peerZeroTierIp,

@@ -240,6 +240,12 @@ class ProcessZeroTierLocalService implements ZeroTierLocalService {
   }
 
   @override
+  Future<ZeroTierNetworkState?> probeNetworkStateNow(String networkId) async {
+    final List<ZeroTierNetworkState> networks = await listNetworks();
+    return _findNetwork(networks, networkId);
+  }
+
+  @override
   Future<void> applyFirewallRules({
     required String ruleScopeId,
     required String peerZeroTierIp,

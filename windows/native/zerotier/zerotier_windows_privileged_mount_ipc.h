@@ -7,8 +7,8 @@
 
 namespace ztwin::privileged_mount {
 
-constexpr uint32_t kProtocolVersion = 4;
-constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV4";
+constexpr uint32_t kProtocolVersion = 6;
+constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV6";
 
 enum class Command : uint32_t {
   kInvalid = 0,
@@ -21,6 +21,8 @@ enum class Command : uint32_t {
   kEnsureFirewallHostExe = 7,
   kStartWintunProxySession = 8,
   kStopWintunProxySession = 9,
+  kWintunProxySendPacket = 10,
+  kWintunProxyReceivePacket = 11,
 };
 
 enum class Result : uint32_t {

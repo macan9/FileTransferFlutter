@@ -105,6 +105,24 @@ class MethodChannelZeroTierService implements ZeroTierPlatformApi {
   }
 
   @override
+  Future<ZeroTierNetworkState?> probeNetworkStateNow(String networkId) async {
+    final Object? result = await _invoke(
+      'probeNetworkStateNow',
+      <String, Object?>{
+        'networkId': networkId,
+      },
+    );
+    if (result == null) {
+      return null;
+    }
+    final Map<Object?, Object?> map = _asMap(result);
+    if (_readNullableString(map, 'error')?.trim().isNotEmpty == true) {
+      return null;
+    }
+    return _parseNetworkState(result);
+  }
+
+  @override
   Future<void> applyFirewallRules({
     required String ruleScopeId,
     required String peerZeroTierIp,

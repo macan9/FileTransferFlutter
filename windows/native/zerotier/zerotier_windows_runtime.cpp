@@ -668,7 +668,7 @@ std::filesystem::path StandaloneMountHelperPath() {
     return {};
   }
   const std::filesystem::path helper_dir = current.parent_path();
-  const std::filesystem::path preferred = helper_dir / L"zt_mount_helper_v4.exe";
+  const std::filesystem::path preferred = helper_dir / L"zt_mount_helper_v6.exe";
   if (std::filesystem::exists(preferred)) {
     return preferred;
   }

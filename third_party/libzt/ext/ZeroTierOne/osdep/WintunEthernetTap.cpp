@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
 
@@ -24,13 +25,15 @@ const size_t kMaxPendingIpv4Packets = 512;
 const uint64_t kPendingIpv4RetryInterval = 1000;
 const uint64_t kPendingIpv4MaxAge = 15000;
 const uint64_t kStatsLogInterval = 10000;
-const DWORD kPrivilegedMountProtocolVersion = 4;
+const DWORD kPrivilegedMountProtocolVersion = 6;
 const DWORD kPrivilegedMountTimeoutMs = 5000;
-const wchar_t kPrivilegedMountPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV4";
-const wchar_t kPrivilegedMountHelperName[] = L"zt_mount_helper_v4.exe";
+const wchar_t kPrivilegedMountPipeName[] = L"\\\\.\\pipe\\ZeroTierMountServicePipeV6";
+const wchar_t kPrivilegedMountHelperName[] = L"zt_mount_helper_v6.exe";
 const DWORD kEnsureWintunAdapterCommand = 6;
 const DWORD kStartWintunProxySessionCommand = 8;
 const DWORD kStopWintunProxySessionCommand = 9;
+const DWORD kWintunProxySendPacketCommand = 10;
+const DWORD kWintunProxyReceivePacketCommand = 11;
 const DWORD kResultSuccess = 1;
 const DWORD kResultAlreadyExists = 2;
 
@@ -372,6 +375,211 @@ bool sendPrivilegedMountRequest(const PrivilegedMountRequest &request,Privileged
 	return true;
 }
 
+bool createTempBinaryFilePath(const wchar_t *prefix,std::wstring *path,DWORD *errorCode)
+{
+	if (path == nullptr) {
+		if (errorCode) {
+			*errorCode = ERROR_INVALID_PARAMETER;
+		}
+		return false;
+	}
+	path->clear();
+	if (errorCode) {
+		*errorCode = ERROR_GEN_FAILURE;
+	}
+	wchar_t tempPath[MAX_PATH] = { 0 };
+	const DWORD tempPathLen = GetTempPathW(MAX_PATH,tempPath);
+	if (tempPathLen == 0 || tempPathLen >= MAX_PATH) {
+		if (errorCode) {
+			*errorCode = GetLastError();
+		}
+		return false;
+	}
+	wchar_t tempFile[MAX_PATH] = { 0 };
+	if (GetTempFileNameW(tempPath,prefix,0,tempFile) == 0) {
+		if (errorCode) {
+			*errorCode = GetLastError();
+		}
+		return false;
+	}
+	*path = tempFile;
+	if (errorCode) {
+		*errorCode = NO_ERROR;
+	}
+	return true;
+}
+
+bool writeBinaryFile(const std::wstring &path,const void *bytes,size_t size)
+{
+	if (path.empty() || bytes == nullptr || size == 0) {
+		return false;
+	}
+	HANDLE file = CreateFileW(
+		path.c_str(),
+		GENERIC_WRITE,
+		0,
+		nullptr,
+		CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	DWORD written = 0;
+	const BOOL ok = WriteFile(
+		file,
+		bytes,
+		static_cast<DWORD>(size),
+		&written,
+		nullptr);
+	CloseHandle(file);
+	return ok != FALSE && written == size;
+}
+
+bool readBinaryFile(const std::wstring &path,void *bytes,size_t size)
+{
+	if (path.empty() || bytes == nullptr || size == 0) {
+		return false;
+	}
+	HANDLE file = CreateFileW(
+		path.c_str(),
+		GENERIC_READ,
+		FILE_SHARE_READ,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	DWORD read = 0;
+	const BOOL ok = ReadFile(
+		file,
+		bytes,
+		static_cast<DWORD>(size),
+		&read,
+		nullptr);
+	CloseHandle(file);
+	return ok != FALSE && read == size;
+}
+
+bool runStandaloneMountHelperRequest(
+	const PrivilegedMountRequest &request,
+	PrivilegedMountResponse *response,
+	DWORD *launchErrorCode,
+	std::string &detail)
+{
+	if (launchErrorCode) {
+		*launchErrorCode = ERROR_GEN_FAILURE;
+	}
+	detail.clear();
+	if (response == nullptr) {
+		if (launchErrorCode) {
+			*launchErrorCode = ERROR_INVALID_PARAMETER;
+		}
+		return false;
+	}
+	if (isProcessElevated()) {
+		if (launchErrorCode) {
+			*launchErrorCode = ERROR_SERVICE_DISABLED;
+		}
+		return false;
+	}
+	const std::wstring helperPath = joinPath(currentExecutableDirectory(),kPrivilegedMountHelperName);
+	const DWORD attributes = GetFileAttributesW(helperPath.c_str());
+	if (helperPath.empty() || attributes == INVALID_FILE_ATTRIBUTES ||
+		(attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+		if (launchErrorCode) {
+			*launchErrorCode = ERROR_FILE_NOT_FOUND;
+		}
+		detail = "helper_path_missing";
+		return false;
+	}
+
+	std::wstring requestPath;
+	DWORD requestPathError = NO_ERROR;
+	if (!createTempBinaryFilePath(L"zwr",&requestPath,&requestPathError)) {
+		if (launchErrorCode) {
+			*launchErrorCode = requestPathError;
+		}
+		return false;
+	}
+	std::wstring responsePath;
+	DWORD responsePathError = NO_ERROR;
+	if (!createTempBinaryFilePath(L"zws",&responsePath,&responsePathError)) {
+		DeleteFileW(requestPath.c_str());
+		if (launchErrorCode) {
+			*launchErrorCode = responsePathError;
+		}
+		return false;
+	}
+	if (!writeBinaryFile(requestPath,&request,sizeof(request))) {
+		DeleteFileW(requestPath.c_str());
+		DeleteFileW(responsePath.c_str());
+		if (launchErrorCode) {
+			*launchErrorCode = ERROR_WRITE_FAULT;
+		}
+		return false;
+	}
+
+	const std::wstring parameters =
+		L"--single-request --request-file \"" + requestPath +
+		L"\" --response-file \"" + responsePath + L"\"";
+	const std::wstring helperDir = currentExecutableDirectory();
+	SHELLEXECUTEINFOW info = {};
+	info.cbSize = sizeof(info);
+	info.fMask = SEE_MASK_NOCLOSEPROCESS;
+	info.hwnd = nullptr;
+	info.lpVerb = L"runas";
+	info.lpFile = helperPath.c_str();
+	info.lpParameters = parameters.c_str();
+	info.lpDirectory = helperDir.c_str();
+	info.nShow = SW_HIDE;
+	if (!ShellExecuteExW(&info)) {
+		const DWORD launchError = GetLastError();
+		DeleteFileW(requestPath.c_str());
+		DeleteFileW(responsePath.c_str());
+		if (launchErrorCode) {
+			*launchErrorCode = launchError;
+		}
+		std::ostringstream stream;
+		stream << "helper_launch_failed error=" << launchError;
+		detail = stream.str();
+		return false;
+	}
+
+	DWORD processExitCode = ERROR_GEN_FAILURE;
+	const DWORD waitResult = WaitForSingleObject(info.hProcess,30000);
+	if (waitResult == WAIT_OBJECT_0) {
+		GetExitCodeProcess(info.hProcess,&processExitCode);
+	}
+	else if (waitResult == WAIT_TIMEOUT) {
+		processExitCode = WAIT_TIMEOUT;
+		TerminateProcess(info.hProcess,WAIT_TIMEOUT);
+	}
+	else {
+		processExitCode = GetLastError();
+	}
+	CloseHandle(info.hProcess);
+
+	bool responseLoaded = false;
+	if (waitResult == WAIT_OBJECT_0 && processExitCode == 0) {
+		responseLoaded = readBinaryFile(responsePath,response,sizeof(*response));
+	}
+	DeleteFileW(requestPath.c_str());
+	DeleteFileW(responsePath.c_str());
+	if (launchErrorCode) {
+		*launchErrorCode = processExitCode;
+	}
+	std::ostringstream stream;
+	stream << "helper=" << wideToUtf8(helperPath)
+		   << " wait_result=" << waitResult
+		   << " exit_code=" << processExitCode
+		   << " response_loaded=" << (responseLoaded ? "true" : "false");
+	detail = stream.str();
+	return responseLoaded;
+}
+
 bool ensureWintunAdapterViaPrivilegedService(uint64_t nwid,std::string &detail,DWORD *nativeError,DWORD *serviceError)
 {
 	if (nativeError) {
@@ -388,9 +596,23 @@ bool ensureWintunAdapterViaPrivilegedService(uint64_t nwid,std::string &detail,D
 	request.network_id = nwid;
 
 	PrivilegedMountResponse response = {};
+	DWORD launchError = NO_ERROR;
+	if (runStandaloneMountHelperRequest(request,&response,&launchError,detail)) {
+		if (nativeError) {
+			*nativeError = response.native_error;
+		}
+		if (serviceError) {
+			*serviceError = response.service_error;
+		}
+		const std::string message(response.message,strnlen_s(response.message,sizeof(response.message)));
+		if (!detail.empty() && !message.empty()) {
+			detail.append(" ");
+		}
+		detail.append(message);
+		return response.result == kResultSuccess || response.result == kResultAlreadyExists;
+	}
 	DWORD transportError = NO_ERROR;
 	if (!sendPrivilegedMountRequest(request,response,2000,&transportError)) {
-		DWORD launchError = NO_ERROR;
 		std::string launchDetail;
 		if (!launchPrivilegedMountHelper(launchDetail,&launchError) ||
 			!sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError)) {
@@ -443,8 +665,8 @@ bool startWintunProxySessionViaPrivilegedService(uint64_t nwid,uint64_t *session
 	PrivilegedMountResponse response = {};
 	DWORD transportError = NO_ERROR;
 	if (!sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError)) {
-		DWORD launchError = NO_ERROR;
 		std::string launchDetail;
+		DWORD launchError = NO_ERROR;
 		if (!launchPrivilegedMountHelper(launchDetail,&launchError) ||
 			!sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError)) {
 			std::ostringstream stream;
@@ -502,6 +724,21 @@ bool stopWintunProxySessionViaPrivilegedService(uint64_t sessionId,std::string &
 	request.session_id = sessionId;
 
 	PrivilegedMountResponse response = {};
+	DWORD launchError = NO_ERROR;
+	if (runStandaloneMountHelperRequest(request,&response,&launchError,detail)) {
+		if (nativeError) {
+			*nativeError = response.native_error;
+		}
+		if (serviceError) {
+			*serviceError = response.service_error;
+		}
+		const std::string message(response.message,strnlen_s(response.message,sizeof(response.message)));
+		if (!detail.empty() && !message.empty()) {
+			detail.append(" ");
+		}
+		detail.append(message);
+		return response.result == kResultSuccess || response.result == kResultAlreadyExists;
+	}
 	DWORD transportError = NO_ERROR;
 	if (!sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError)) {
 		if (serviceError) {
@@ -520,6 +757,172 @@ bool stopWintunProxySessionViaPrivilegedService(uint64_t sessionId,std::string &
 	}
 	detail.assign(response.message,strnlen_s(response.message,sizeof(response.message)));
 	return response.result == kResultSuccess || response.result == kResultAlreadyExists;
+}
+
+bool sendWintunProxyPacketViaPrivilegedService(uint64_t sessionId,const void *data,unsigned int len,std::string &detail,DWORD *nativeError,DWORD *serviceError)
+{
+	if (nativeError) {
+		*nativeError = NO_ERROR;
+	}
+	if (serviceError) {
+		*serviceError = ERROR_GEN_FAILURE;
+	}
+	detail.clear();
+	if (sessionId == 0 || data == nullptr || len == 0) {
+		if (serviceError) {
+			*serviceError = ERROR_INVALID_PARAMETER;
+		}
+		detail = "invalid_proxy_send_args";
+		return false;
+	}
+
+	std::wstring packetPath;
+	DWORD packetPathError = NO_ERROR;
+	if (!createTempBinaryFilePath(L"zwp",&packetPath,&packetPathError)) {
+		if (serviceError) {
+			*serviceError = packetPathError;
+		}
+		return false;
+	}
+	if (!writeBinaryFile(packetPath,data,len)) {
+		DeleteFileW(packetPath.c_str());
+		if (serviceError) {
+			*serviceError = ERROR_WRITE_FAULT;
+		}
+		detail = "proxy_send_packet_write_failed";
+		return false;
+	}
+
+	PrivilegedMountRequest request = {};
+	request.command = kWintunProxySendPacketCommand;
+	request.request_id = (static_cast<uint64_t>(GetTickCount64()) << 16) ^ 0x575055ULL;
+	request.network_id = _UI64_MAX;
+	request.session_id = sessionId;
+	const std::string packetPathUtf8 = wideToUtf8(packetPath);
+	strncpy_s(request.value,sizeof(request.value),packetPathUtf8.c_str(),_TRUNCATE);
+
+	PrivilegedMountResponse response = {};
+	DWORD transportError = NO_ERROR;
+	const bool ok = sendPrivilegedMountRequest(request,response,kPrivilegedMountTimeoutMs,&transportError);
+	DeleteFileW(packetPath.c_str());
+	if (!ok) {
+		if (serviceError) {
+			*serviceError = transportError;
+		}
+		std::ostringstream stream;
+		stream << "proxy_send_transport_failed error=" << transportError;
+		detail = stream.str();
+		return false;
+	}
+	if (nativeError) {
+		*nativeError = response.native_error;
+	}
+	if (serviceError) {
+		*serviceError = response.service_error;
+	}
+	detail.assign(response.message,strnlen_s(response.message,sizeof(response.message)));
+	return response.result == kResultSuccess || response.result == kResultAlreadyExists;
+}
+
+bool receiveWintunProxyPacketViaPrivilegedService(uint64_t sessionId,std::vector<unsigned char> &packet,std::string &detail,DWORD *nativeError,DWORD *serviceError,bool *empty)
+{
+	packet.clear();
+	if (nativeError) {
+		*nativeError = NO_ERROR;
+	}
+	if (serviceError) {
+		*serviceError = ERROR_GEN_FAILURE;
+	}
+	if (empty) {
+		*empty = false;
+	}
+	detail.clear();
+	if (sessionId == 0) {
+		if (serviceError) {
+			*serviceError = ERROR_INVALID_PARAMETER;
+		}
+		detail = "invalid_proxy_receive_args";
+		return false;
+	}
+
+	std::wstring packetPath;
+	DWORD packetPathError = NO_ERROR;
+	if (!createTempBinaryFilePath(L"zwr",&packetPath,&packetPathError)) {
+		if (serviceError) {
+			*serviceError = packetPathError;
+		}
+		return false;
+	}
+
+	PrivilegedMountRequest request = {};
+	request.command = kWintunProxyReceivePacketCommand;
+	request.request_id = (static_cast<uint64_t>(GetTickCount64()) << 16) ^ 0x575056ULL;
+	request.network_id = _UI64_MAX;
+	request.session_id = sessionId;
+	const std::string packetPathUtf8 = wideToUtf8(packetPath);
+	strncpy_s(request.value,sizeof(request.value),packetPathUtf8.c_str(),_TRUNCATE);
+
+	PrivilegedMountResponse response = {};
+	DWORD transportError = NO_ERROR;
+	const bool ok = sendPrivilegedMountRequest(request,response,250,&transportError);
+	if (!ok) {
+		DeleteFileW(packetPath.c_str());
+		if (serviceError) {
+			*serviceError = transportError;
+		}
+		std::ostringstream stream;
+		stream << "proxy_receive_transport_failed error=" << transportError;
+		detail = stream.str();
+		return false;
+	}
+	if (nativeError) {
+		*nativeError = response.native_error;
+	}
+	if (serviceError) {
+		*serviceError = response.service_error;
+	}
+	detail.assign(response.message,strnlen_s(response.message,sizeof(response.message)));
+	if (response.result != kResultSuccess && response.result != kResultAlreadyExists) {
+		if (empty && response.native_error == ERROR_NO_MORE_ITEMS) {
+			*empty = true;
+		}
+		DeleteFileW(packetPath.c_str());
+		return false;
+	}
+
+	LARGE_INTEGER fileSize = {};
+	HANDLE file = CreateFileW(packetPath.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		DeleteFileW(packetPath.c_str());
+		if (serviceError) {
+			*serviceError = ERROR_READ_FAULT;
+		}
+		detail = "proxy_receive_packet_open_failed";
+		return false;
+	}
+	if (!GetFileSizeEx(file,&fileSize) || fileSize.QuadPart <= 0 || fileSize.QuadPart > static_cast<LONGLONG>(ZT_MAX_MTU)) {
+		CloseHandle(file);
+		DeleteFileW(packetPath.c_str());
+		if (serviceError) {
+			*serviceError = ERROR_INVALID_DATA;
+		}
+		detail = "proxy_receive_packet_size_invalid";
+		return false;
+	}
+	packet.resize(static_cast<size_t>(fileSize.QuadPart));
+	DWORD bytesRead = 0;
+	const BOOL readOk = ReadFile(file,&packet[0],static_cast<DWORD>(packet.size()),&bytesRead,nullptr);
+	CloseHandle(file);
+	DeleteFileW(packetPath.c_str());
+	if (!readOk || bytesRead != packet.size()) {
+		packet.clear();
+		if (serviceError) {
+			*serviceError = ERROR_READ_FAULT;
+		}
+		detail = "proxy_receive_packet_read_failed";
+		return false;
+	}
+	return true;
 }
 
 MAC ipv6MulticastToMac(const BYTE *packet)
@@ -695,6 +1098,15 @@ void WintunEthernetTap::openOrCreateAdapter()
 		}
 	}
 	if (_adapter == nullptr) {
+		if (helperSucceeded) {
+			_ifIndex = 0;
+			memset(&_adapterLuid,0,sizeof(_adapterLuid));
+			_initialized = true;
+			fprintf(stderr,"[ZT/WINTUN] adapter_proxy_ready name=%s helper_detail=%s\n",
+				_adapterName.c_str(),
+				helperDetail.c_str());
+			return;
+		}
 		std::ostringstream stream;
 		stream << "WintunEthernetTap: open/create adapter failed"
 			   << " open_error=" << openError
@@ -740,7 +1152,9 @@ void WintunEthernetTap::startSession()
 	}
 
 	const DWORD ringCapacity = 0x400000;
-	_session = _api.startSession(_adapter,ringCapacity);
+	if (_adapter != nullptr) {
+		_session = _api.startSession(_adapter,ringCapacity);
+	}
 	if (_session == nullptr) {
 		const DWORD error = GetLastError();
 		std::string helperDetail;
@@ -863,6 +1277,39 @@ DWORD WINAPI WintunEthernetTap::receiveThreadEntry(LPVOID context)
 
 void WintunEthernetTap::receiveLoop()
 {
+	if (_helperProxyEnabled) {
+		while (_sessionStarted && _helperProxyEnabled) {
+			std::vector<unsigned char> packet;
+			std::string detail;
+			DWORD nativeError = NO_ERROR;
+			DWORD serviceError = NO_ERROR;
+			bool empty = false;
+			if (receiveWintunProxyPacketViaPrivilegedService(
+				_helperProxySessionId,packet,detail,&nativeError,&serviceError,&empty)) {
+				++_rxPackets;
+				_rxBytes += packet.size();
+				handleInboundIpPacket(&packet[0],static_cast<DWORD>(packet.size()));
+				processPendingIpv4Resolutions();
+				maybeLogStats(false);
+				continue;
+			}
+			if (empty) {
+				processPendingIpv4Resolutions();
+				maybeLogStats(false);
+				if (_stopEvent != nullptr && WaitForSingleObject(_stopEvent,250) == WAIT_OBJECT_0) {
+					break;
+				}
+				continue;
+			}
+			fprintf(stderr,"[ZT/WINTUN] helper_proxy_receive_failed sessionId=%llu service_error=%lu native_error=%lu detail=%s\n",
+				static_cast<unsigned long long>(_helperProxySessionId),
+				static_cast<unsigned long>(serviceError),
+				static_cast<unsigned long>(nativeError),
+				detail.c_str());
+			Sleep(100);
+		}
+		return;
+	}
 	HANDLE readWaitEvent = _api.getReadWaitEvent(_session);
 	HANDLE waitHandles[2] = { _stopEvent, readWaitEvent };
 	while ((_sessionStarted)&&(_session != nullptr)) {
@@ -1099,6 +1546,22 @@ bool WintunEthernetTap::sendPacketToWintun(const void *data,unsigned int len)
 	}
 	if ((!_sessionStarted)||(_session == nullptr)) {
 		if (_helperProxyEnabled) {
+			std::string detail;
+			DWORD nativeError = NO_ERROR;
+			DWORD serviceError = NO_ERROR;
+			if (!sendWintunProxyPacketViaPrivilegedService(
+				_helperProxySessionId,data,len,detail,&nativeError,&serviceError)) {
+				++_dropNoSessionPackets;
+				++_droppedPackets;
+				fprintf(stderr,"[ZT/WINTUN] helper_proxy_send_failed sessionId=%llu service_error=%lu native_error=%lu detail=%s\n",
+					static_cast<unsigned long long>(_helperProxySessionId),
+					static_cast<unsigned long>(serviceError),
+					static_cast<unsigned long>(nativeError),
+					detail.c_str());
+				return false;
+			}
+			++_txPackets;
+			_txBytes += len;
 			return true;
 		}
 		++_dropNoSessionPackets;

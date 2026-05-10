@@ -45,6 +45,11 @@ using WintunGetAdapterLuidFn = void(WINAPI*)(WintunAdapterHandle, NET_LUID*);
 using WintunSessionHandle = void*;
 using WintunStartSessionFn = WintunSessionHandle(WINAPI*)(WintunAdapterHandle, DWORD);
 using WintunEndSessionFn = void(WINAPI*)(WintunSessionHandle);
+using WintunGetReadWaitEventFn = HANDLE(WINAPI*)(WintunSessionHandle);
+using WintunReceivePacketFn = BYTE*(WINAPI*)(WintunSessionHandle, DWORD*);
+using WintunReleaseReceivePacketFn = void(WINAPI*)(WintunSessionHandle, const BYTE*);
+using WintunAllocateSendPacketFn = BYTE*(WINAPI*)(WintunSessionHandle, DWORD);
+using WintunSendPacketFn = void(WINAPI*)(WintunSessionHandle, const BYTE*);
 
 std::mutex g_wintun_adapter_mutex;
 std::map<uint64_t, WintunAdapterHandle> g_pinned_wintun_adapters;
@@ -70,6 +75,11 @@ struct WintunApi {
   WintunGetAdapterLuidFn get_adapter_luid = nullptr;
   WintunStartSessionFn start_session = nullptr;
   WintunEndSessionFn end_session = nullptr;
+  WintunGetReadWaitEventFn get_read_wait_event = nullptr;
+  WintunReceivePacketFn receive_packet = nullptr;
+  WintunReleaseReceivePacketFn release_receive_packet = nullptr;
+  WintunAllocateSendPacketFn allocate_send_packet = nullptr;
+  WintunSendPacketFn send_packet = nullptr;
 
   ~WintunApi() {
     if (module != nullptr) {
@@ -78,6 +88,9 @@ struct WintunApi {
     }
   }
 };
+
+bool ReadBinaryFile(const std::wstring& path, std::vector<uint8_t>* bytes);
+bool WriteBinaryFile(const std::wstring& path, const void* bytes, size_t size);
 
 void ReleasePinnedWintunAdapters(WintunApi* api) {
   if (api == nullptr || api->close_adapter == nullptr) {
@@ -581,9 +594,23 @@ WintunApi* GetSharedWintunApi(std::string* load_message) {
           GetProcAddress(module, "WintunStartSession"));
       api.end_session = reinterpret_cast<WintunEndSessionFn>(
           GetProcAddress(module, "WintunEndSession"));
+      api.get_read_wait_event = reinterpret_cast<WintunGetReadWaitEventFn>(
+          GetProcAddress(module, "WintunGetReadWaitEvent"));
+      api.receive_packet = reinterpret_cast<WintunReceivePacketFn>(
+          GetProcAddress(module, "WintunReceivePacket"));
+      api.release_receive_packet =
+          reinterpret_cast<WintunReleaseReceivePacketFn>(
+              GetProcAddress(module, "WintunReleaseReceivePacket"));
+      api.allocate_send_packet = reinterpret_cast<WintunAllocateSendPacketFn>(
+          GetProcAddress(module, "WintunAllocateSendPacket"));
+      api.send_packet = reinterpret_cast<WintunSendPacketFn>(
+          GetProcAddress(module, "WintunSendPacket"));
       if (api.create_adapter != nullptr && api.open_adapter != nullptr &&
           api.close_adapter != nullptr && api.get_adapter_luid != nullptr &&
-          api.start_session != nullptr && api.end_session != nullptr) {
+          api.start_session != nullptr && api.end_session != nullptr &&
+          api.get_read_wait_event != nullptr && api.receive_packet != nullptr &&
+          api.release_receive_packet != nullptr &&
+          api.allocate_send_packet != nullptr && api.send_packet != nullptr) {
         break;
       }
       FreeLibrary(module);
@@ -1703,6 +1730,158 @@ Response HandleStopWintunProxySessionRequest(const Request& request) {
   return response;
 }
 
+Response HandleWintunProxySendPacketRequest(const Request& request) {
+  Response response = {};
+  response.protocol_version = ztwin::privileged_mount::kProtocolVersion;
+  response.request_id = request.request_id;
+  response.session_id = request.session_id;
+
+  if (request.session_id == 0 || request.value[0] == '\0') {
+    response.result = static_cast<uint32_t>(Result::kInvalidRequest);
+    response.service_error = ERROR_INVALID_PARAMETER;
+    SafeCopyMessage("invalid_wintun_proxy_send_request", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  std::string load_message;
+  WintunApi* api = GetSharedWintunApi(&load_message);
+  if (api == nullptr || api->allocate_send_packet == nullptr ||
+      api->send_packet == nullptr) {
+    response.result = static_cast<uint32_t>(Result::kUnavailable);
+    response.service_error = ERROR_MOD_NOT_FOUND;
+    SafeCopyMessage("wintun_send_exports_missing", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  WintunProxySession proxy_session = {};
+  {
+    std::scoped_lock lock(g_wintun_proxy_mutex);
+    const auto session_it = g_wintun_proxy_sessions.find(request.session_id);
+    if (session_it == g_wintun_proxy_sessions.end() ||
+        session_it->second.session == nullptr) {
+      response.result = static_cast<uint32_t>(Result::kNotFound);
+      response.service_error = ERROR_NOT_FOUND;
+      SafeCopyMessage("wintun_proxy_session_not_found", response.message,
+                      sizeof(response.message));
+      return response;
+    }
+    proxy_session = session_it->second;
+  }
+
+  const std::wstring packet_path = Utf8ToWide(
+      std::string(request.value, strnlen_s(request.value, sizeof(request.value))));
+  std::vector<uint8_t> packet_bytes;
+  if (!ReadBinaryFile(packet_path, &packet_bytes) || packet_bytes.empty()) {
+    response.result = static_cast<uint32_t>(Result::kFailed);
+    response.service_error = ERROR_READ_FAULT;
+    SafeCopyMessage("wintun_proxy_send_packet_read_failed", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  BYTE* packet = api->allocate_send_packet(
+      proxy_session.session, static_cast<DWORD>(packet_bytes.size()));
+  if (packet == nullptr) {
+    response.result = static_cast<uint32_t>(Result::kFailed);
+    response.native_error = GetLastError();
+    SafeCopyMessage("wintun_proxy_send_packet_alloc_failed", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+  memcpy(packet, packet_bytes.data(), packet_bytes.size());
+  api->send_packet(proxy_session.session, packet);
+
+  response.result = static_cast<uint32_t>(Result::kSuccess);
+  response.adapter_if_index = proxy_session.if_index;
+  response.adapter_luid = proxy_session.luid.Value;
+  SafeCopyMessage("wintun_proxy_send_packet_ok", response.message,
+                  sizeof(response.message));
+  return response;
+}
+
+Response HandleWintunProxyReceivePacketRequest(const Request& request) {
+  Response response = {};
+  response.protocol_version = ztwin::privileged_mount::kProtocolVersion;
+  response.request_id = request.request_id;
+  response.session_id = request.session_id;
+
+  if (request.session_id == 0 || request.value[0] == '\0') {
+    response.result = static_cast<uint32_t>(Result::kInvalidRequest);
+    response.service_error = ERROR_INVALID_PARAMETER;
+    SafeCopyMessage("invalid_wintun_proxy_receive_request", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  std::string load_message;
+  WintunApi* api = GetSharedWintunApi(&load_message);
+  if (api == nullptr || api->receive_packet == nullptr ||
+      api->release_receive_packet == nullptr ||
+      api->get_read_wait_event == nullptr) {
+    response.result = static_cast<uint32_t>(Result::kUnavailable);
+    response.service_error = ERROR_MOD_NOT_FOUND;
+    SafeCopyMessage("wintun_receive_exports_missing", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  WintunProxySession proxy_session = {};
+  {
+    std::scoped_lock lock(g_wintun_proxy_mutex);
+    const auto session_it = g_wintun_proxy_sessions.find(request.session_id);
+    if (session_it == g_wintun_proxy_sessions.end() ||
+        session_it->second.session == nullptr) {
+      response.result = static_cast<uint32_t>(Result::kNotFound);
+      response.service_error = ERROR_NOT_FOUND;
+      SafeCopyMessage("wintun_proxy_session_not_found", response.message,
+                      sizeof(response.message));
+      return response;
+    }
+    proxy_session = session_it->second;
+  }
+
+  const std::wstring packet_path = Utf8ToWide(
+      std::string(request.value, strnlen_s(request.value, sizeof(request.value))));
+  DWORD packet_size = 0;
+  BYTE* packet = api->receive_packet(proxy_session.session, &packet_size);
+  if (packet == nullptr) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_NO_MORE_ITEMS) {
+      response.result = static_cast<uint32_t>(Result::kNotFound);
+      response.native_error = error;
+      SafeCopyMessage("wintun_proxy_receive_empty", response.message,
+                      sizeof(response.message));
+      return response;
+    }
+    response.result = static_cast<uint32_t>(Result::kFailed);
+    response.native_error = error;
+    SafeCopyMessage("wintun_proxy_receive_packet_failed", response.message,
+                    sizeof(response.message));
+    return response;
+  }
+
+  const bool wrote =
+      WriteBinaryFile(packet_path, packet, static_cast<size_t>(packet_size));
+  api->release_receive_packet(proxy_session.session, packet);
+  if (!wrote) {
+    response.result = static_cast<uint32_t>(Result::kFailed);
+    response.service_error = ERROR_WRITE_FAULT;
+    SafeCopyMessage("wintun_proxy_receive_packet_write_failed",
+                    response.message, sizeof(response.message));
+    return response;
+  }
+
+  response.result = static_cast<uint32_t>(Result::kSuccess);
+  response.native_error = packet_size;
+  response.adapter_if_index = proxy_session.if_index;
+  response.adapter_luid = proxy_session.luid.Value;
+  SafeCopyMessage("wintun_proxy_receive_packet_ok", response.message,
+                  sizeof(response.message));
+  return response;
+}
+
 Response HandleRequest(const Request& request) {
   Response response = {};
   response.protocol_version = ztwin::privileged_mount::kProtocolVersion;
@@ -1732,6 +1911,12 @@ Response HandleRequest(const Request& request) {
     }
     case Command::kStopWintunProxySession: {
       return HandleStopWintunProxySessionRequest(request);
+    }
+    case Command::kWintunProxySendPacket: {
+      return HandleWintunProxySendPacketRequest(request);
+    }
+    case Command::kWintunProxyReceivePacket: {
+      return HandleWintunProxyReceivePacketRequest(request);
     }
     case Command::kEnsureFirewallHostExe: {
       if (value.empty()) {
@@ -2109,6 +2294,54 @@ bool WriteResponseFile(const std::wstring& path, const Response& response) {
     return false;
   }
   output.write(reinterpret_cast<const char*>(&response), sizeof(response));
+  output.close();
+  return output.good();
+}
+
+bool ReadBinaryFile(const std::wstring& path, std::vector<uint8_t>* bytes) {
+  if (bytes == nullptr || path.empty()) {
+    return false;
+  }
+  bytes->clear();
+  std::ifstream input(std::filesystem::path(path), std::ios::binary);
+  if (!input.is_open()) {
+    return false;
+  }
+  input.seekg(0, std::ios::end);
+  const std::streamoff size = input.tellg();
+  if (size < 0) {
+    return false;
+  }
+  input.seekg(0, std::ios::beg);
+  bytes->resize(static_cast<size_t>(size));
+  if (!bytes->empty()) {
+    input.read(reinterpret_cast<char*>(bytes->data()),
+               static_cast<std::streamsize>(bytes->size()));
+    if (!input.good() && !input.eof()) {
+      bytes->clear();
+      return false;
+    }
+    if (input.gcount() != static_cast<std::streamsize>(bytes->size())) {
+      bytes->clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+bool WriteBinaryFile(const std::wstring& path, const void* bytes, size_t size) {
+  if (path.empty() || bytes == nullptr) {
+    return false;
+  }
+  std::ofstream output(std::filesystem::path(path),
+                       std::ios::binary | std::ios::trunc);
+  if (!output.is_open()) {
+    return false;
+  }
+  if (size > 0) {
+    output.write(reinterpret_cast<const char*>(bytes),
+                 static_cast<std::streamsize>(size));
+  }
   output.close();
   return output.good();
 }

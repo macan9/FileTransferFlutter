@@ -20,6 +20,7 @@ abstract class ZeroTierPlatformApi {
   });
   Future<List<ZeroTierNetworkState>> listNetworks();
   Future<ZeroTierNetworkState?> getNetworkDetail(String networkId);
+  Future<ZeroTierNetworkState?> probeNetworkStateNow(String networkId);
   Future<void> applyFirewallRules({
     required String ruleScopeId,
     required String peerZeroTierIp,

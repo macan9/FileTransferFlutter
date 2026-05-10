@@ -57,6 +57,10 @@ class ZeroTierFacade implements ZeroTierPlatformApi {
       _platformApi.getNetworkDetail(networkId);
 
   @override
+  Future<ZeroTierNetworkState?> probeNetworkStateNow(String networkId) =>
+      _platformApi.probeNetworkStateNow(networkId);
+
+  @override
   Future<void> applyFirewallRules({
     required String ruleScopeId,
     required String peerZeroTierIp,
