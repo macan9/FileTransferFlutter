@@ -721,6 +721,12 @@ bool EnsurePrivilegedMountServiceBinaryCurrent(std::string* detail) {
       }
       return true;
     }
+    if (open_error == ERROR_ACCESS_DENIED) {
+      if (detail != nullptr) {
+        *detail = "service_sync_skipped_access_denied";
+      }
+      return true;
+    }
     if (detail != nullptr) {
       *detail = "open_service_failed:" + std::to_string(open_error);
     }
