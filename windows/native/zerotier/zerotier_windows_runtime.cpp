@@ -636,6 +636,28 @@ bool IsPrivilegedMountServiceEnabled() {
   return enabled;
 }
 
+std::wstring TrimQuotedServicePath(const std::wstring& raw_path) {
+  std::wstring value = raw_path;
+  while (!value.empty() && iswspace(value.front())) {
+    value.erase(value.begin());
+  }
+  while (!value.empty() && iswspace(value.back())) {
+    value.pop_back();
+  }
+  if (value.size() >= 2 && value.front() == L'"') {
+    const size_t closing_quote = value.find(L'"', 1);
+    if (closing_quote != std::wstring::npos) {
+      value = value.substr(1, closing_quote - 1);
+    }
+  } else {
+    const size_t exe_pos = value.find(L".exe");
+    if (exe_pos != std::wstring::npos) {
+      value = value.substr(0, exe_pos + 4);
+    }
+  }
+  return value;
+}
+
 std::filesystem::path StandaloneMountHelperPath() {
   const std::filesystem::path current = CurrentExecutablePath();
   if (current.empty()) {
@@ -659,6 +681,114 @@ bool IsStandaloneMountHelperEnabled() {
   const bool enabled = ParseTruthyEnvValue(raw);
   free(raw);
   return enabled;
+}
+
+bool EnsurePrivilegedMountServiceBinaryCurrent(std::string* detail) {
+  if (detail != nullptr) {
+    detail->clear();
+  }
+  if (!IsPrivilegedMountServiceEnabled()) {
+    if (detail != nullptr) {
+      *detail = "service_disabled_by_env";
+    }
+    return true;
+  }
+
+  const std::filesystem::path expected_path = StandaloneMountHelperPath();
+  if (expected_path.empty() || !std::filesystem::exists(expected_path)) {
+    if (detail != nullptr) {
+      *detail = "expected_helper_missing";
+    }
+    return false;
+  }
+
+  SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+  if (scm == nullptr) {
+    if (detail != nullptr) {
+      *detail = "open_scm_failed:" + std::to_string(GetLastError());
+    }
+    return false;
+  }
+
+  SC_HANDLE service =
+      OpenServiceW(scm, L"ZeroTierMountService", SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG);
+  if (service == nullptr) {
+    const DWORD open_error = GetLastError();
+    CloseServiceHandle(scm);
+    if (open_error == ERROR_SERVICE_DOES_NOT_EXIST) {
+      if (detail != nullptr) {
+        *detail = "service_absent";
+      }
+      return true;
+    }
+    if (detail != nullptr) {
+      *detail = "open_service_failed:" + std::to_string(open_error);
+    }
+    return false;
+  }
+
+  DWORD bytes_needed = 0;
+  QueryServiceConfigW(service, nullptr, 0, &bytes_needed);
+  if (bytes_needed == 0) {
+    const DWORD query_error = GetLastError();
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    if (detail != nullptr) {
+      *detail = "query_service_size_failed:" + std::to_string(query_error);
+    }
+    return false;
+  }
+
+  std::vector<unsigned char> buffer(bytes_needed);
+  QUERY_SERVICE_CONFIGW* config =
+      reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buffer.data());
+  if (!QueryServiceConfigW(service, config, bytes_needed, &bytes_needed)) {
+    const DWORD query_error = GetLastError();
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    if (detail != nullptr) {
+      *detail = "query_service_failed:" + std::to_string(query_error);
+    }
+    return false;
+  }
+
+  const std::wstring current_path = TrimQuotedServicePath(
+      config->lpBinaryPathName == nullptr ? L"" : config->lpBinaryPathName);
+  std::error_code current_ec;
+  std::error_code expected_ec;
+  const std::filesystem::path normalized_current =
+      std::filesystem::weakly_canonical(current_path, current_ec);
+  const std::filesystem::path normalized_expected =
+      std::filesystem::weakly_canonical(expected_path, expected_ec);
+  const std::wstring current_cmp =
+      current_ec ? current_path : normalized_current.wstring();
+  const std::wstring expected_cmp =
+      expected_ec ? expected_path.wstring() : normalized_expected.wstring();
+
+  if (_wcsicmp(current_cmp.c_str(), expected_cmp.c_str()) == 0) {
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    if (detail != nullptr) {
+      *detail = "service_path_current";
+    }
+    return true;
+  }
+
+  const std::wstring quoted_expected = L"\"" + expected_path.wstring() + L"\"";
+  const BOOL config_ok = ChangeServiceConfigW(
+      service, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
+      quoted_expected.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  const DWORD config_error = config_ok ? NO_ERROR : GetLastError();
+  CloseServiceHandle(service);
+  CloseServiceHandle(scm);
+
+  if (detail != nullptr) {
+    *detail = "service_repoint "
+              "from=" +
+              WideToUtf8(current_cmp) + " to=" + WideToUtf8(expected_cmp) +
+              " result=" + std::to_string(config_error);
+  }
+  return config_ok == TRUE;
 }
 
 bool CreateTempBinaryFilePath(const wchar_t* prefix,
@@ -2160,6 +2290,8 @@ bool ZeroTierWindowsRuntime::JoinNetworkAndWaitForIp(uint64_t network_id,
     return false;
   }
 
+  PruneKnownNetworksForJoin(network_id);
+
   uint64_t join_generation = 0;
   bool emit_existing_network_online = false;
   flutter::EncodableMap existing_network_payload;
@@ -2464,6 +2596,60 @@ bool ZeroTierWindowsRuntime::LeaveNetwork(uint64_t network_id,
   lock.unlock();
   EmitError(message, network_id_hex);
   return false;
+}
+
+void ZeroTierWindowsRuntime::PruneKnownNetworksForJoin(uint64_t target_network_id) {
+  if (target_network_id == 0) {
+    return;
+  }
+
+  std::vector<uint64_t> networks_to_prune;
+  {
+    std::scoped_lock lock(mutex_);
+    LoadKnownNetworkIdsLocked();
+    for (const uint64_t known_network_id : known_network_ids_) {
+      if (known_network_id == 0 || known_network_id == target_network_id) {
+        continue;
+      }
+      networks_to_prune.push_back(known_network_id);
+    }
+  }
+
+  for (const uint64_t stale_network_id : networks_to_prune) {
+    {
+      std::scoped_lock lock(mutex_);
+      pending_join_networks_.erase(stale_network_id);
+      leaving_networks_.erase(stale_network_id);
+      leave_request_sources_.erase(stale_network_id);
+      pending_leave_generations_.erase(stale_network_id);
+    }
+
+    RemoveMountedSystemIpsForNetwork(stale_network_id, "pruneBeforeJoin");
+    RemoveMountedSystemRoutesForNetwork(stale_network_id, "pruneBeforeJoin");
+
+    int leave_result = ZTS_ERR_OK;
+    {
+      std::scoped_lock api_lock(api_mutex_);
+      leave_result = zts_net_leave(stale_network_id);
+    }
+
+    {
+      std::scoped_lock lock(mutex_);
+      ForgetKnownNetworkLocked(stale_network_id);
+      networks_.erase(stale_network_id);
+      pending_join_networks_.erase(stale_network_id);
+      leaving_networks_.erase(stale_network_id);
+      leave_request_sources_.erase(stale_network_id);
+      pending_leave_generations_.erase(stale_network_id);
+    }
+
+    std::ostringstream stream;
+    stream << "join_prune_stale_network"
+           << " target=" << ToHexNetworkId(target_network_id)
+           << " stale=" << ToHexNetworkId(stale_network_id)
+           << " zts_net_leave=" << leave_result;
+    LogNodeTrace(stream.str());
+  }
 }
 
 flutter::EncodableList ZeroTierWindowsRuntime::ListNetworks() const {
@@ -3207,6 +3393,19 @@ bool ZeroTierWindowsRuntime::EnsurePrepared(std::string* error_message) {
 
   storage_path_ = NodeStoragePath();
   logs_path_ = LogsPath();
+
+  std::string service_sync_detail;
+  if (!EnsurePrivilegedMountServiceBinaryCurrent(&service_sync_detail)) {
+    SetLastErrorLocked("privileged mount service sync failed: " +
+                       service_sync_detail);
+    if (error_message != nullptr) {
+      *error_message = last_error_;
+    }
+    return false;
+  }
+  if (!service_sync_detail.empty()) {
+    LogNodeTrace("privileged_mount_service_sync detail=" + service_sync_detail);
+  }
 
   std::scoped_lock api_lock(api_mutex_);
   const int storage_result = zts_init_from_storage(storage_path_.c_str());
@@ -3998,6 +4197,112 @@ bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
   return bound_any;
 }
 
+void ZeroTierWindowsRuntime::CleanupStaleSystemIpStateForNetwork(
+    uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
+    const std::map<std::string, uint8_t>& managed_prefix_hints) {
+  if (adapter.if_index == 0) {
+    return;
+  }
+
+  std::map<uint32_t, uint8_t> expected_ipv4_prefixes;
+  for (const auto& address : record.assigned_addresses) {
+    in_addr parsed = {};
+    if (!ParseIpv4(address, &parsed)) {
+      continue;
+    }
+    uint8_t prefix = 24;
+    const auto managed_prefix_it = managed_prefix_hints.find(address);
+    if (managed_prefix_it != managed_prefix_hints.end()) {
+      prefix = ClampIpv4PrefixLength(managed_prefix_it->second);
+    } else {
+      const auto adapter_prefix_it = adapter.ipv4_prefix_lengths.find(address);
+      if (adapter_prefix_it != adapter.ipv4_prefix_lengths.end()) {
+        prefix = ClampIpv4PrefixLength(adapter_prefix_it->second);
+      }
+    }
+    expected_ipv4_prefixes[parsed.S_un.S_addr] = prefix;
+  }
+
+  std::vector<MountedSystemIp> stale_ips;
+  for (const auto& existing_address : adapter.ipv4_addresses) {
+    in_addr parsed = {};
+    if (!ParseIpv4(existing_address, &parsed)) {
+      continue;
+    }
+    const uint32_t address_ipv4 = parsed.S_un.S_addr;
+    const auto expected_it = expected_ipv4_prefixes.find(address_ipv4);
+    uint8_t existing_prefix = 24;
+    const auto adapter_prefix_it = adapter.ipv4_prefix_lengths.find(existing_address);
+    if (adapter_prefix_it != adapter.ipv4_prefix_lengths.end()) {
+      existing_prefix = ClampIpv4PrefixLength(adapter_prefix_it->second);
+    }
+    if (expected_it != expected_ipv4_prefixes.end() &&
+        expected_it->second == existing_prefix) {
+      continue;
+    }
+    stale_ips.push_back(
+        MountedSystemIp{adapter.if_index, address_ipv4, existing_prefix, 0});
+  }
+
+  for (const auto& stale_ip : stale_ips) {
+    char ip_text[INET_ADDRSTRLEN] = {0};
+    in_addr ip_addr = {};
+    ip_addr.S_un.S_addr = stale_ip.address_ipv4;
+    inet_ntop(AF_INET, &ip_addr, ip_text, static_cast<DWORD>(sizeof(ip_text)));
+
+    std::ostringstream stream;
+    stream << "ip_cleanup_stale"
+           << " network_id=" << ToHexNetworkId(network_id)
+           << " if_index=" << stale_ip.if_index
+           << " address=" << ip_text
+           << "/" << static_cast<int>(stale_ip.prefix_length);
+    LogNodeTrace(stream.str());
+
+    DWORD ps_exit_code = NO_ERROR;
+    std::string remove_executor = "-";
+    const bool removed = TryRemoveIpViaPowerShell(network_id, stale_ip.if_index,
+                                                  ip_text, &ps_exit_code, true,
+                                                  &remove_executor);
+
+    std::ostringstream remove_stream;
+    remove_stream << "ip_cleanup_stale_result"
+                  << " network_id=" << ToHexNetworkId(network_id)
+                  << " if_index=" << stale_ip.if_index
+                  << " address=" << ip_text
+                  << "/" << static_cast<int>(stale_ip.prefix_length)
+                  << " removed=" << BoolLabel(removed)
+                  << " executor=" << remove_executor
+                  << " ps_exit_code=" << ps_exit_code;
+    LogNodeTrace(remove_stream.str());
+
+    const uint32_t mask = PrefixMaskNetworkOrder(stale_ip.prefix_length);
+    const uint32_t destination = stale_ip.address_ipv4 & mask;
+    char destination_text[INET_ADDRSTRLEN] = {0};
+    in_addr destination_addr = {};
+    destination_addr.S_un.S_addr = destination;
+    inet_ntop(AF_INET, &destination_addr, destination_text,
+              static_cast<DWORD>(sizeof(destination_text)));
+    const std::string cidr = std::string(destination_text) + "/" +
+                             std::to_string(static_cast<int>(stale_ip.prefix_length));
+    DWORD route_exit_code = NO_ERROR;
+    std::string route_executor = "-";
+    const bool route_removed = TryRemoveRouteViaPowerShell(
+        network_id, stale_ip.if_index, cidr, &route_exit_code, true,
+        &route_executor);
+
+    std::ostringstream route_stream;
+    route_stream << "route_cleanup_stale_result"
+                 << " network_id=" << ToHexNetworkId(network_id)
+                 << " if_index=" << stale_ip.if_index
+                 << " cidr=" << cidr
+                 << " removed=" << BoolLabel(route_removed)
+                 << " executor=" << route_executor
+                 << " ps_exit_code=" << route_exit_code;
+    LogNodeTrace(route_stream.str());
+  }
+}
+
 bool ZeroTierWindowsRuntime::TryMountSystemRoutesForNetwork(
     uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
     const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
@@ -4670,12 +4975,14 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
       } else {
         const auto hints_it = managed_ipv4_prefix_hints.find(network_id);
         const std::map<std::string, uint8_t> empty_prefix_hints;
+        const std::map<std::string, uint8_t>& prefix_hints =
+            hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
+                                                        : hints_it->second;
+        CleanupStaleSystemIpStateForNetwork(network_id, record,
+                                            *selected_adapter, prefix_hints);
         std::vector<MountedSystemIp> created_ips;
         const bool ip_bound = TryBindSystemIpForNetwork(
-            network_id, record, *selected_adapter,
-            hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
-                                                        : hints_it->second,
-            &created_ips);
+            network_id, record, *selected_adapter, prefix_hints, &created_ips);
         if (!created_ips.empty()) {
           created_ips_by_network[network_id] = std::move(created_ips);
         }

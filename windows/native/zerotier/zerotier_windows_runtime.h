@@ -138,6 +138,7 @@ class ZeroTierWindowsRuntime {
 
   bool EnsurePrepared(std::string* error_message);
   bool EnsureNodeReady(std::string* error_message);
+  void PruneKnownNetworksForJoin(uint64_t target_network_id);
   void ProcessEvent(void* message_ptr);
   void UpdateNetworkFromLibztMessage(const void* message_ptr);
   void UpdateAddressFromLibztMessage(const void* message_ptr);
@@ -161,6 +162,10 @@ class ZeroTierWindowsRuntime {
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
       const std::map<std::string, uint8_t>& managed_prefix_hints,
       std::vector<MountedSystemIp>* created_ips);
+  void CleanupStaleSystemIpStateForNetwork(
+      uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
+      const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
+      const std::map<std::string, uint8_t>& managed_prefix_hints);
   void RecordMountedSystemRoutesLocked(
       uint64_t network_id, const std::vector<MountedSystemRoute>& created_routes);
   void RecordConfirmedSystemRoutesLocked(
