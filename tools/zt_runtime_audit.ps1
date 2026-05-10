@@ -19,28 +19,12 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
   $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 }
 
+. (Join-Path $ProjectRoot 'scripts\windows\_common.ps1')
+
 function Write-Section {
   param([string]$Title)
   Write-Host ""
   Write-Host "=== $Title ==="
-}
-
-function Get-CmakePath {
-  $candidates = @(
-    'cmake',
-    'E:\DevSoftWare\VisualStudio2026\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
-  )
-  foreach ($candidate in $candidates) {
-    try {
-      $cmd = Get-Command $candidate -ErrorAction Stop
-      return $cmd.Source
-    } catch {
-    }
-    if (Test-Path $candidate) {
-      return (Resolve-Path $candidate).Path
-    }
-  }
-  throw 'cmake was not found.'
 }
 
 function Read-KeyValueFile {
@@ -428,7 +412,7 @@ $existingSmokeLogsAvailable = (Test-Path $stdoutLogPath) -or (Test-Path $stderrL
 $shouldUseExistingSmokeLogs = $UseExistingSmokeLogs -or (-not $ForceSmoke -and -not $SkipSmoke -and $existingSmokeLogsAvailable)
 
 Write-Section 'Environment'
-$cmakePath = Get-CmakePath
+$cmakePath = Resolve-CMakePath
 $report.CmakePath = $cmakePath
 $report.ProjectRoot = $ProjectRoot
 $report.RuntimeRoot = $RuntimeRoot

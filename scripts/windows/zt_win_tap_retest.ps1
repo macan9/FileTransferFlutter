@@ -12,6 +12,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "_common.ps1")
 
 function Write-Section([string]$Text) {
   Write-Host ""
@@ -22,25 +23,6 @@ function Test-IsAdmin {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Resolve-CMakePath {
-  $candidates = @(
-    "E:\DevSoftWare\VisualStudio2026\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
-    "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
-    "D:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
-    "D:\Program Files\Microsoft Visual Studio\17\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
-  )
-  foreach ($candidate in $candidates) {
-    if (Test-Path -LiteralPath $candidate) {
-      return $candidate
-    }
-  }
-  $cmd = Get-Command cmake -ErrorAction SilentlyContinue
-  if ($cmd -ne $null) {
-    return $cmd.Source
-  }
-  throw "cmake not found. Install CMake or Visual Studio CMake workload first."
 }
 
 function Find-DriverFiles([string[]]$SearchRoots) {
@@ -93,7 +75,7 @@ function Save-RouteSnapshot([string]$Path) {
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$buildDir = Join-Path $repoRoot "build\win_step4_on"
+$buildDir = Join-Path $repoRoot "build\windows\x64"
 $smokeDir = Join-Path $buildDir "runner\Debug"
 $smokeExe = Join-Path $smokeDir "zt_runtime_smoke.exe"
 $logDir = Join-Path $repoRoot "logs\zerotier"
@@ -116,7 +98,7 @@ if ($env:ZT_WINTUN_DLL) {
   $wintunSearchPaths += $env:ZT_WINTUN_DLL
 }
 $wintunSearchPaths += Join-Path $repoRoot "build\windows\x64\runner\Debug\wintun.dll"
-$wintunSearchPaths += Join-Path $repoRoot "build\win_step4_on\runner\Debug\wintun.dll"
+$wintunSearchPaths += Join-Path $repoRoot "build\windows\x64\runner\Debug\wintun.dll"
 $wintunSearchPaths += Join-Path $repoRoot "third_party\wintun\0.14.1\extract\wintun\bin\amd64\wintun.dll"
 $wintunSearchPaths += Join-Path $repoRoot "third_party\wintun"
 

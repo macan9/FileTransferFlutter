@@ -5,6 +5,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "_common.ps1")
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $logDir = Join-Path $repoRoot "logs\zerotier"
@@ -14,10 +15,8 @@ $taskLog = Join-Path $logDir ("zt_admin_task_" + $stamp + ".log")
 
 Start-Transcript -LiteralPath $taskLog -Force | Out-Null
 try {
-  $cmakeBin = "E:\DevSoftWare\VisualStudio2026\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
-  if (Test-Path (Join-Path $cmakeBin "cmake.exe")) {
-    $env:Path = $cmakeBin + ";" + $env:Path
-  }
+  $cmake = Resolve-CMakePath
+  $env:Path = (Split-Path -Path $cmake -Parent) + ";" + $env:Path
 
   $driverDir = Join-Path $repoRoot "third_party\libzt\ext\ZeroTierOne\ext\bin\tap-windows-ndis6\x64"
   if (-not (Test-Path (Join-Path $driverDir "zttap300.inf"))) {

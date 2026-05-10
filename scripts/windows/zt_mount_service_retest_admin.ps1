@@ -1,13 +1,14 @@
 param(
   [Parameter(Mandatory = $true)]
   [string]$NetworkId,
-  [string]$BuildDir = "build/win_step5",
+  [string]$BuildDir = "build/windows/x64",
   [int]$JoinTimeoutMs = 120000,
   [int]$LeaveTimeoutMs = 90000
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "_common.ps1")
 
 function Invoke-Sc([string]$Arguments) {
   & sc.exe $Arguments
@@ -35,10 +36,8 @@ $logPath = Join-Path $logDir ("zt_mount_service_retest_" + $stamp + ".log")
 
 Start-Transcript -LiteralPath $logPath -Force | Out-Null
 try {
-  $cmakeBin = "E:\DevSoftWare\VisualStudio2026\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
-  if (Test-Path (Join-Path $cmakeBin "cmake.exe")) {
-    $env:Path = $cmakeBin + ";" + $env:Path
-  }
+  $cmake = Resolve-CMakePath
+  $env:Path = (Split-Path -Path $cmake -Parent) + ";" + $env:Path
 
   $serviceExe = Join-Path $repoRoot ($BuildDir + "\runner\Debug\zt_mount_helper.exe")
   if (-not (Test-Path -LiteralPath $serviceExe)) {
