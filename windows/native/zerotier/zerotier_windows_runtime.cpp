@@ -4087,6 +4087,11 @@ std::string ZeroTierWindowsRuntime::ToHexNetworkId(uint64_t network_id) const {
   return stream.str();
 }
 
+std::string ZeroTierWindowsRuntime::ExpectedWintunAdapterNameForNetwork(
+    uint64_t network_id) const {
+  return "FileTransferFlutter-" + ToHexNetworkId(network_id);
+}
+
 bool ZeroTierWindowsRuntime::TryBindSystemIpForNetwork(
     uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
     const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
@@ -4320,6 +4325,82 @@ void ZeroTierWindowsRuntime::CleanupStaleSystemIpStateForNetwork(
                  << " executor=" << route_executor
                  << " ps_exit_code=" << route_exit_code;
     LogNodeTrace(route_stream.str());
+  }
+}
+
+void ZeroTierWindowsRuntime::CleanupManagedIpv4OnForeignAdaptersForNetwork(
+    uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
+    const ZeroTierWindowsAdapterBridge::AdapterRecord& selected_adapter,
+    const std::vector<ZeroTierWindowsAdapterBridge::AdapterRecord>& adapters,
+    const std::map<std::string, uint8_t>& managed_prefix_hints) {
+  if (selected_adapter.if_index == 0 || record.assigned_addresses.empty()) {
+    return;
+  }
+
+  std::map<uint32_t, uint8_t> expected_ipv4_prefixes;
+  for (const auto& address : record.assigned_addresses) {
+    in_addr parsed = {};
+    if (!ParseIpv4(address, &parsed)) {
+      continue;
+    }
+    uint8_t prefix = 24;
+    const auto managed_prefix_it = managed_prefix_hints.find(address);
+    if (managed_prefix_it != managed_prefix_hints.end()) {
+      prefix = ClampIpv4PrefixLength(managed_prefix_it->second);
+    }
+    expected_ipv4_prefixes[parsed.S_un.S_addr] = prefix;
+  }
+
+  for (const auto& adapter : adapters) {
+    if (adapter.if_index == 0 || adapter.if_index == selected_adapter.if_index) {
+      continue;
+    }
+    if (adapter.driver_kind != "wintun" && adapter.driver_kind != "wireguard") {
+      continue;
+    }
+    for (const auto& existing_address : adapter.ipv4_addresses) {
+      in_addr parsed = {};
+      if (!ParseIpv4(existing_address, &parsed)) {
+        continue;
+      }
+      const auto expected_it = expected_ipv4_prefixes.find(parsed.S_un.S_addr);
+      if (expected_it == expected_ipv4_prefixes.end()) {
+        continue;
+      }
+      uint8_t prefix = expected_it->second;
+      const auto adapter_prefix_it = adapter.ipv4_prefix_lengths.find(existing_address);
+      if (adapter_prefix_it != adapter.ipv4_prefix_lengths.end()) {
+        prefix = ClampIpv4PrefixLength(adapter_prefix_it->second);
+      }
+      std::ostringstream stream;
+      stream << "ip_cleanup_foreign_adapter"
+             << " network_id=" << ToHexNetworkId(network_id)
+             << " selected_if_index=" << selected_adapter.if_index
+             << " foreign_if_index=" << adapter.if_index
+             << " foreign_adapter="
+             << (!adapter.friendly_name.empty()
+                     ? adapter.friendly_name
+                     : (!adapter.description.empty() ? adapter.description
+                                                     : adapter.adapter_name))
+             << " address=" << existing_address
+             << "/" << static_cast<int>(prefix);
+      LogNodeTrace(stream.str());
+      DWORD ps_exit_code = NO_ERROR;
+      std::string remove_executor = "-";
+      const bool removed = TryRemoveIpViaPowerShell(
+          network_id, adapter.if_index, existing_address, &ps_exit_code, true,
+          &remove_executor);
+      std::ostringstream result_stream;
+      result_stream << "ip_cleanup_foreign_adapter_result"
+                    << " network_id=" << ToHexNetworkId(network_id)
+                    << " foreign_if_index=" << adapter.if_index
+                    << " address=" << existing_address
+                    << "/" << static_cast<int>(prefix)
+                    << " removed=" << BoolLabel(removed)
+                    << " executor=" << remove_executor
+                    << " ps_exit_code=" << ps_exit_code;
+      LogNodeTrace(result_stream.str());
+    }
   }
 }
 
@@ -4810,6 +4891,7 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     const ZeroTierWindowsAdapterBridge::AdapterRecord* selected_adapter =
         nullptr;
     bool selected_exact_match = false;
+    bool selected_adapter_has_expected_ip = false;
     bool confirmed_route_bound = !record.route_expected;
 
     const auto has_confirmed_route = [&](uint32_t if_index) {
@@ -4850,11 +4932,15 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
     };
 
     if (!record.assigned_addresses.empty()) {
+      const std::string expected_adapter_name =
+          ExpectedWintunAdapterNameForNetwork(network_id);
       const ZeroTierWindowsAdapterBridge::AdapterRecord* exact_match = nullptr;
       int exact_match_score = std::numeric_limits<int>::min();
+      bool exact_match_has_expected_ip = false;
       const ZeroTierWindowsAdapterBridge::AdapterRecord* fallback_candidate =
           nullptr;
       int fallback_score = std::numeric_limits<int>::min();
+      bool fallback_has_expected_ip = false;
       for (const auto& adapter : adapter_probe.adapters) {
         const bool backend_candidate =
             tap_backend_ == nullptr
@@ -4867,6 +4953,14 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                 : tap_backend_->DescribeMountCandidateDecision(adapter);
         const int backend_score =
             tap_backend_ == nullptr ? 0 : tap_backend_->FallbackScore(adapter);
+        const std::string adapter_display_name =
+            !adapter.friendly_name.empty()
+                ? adapter.friendly_name
+                : (!adapter.description.empty() ? adapter.description
+                                                : adapter.adapter_name);
+        const bool matches_expected_adapter_name =
+            _stricmp(adapter_display_name.c_str(),
+                     expected_adapter_name.c_str()) == 0;
         const bool matched = std::any_of(
             record.assigned_addresses.begin(), record.assigned_addresses.end(),
             [&adapter](const std::string& address) {
@@ -4889,6 +4983,8 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
                  << " backend=" << tap_backend_id_
                  << " backend_decision=" << backend_decision
                  << " backend_score=" << backend_score
+                 << " matches_expected_adapter_name="
+                 << BoolLabel(matches_expected_adapter_name)
                  << " matched_expected_ip=" << BoolLabel(matched)
                  << " is_up=" << BoolLabel(adapter.is_up)
                  << " media_status=" << adapter.media_status
@@ -4900,27 +4996,34 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         if (!backend_candidate) {
           continue;
         }
-        if (matched) {
+        const int effective_score =
+            backend_score + (matches_expected_adapter_name ? 1000 : 0);
+        if (matched || matches_expected_adapter_name) {
           if (exact_match == nullptr ||
-              backend_score > exact_match_score ||
-              (backend_score == exact_match_score &&
+              effective_score > exact_match_score ||
+              (effective_score == exact_match_score &&
                !exact_match->is_up && adapter.is_up)) {
             exact_match = &adapter;
-            exact_match_score = backend_score;
+            exact_match_score = effective_score;
+            exact_match_has_expected_ip = matched;
           }
           continue;
         }
         if (fallback_candidate == nullptr ||
-            backend_score > fallback_score ||
-            (backend_score == fallback_score &&
+            effective_score > fallback_score ||
+            (effective_score == fallback_score &&
              !fallback_candidate->is_up && adapter.is_up)) {
           fallback_candidate = &adapter;
-          fallback_score = backend_score;
+          fallback_score = effective_score;
+          fallback_has_expected_ip = matched;
         }
       }
 
       selected_adapter = exact_match != nullptr ? exact_match : fallback_candidate;
       selected_exact_match = exact_match != nullptr;
+      selected_adapter_has_expected_ip =
+          exact_match != nullptr ? exact_match_has_expected_ip
+                                 : fallback_has_expected_ip;
       {
         std::ostringstream stream;
         stream << "adapter_probe_selected"
@@ -4958,12 +5061,13 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         record.tap_device_instance_id = selected_adapter->device_instance_id;
         record.tap_netcfg_instance_id = selected_adapter->netcfg_instance_id;
         confirmed_route_bound = has_confirmed_route(selected_adapter->if_index);
-        record.system_ip_bound = selected_exact_match;
+        record.system_ip_bound = selected_adapter_has_expected_ip;
         record.system_route_bound =
             confirmed_route_bound ||
-            (selected_exact_match && selected_adapter->has_expected_route);
+            (selected_adapter_has_expected_ip &&
+             selected_adapter->has_expected_route);
         record.local_interface_ready =
-            selected_exact_match && selected_adapter->is_up;
+            selected_adapter_has_expected_ip && selected_adapter->is_up;
       }
     }
 
@@ -5002,6 +5106,9 @@ void ZeroTierWindowsRuntime::RefreshSnapshot() {
         const std::map<std::string, uint8_t>& prefix_hints =
             hints_it == managed_ipv4_prefix_hints.end() ? empty_prefix_hints
                                                         : hints_it->second;
+        CleanupManagedIpv4OnForeignAdaptersForNetwork(
+            network_id, record, *selected_adapter, adapter_probe.adapters,
+            prefix_hints);
         CleanupStaleSystemIpStateForNetwork(network_id, record,
                                             *selected_adapter, prefix_hints);
         std::vector<MountedSystemIp> created_ips;

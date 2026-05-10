@@ -151,6 +151,7 @@ class ZeroTierWindowsRuntime {
   std::string LogsPath() const;
   std::string KnownNetworksPath() const;
   std::string ToHexNetworkId(uint64_t network_id) const;
+  std::string ExpectedWintunAdapterNameForNetwork(uint64_t network_id) const;
   bool TryMountSystemRoutesForNetwork(
       uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
@@ -165,6 +166,11 @@ class ZeroTierWindowsRuntime {
   void CleanupStaleSystemIpStateForNetwork(
       uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
       const ZeroTierWindowsAdapterBridge::AdapterRecord& adapter,
+      const std::map<std::string, uint8_t>& managed_prefix_hints);
+  void CleanupManagedIpv4OnForeignAdaptersForNetwork(
+      uint64_t network_id, const ZeroTierWindowsNetworkRecord& record,
+      const ZeroTierWindowsAdapterBridge::AdapterRecord& selected_adapter,
+      const std::vector<ZeroTierWindowsAdapterBridge::AdapterRecord>& adapters,
       const std::map<std::string, uint8_t>& managed_prefix_hints);
   void RecordMountedSystemRoutesLocked(
       uint64_t network_id, const std::vector<MountedSystemRoute>& created_routes);
