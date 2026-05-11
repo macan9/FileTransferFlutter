@@ -18,7 +18,8 @@ class AppBootstrap {
   static Future<AppBootstrap> initialize() async {
     final appSupportDirectory = await getApplicationSupportDirectory();
     final hiveDirectory =
-        '${appSupportDirectory.path}${Platform.pathSeparator}hive';
+        '${appSupportDirectory.path}${Platform.pathSeparator}hive'
+        '${Platform.pathSeparator}$_buildFlavorName';
     await Hive.initFlutter(hiveDirectory);
     const LaunchEnvironmentLoader launchEnvironmentLoader =
         LaunchEnvironmentLoader();
@@ -39,4 +40,10 @@ class AppBootstrap {
       initialConfig: initialConfig,
     );
   }
+
+  static const String _buildFlavorName = bool.fromEnvironment('dart.vm.product')
+      ? 'release'
+      : bool.fromEnvironment('dart.vm.profile')
+          ? 'profile'
+          : 'debug';
 }

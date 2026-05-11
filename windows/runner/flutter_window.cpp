@@ -44,6 +44,14 @@ bool FlutterWindow::OnCreate() {
       plugin_registrar);
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
+  flutter_controller_->engine()->SetNextFrameCallback([&]() {
+    this->Show();
+  });
+
+  // Ensure a frame is pending even if the callback is registered after the
+  // engine has already produced its first frame.
+  flutter_controller_->ForceRedraw();
+
   return true;
 }
 
