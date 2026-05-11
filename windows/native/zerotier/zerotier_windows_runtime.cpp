@@ -15,6 +15,7 @@
 
 #include <WinSock2.h>
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
 #include <shellapi.h>
@@ -34,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <cwctype>
 #include <optional>
 #include <sstream>
 #include <iostream>
@@ -638,6 +640,145 @@ bool IsPrivilegedMountServiceEnabled() {
   const bool enabled = ParseTruthyEnvValue(raw);
   free(raw);
   return enabled;
+}
+
+bool PathEqualsIgnoreCase(const std::filesystem::path& lhs,
+                          const std::filesystem::path& rhs) {
+  std::error_code lhs_error;
+  std::error_code rhs_error;
+  const std::filesystem::path lhs_normalized =
+      std::filesystem::weakly_canonical(lhs, lhs_error).lexically_normal();
+  const std::filesystem::path rhs_normalized =
+      std::filesystem::weakly_canonical(rhs, rhs_error).lexically_normal();
+  std::wstring lhs_text =
+      (lhs_error ? lhs.lexically_normal() : lhs_normalized).wstring();
+  std::wstring rhs_text =
+      (rhs_error ? rhs.lexically_normal() : rhs_normalized).wstring();
+  std::transform(lhs_text.begin(), lhs_text.end(), lhs_text.begin(),
+                 [](wchar_t ch) { return std::towlower(ch); });
+  std::transform(rhs_text.begin(), rhs_text.end(), rhs_text.begin(),
+                 [](wchar_t ch) { return std::towlower(ch); });
+  return lhs_text == rhs_text;
+}
+
+bool StopWindowsServiceByName(const wchar_t* service_name) {
+  if (service_name == nullptr || service_name[0] == L'\0') {
+    return false;
+  }
+  SC_HANDLE scm =
+      OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+  if (scm == nullptr) {
+    return false;
+  }
+  SC_HANDLE service = OpenServiceW(
+      scm, service_name, SERVICE_QUERY_STATUS | SERVICE_STOP);
+  if (service == nullptr) {
+    CloseServiceHandle(scm);
+    return false;
+  }
+
+  SERVICE_STATUS_PROCESS status = {};
+  DWORD bytes_needed = 0;
+  if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                            reinterpret_cast<LPBYTE>(&status), sizeof(status),
+                            &bytes_needed)) {
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    return false;
+  }
+
+  if (status.dwCurrentState != SERVICE_STOPPED &&
+      status.dwCurrentState != SERVICE_STOP_PENDING) {
+    SERVICE_STATUS ignored = {};
+    ControlService(service, SERVICE_CONTROL_STOP, &ignored);
+  }
+
+  constexpr int kMaxWaitMs = 4000;
+  constexpr int kPollIntervalMs = 200;
+  int waited_ms = 0;
+  while (waited_ms < kMaxWaitMs) {
+    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                              reinterpret_cast<LPBYTE>(&status),
+                              sizeof(status), &bytes_needed)) {
+      break;
+    }
+    if (status.dwCurrentState == SERVICE_STOPPED) {
+      CloseServiceHandle(service);
+      CloseServiceHandle(scm);
+      return true;
+    }
+    Sleep(kPollIntervalMs);
+    waited_ms += kPollIntervalMs;
+  }
+
+  const bool stopped = status.dwCurrentState == SERVICE_STOPPED;
+  CloseServiceHandle(service);
+  CloseServiceHandle(scm);
+  return stopped;
+}
+
+void KillHelperProcessesForBuildDirectory(
+    const std::filesystem::path& executable_directory) {
+  if (executable_directory.empty()) {
+    return;
+  }
+
+  constexpr const wchar_t* kCandidateNames[] = {
+      L"zt_mount_helper.exe",  L"zt_mount_helper_v2.exe",
+      L"zt_mount_helper_v3.exe", L"zt_mount_helper_v4.exe",
+      L"zt_mount_helper_v5.exe", L"zt_mount_helper_v6.exe",
+      L"zt_mount_service.exe"};
+
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    return;
+  }
+
+  PROCESSENTRY32W entry = {};
+  entry.dwSize = sizeof(entry);
+  if (!Process32FirstW(snapshot, &entry)) {
+    CloseHandle(snapshot);
+    return;
+  }
+
+  do {
+    bool candidate_name = false;
+    for (const wchar_t* file_name : kCandidateNames) {
+      if (_wcsicmp(entry.szExeFile, file_name) == 0) {
+        candidate_name = true;
+        break;
+      }
+    }
+    if (!candidate_name) {
+      continue;
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                     PROCESS_TERMINATE | SYNCHRONIZE,
+                                 FALSE, entry.th32ProcessID);
+    if (process == nullptr) {
+      continue;
+    }
+
+    std::wstring image_path(MAX_PATH, L'\0');
+    DWORD image_path_size = static_cast<DWORD>(image_path.size());
+    bool same_directory = false;
+    if (QueryFullProcessImageNameW(process, 0, image_path.data(),
+                                   &image_path_size)) {
+      image_path.resize(image_path_size);
+      const std::filesystem::path process_path(image_path);
+      same_directory = PathEqualsIgnoreCase(process_path.parent_path(),
+                                            executable_directory);
+    }
+
+    if (same_directory) {
+      TerminateProcess(process, 0);
+      WaitForSingleObject(process, 1500);
+    }
+    CloseHandle(process);
+  } while (Process32NextW(snapshot, &entry));
+
+  CloseHandle(snapshot);
 }
 
 std::wstring TrimQuotedServicePath(const std::wstring& raw_path) {
@@ -2088,6 +2229,14 @@ ZeroTierWindowsRuntime::~ZeroTierWindowsRuntime() {
       return g_runtime_callback_active_count == 0;
     });
   }
+}
+
+void ZeroTierWindowsRuntime::ShutdownForProcessExit() {
+  StopNode();
+  StopWindowsServiceByName(L"ZeroTierMountService");
+  const std::filesystem::path executable_directory =
+      CurrentExecutablePath().parent_path();
+  KillHelperProcessesForBuildDirectory(executable_directory);
 }
 
 flutter::EncodableMap ZeroTierWindowsRuntime::DetectStatus() {
