@@ -772,15 +772,9 @@ class NetworkingAgentRuntimeController
       }
     }
 
-    final String? relayNodeId = mode == P2pConnectionMode.relay
-        ? _firstNonEmpty(
-            state.observedRelayNodeId,
-            state.preferredRelayNodeId,
-          )
-        : null;
     return _ObservedRelayState(
       connectionMode: mode,
-      relayNodeId: relayNodeId,
+      relayNodeId: null,
       rttMs: _firstObservedMetric(
         transportState?.sessionTransports
             .map((item) => item.rttMs)
@@ -2637,18 +2631,6 @@ class _ObservedRelayState {
   final int? rttMs;
   final int? txBytes;
   final int? rxBytes;
-}
-
-String? _firstNonEmpty(String? first, String? second) {
-  final String? normalizedFirst = first?.trim();
-  if (normalizedFirst != null && normalizedFirst.isNotEmpty) {
-    return normalizedFirst;
-  }
-  final String? normalizedSecond = second?.trim();
-  if (normalizedSecond != null && normalizedSecond.isNotEmpty) {
-    return normalizedSecond;
-  }
-  return null;
 }
 
 int? _firstObservedMetric(Iterable<int>? values) {

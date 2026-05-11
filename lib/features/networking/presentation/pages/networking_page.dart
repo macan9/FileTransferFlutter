@@ -57,7 +57,7 @@ class NetworkingSectionPage extends ConsumerWidget {
     final Widget child;
     switch (section) {
       case NetworkingSection.agent:
-        title = 'Agent 实况';
+        title = '节点概览';
         child = _HeroStatusCard(
           runtimeStatus: runtimeStatus,
           agentState: agentState,
@@ -101,7 +101,7 @@ class NetworkingSectionPage extends ConsumerWidget {
           },
         );
       case NetworkingSection.alignment:
-        title = '架构联动';
+        title = '状态对齐';
         child = _NetworkingAlignmentCard(
           defaultNetwork: dashboard.defaultNetwork,
           managedNetworks: dashboard.managedNetworks,
@@ -1132,9 +1132,11 @@ class _HeroStatusCard extends StatelessWidget {
       recentEvents: recentEvents,
       lastError: lastError,
     );
+    final PairingSession? latestSession = _latestPairingSession(pairingSessions);
+
     return SectionCard(
-      title: 'ZeroTier Agent 实况',
-      subtitle: '页面直接消费统一 ZeroTierFacade 与 provider 状态流，展示本机节点、网络与事件回流。',
+      title: 'ZeroTier 节点概览',
+      subtitle: '集中展示本机 ZeroTier 节点状态、当前链路观测与关键排障信息，便于快速判断当前组网运行情况。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
@@ -1149,7 +1151,7 @@ class _HeroStatusCard extends StatelessWidget {
                   label: 'libzt 节点', value: _nodeStateLabel(runtimeStatus)),
               _InfoPill(
                 label: '注册状态',
-                value: isRegistered ? '已注册' : '未注册',
+                value: isRegistered ? '已就绪' : '未就绪',
               ),
               _InfoPill(
                 label: '防火墙',
@@ -1196,6 +1198,19 @@ class _HeroStatusCard extends StatelessWidget {
               ],
             ),
           ),
+          const SizedBox(height: 16),
+          _CapabilityItem(
+            tone: latestSession == null
+                ? _CapabilityTone.warning
+                : _CapabilityTone.info,
+            label: latestSession == null
+                ? '当前还没有可展示的会话链路信息。'
+                : '已同步 ${pairingSessions.length} 条会话，可优先查看最新一条的中继决策、实际链路与会话状态。',
+          ),
+          if (latestSession != null) ...<Widget>[
+            const SizedBox(height: 12),
+            _PairingSessionRelayCard(session: latestSession),
+          ],
           const SizedBox(height: 16),
           _LabeledBlock(
             label: '设备 ID',
@@ -1244,19 +1259,6 @@ class _HeroStatusCard extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(height: 10),
-          _CapabilityItem(
-            tone: pairingSessions.isEmpty
-                ? _CapabilityTone.warning
-                : _CapabilityTone.info,
-            label: pairingSessions.isEmpty
-                ? '浼氳瘽涓庝腑缁嶇姸鎬佸皻鏈悓姝ュ埌鍓嶇銆?'
-                : '宸插悓姝ュ埌 ${pairingSessions.length} 涓细璇濓紝鍙湪浼氳瘽璇︽儏涓煡鐪嬩腑缁嶇姸鎬併€?',
-          ),
-          if (pairingSessions.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 12),
-            _PairingSessionRelayCard(session: pairingSessions.first),
-          ],
         ],
       ),
     );
@@ -1340,46 +1342,151 @@ class _PairingSessionRelayCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final String sessionTime = _timeOrDash(
+      session.updatedAt ??
+          session.activatedAt ??
+          session.joinedAt ??
+          session.createdAt,
+    );
+    final String sessionNetwork = session.zeroTierNetworkName
+                ?.trim()
+                .isNotEmpty ==
+            true
+        ? '${session.zeroTierNetworkName} (${session.zeroTierNetworkId ?? '-'})'
+        : (session.zeroTierNetworkId?.trim().isNotEmpty == true
+            ? session.zeroTierNetworkId!
+            : '未记录');
+    final String peerSummary =
+        '${session.initiatorDevice.deviceName} -> ${session.targetDevice.deviceName}';
+
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFFE5E7EB)),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
+        boxShadow: const <BoxShadow>[
+          BoxShadow(
+            color: Color(0x0F0F172A),
+            blurRadius: 14,
+            offset: Offset(0, 6),
+          ),
+        ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Text(
-            '会话链路观测',
-            style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w800,
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      '会话链路观测',
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '优先展示最新会话的链路决策与实际观测结果，适合快速判断当前是直连、经中继，还是仍在等待收敛。',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                        height: 1.45,
+                      ),
+                    ),
+                  ],
                 ),
+              ),
+              const SizedBox(width: 12),
+              _StatusChip(
+                label: _sessionStatusLabel(session.status),
+                color: _isClosedPairingSession(session.status)
+                    ? const Color(0xFFB45309)
+                    : const Color(0xFF2563EB),
+              ),
+            ],
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 14),
+          _DetailSurface(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  '会话摘要',
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: const Color(0xFF475569),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  peerSummary,
+                  style: theme.textTheme.bodyLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: const Color(0xFF0F172A),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '网络: $sessionNetwork\n'
+                  '最近时间: $sessionTime\n'
+                  'Agent 命令数: ${session.commands.length}',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF475569),
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
           Wrap(
             spacing: 8,
             runSpacing: 8,
             children: <Widget>[
-              _InfoPill(label: '会话', value: session.id),
+              _InfoPill(label: '会话 ID', value: session.id),
               _InfoPill(
-                label: '推荐中继',
-                value: session.relayNodeId ?? '-',
+                label: '会话状态',
+                value: _sessionStatusLabel(session.status),
               ),
-              _InfoPill(
-                label: '推荐原因',
-                value: session.relayDecisionReason ?? '-',
-              ),
+              _InfoPill(label: '推荐中继', value: session.relayNodeId ?? '-'),
               _InfoPill(
                 label: '实际链路',
                 value: _connectionModeLabel(session.observedConnectionMode),
               ),
               _InfoPill(
-                label: '实际中继',
-                value: session.observedRelayNodeId ?? '-',
-              ),
+                  label: '实际中继', value: session.observedRelayNodeId ?? '-'),
             ],
+          ),
+          const SizedBox(height: 12),
+          _DetailSurface(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  '推荐原因',
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: const Color(0xFF475569),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SelectableText(
+                  (session.relayDecisionReason?.trim().isNotEmpty ?? false)
+                      ? session.relayDecisionReason!
+                      : '当前没有返回中继决策原因。',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF334155),
+                    height: 1.55,
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -1462,8 +1569,8 @@ class _NetworkingAlignmentCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SectionCard(
-      title: '架构联动状态',
-      subtitle: '这里同时展示服务端编排层和本地 ZeroTier 运行时，方便校准状态映射是否一致。',
+      title: '状态对齐',
+      subtitle: '这里同时展示服务端编排视角和本地 ZeroTier 运行时视角，方便核对状态映射是否一致。',
       child: Column(
         children: <Widget>[
           _CapabilityItem(
@@ -2821,29 +2928,65 @@ class _LabeledBlock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
-        Text(label, style: Theme.of(context).textTheme.labelLarge),
+        Text(label, style: theme.textTheme.labelLarge),
         const SizedBox(height: 8),
         Container(
           width: double.infinity,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surfaceContainerLowest,
-            borderRadius: BorderRadius.circular(14),
+            color: theme.colorScheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(16),
             border: Border.all(
-              color: Theme.of(context).colorScheme.outlineVariant,
+              color: theme.colorScheme.outlineVariant,
             ),
+            boxShadow: const <BoxShadow>[
+              BoxShadow(
+                color: Color(0x080F172A),
+                blurRadius: 10,
+                offset: Offset(0, 3),
+              ),
+            ],
           ),
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
-              Expanded(child: SelectableText(value)),
-              if (action != null) action!,
+              if (action != null)
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: action!,
+                ),
+              SelectableText(
+                value,
+                style: theme.textTheme.bodyMedium?.copyWith(height: 1.55),
+              ),
             ],
           ),
         ),
       ],
+    );
+  }
+}
+
+class _DetailSurface extends StatelessWidget {
+  const _DetailSurface({
+    required this.child,
+  });
+  final Widget child;
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
+      ),
+      child: child,
     );
   }
 }
@@ -3307,9 +3450,9 @@ class _SecondarySectionBar extends StatelessWidget {
           spacing: 12,
           runSpacing: 8,
           children: <Widget>[
-            _SectionLinkButton(label: 'Agent 实况', onTap: onTapAgent),
+            _SectionLinkButton(label: '节点概览', onTap: onTapAgent),
             _SectionLinkButton(label: '运行状态', onTap: onTapRuntime),
-            _SectionLinkButton(label: '架构联动', onTap: onTapAlignment),
+            _SectionLinkButton(label: '状态对齐', onTap: onTapAlignment),
             _SectionLinkButton(label: '本地网络', onTap: onTapLocal),
           ]),
     );
@@ -3965,12 +4108,44 @@ String _connectionModeLabel(P2pConnectionMode? mode) {
     return '直连中';
   }
   if (mode == P2pConnectionMode.relay) {
-    return '已切中继';
+    return '经中继';
   }
   if (mode == P2pConnectionMode.failed) {
     return '链路异常';
   }
   return '链路待确认';
+}
+
+bool _isClosedPairingSession(String status) {
+  final String normalized = status.trim().toLowerCase();
+  return normalized == 'closed' ||
+      normalized == 'cancelled' ||
+      normalized == 'revoked' ||
+      normalized == 'expired' ||
+      normalized == 'failed';
+}
+
+String _sessionStatusLabel(String status) {
+  switch (status.trim().toLowerCase()) {
+    case 'active':
+      return '进行中';
+    case 'joined':
+      return '已加入';
+    case 'pending':
+      return '待处理';
+    case 'cancelled':
+      return '已取消';
+    case 'revoked':
+      return '已撤销';
+    case 'closed':
+      return '已关闭';
+    case 'expired':
+      return '已过期';
+    case 'failed':
+      return '失败';
+    default:
+      return status.trim().isEmpty ? '未识别' : status.trim();
+  }
 }
 
 String _buildDefaultPrivateNetworkName(AppConfig config) {
@@ -5391,6 +5566,30 @@ bool _isAcceptedMembershipStatus(String? status) {
 
 bool _isRevokedMembershipStatus(String? status) {
   return status?.trim().toLowerCase() == 'revoked';
+}
+
+PairingSession? _latestPairingSession(List<PairingSession> sessions) {
+  if (sessions.isEmpty) {
+    return null;
+  }
+
+  final List<PairingSession> sortedSessions = List<PairingSession>.from(sessions)
+    ..sort(_comparePairingSessionsByRecency);
+  return sortedSessions.first;
+}
+
+int _comparePairingSessionsByRecency(PairingSession left, PairingSession right) {
+  final DateTime leftTime = _pairingSessionSortTime(left);
+  final DateTime rightTime = _pairingSessionSortTime(right);
+  return rightTime.compareTo(leftTime);
+}
+
+DateTime _pairingSessionSortTime(PairingSession session) {
+  return session.updatedAt ??
+      session.activatedAt ??
+      session.joinedAt ??
+      session.createdAt ??
+      DateTime.fromMillisecondsSinceEpoch(0);
 }
 
 String? _currentMembershipStatus(

@@ -138,9 +138,10 @@ class P2pTransportService {
   }
 
   Future<void> handleRemoteOffer(Map<String, dynamic> payload) async {
-    final String targetDeviceId = _extractTargetDeviceId(payload);
-    _log('handleRemoteOffer target=$targetDeviceId');
-    final _PeerLink link = await _findLinkByPeer(targetDeviceId);
+    final _PeerLink link = await _findLinkForSignal(payload);
+    _log(
+      'handleRemoteOffer session=${link.session.sessionId} peer=${link.peerDeviceId}',
+    );
     final Map<String, dynamic> offer = _normalizeMap(payload['offer']);
     _log(
       'handleRemoteOffer setRemoteDescription session=${link.session.sessionId} type=${offer["type"]}',
@@ -179,9 +180,10 @@ class P2pTransportService {
   }
 
   Future<void> handleRemoteAnswer(Map<String, dynamic> payload) async {
-    final String targetDeviceId = _extractTargetDeviceId(payload);
-    _log('handleRemoteAnswer target=$targetDeviceId');
-    final _PeerLink link = await _findLinkByPeer(targetDeviceId);
+    final _PeerLink link = await _findLinkForSignal(payload);
+    _log(
+      'handleRemoteAnswer session=${link.session.sessionId} peer=${link.peerDeviceId}',
+    );
     final Map<String, dynamic> answer = _normalizeMap(payload['answer']);
     _log(
       'handleRemoteAnswer setRemoteDescription session=${link.session.sessionId} type=${answer["type"]}',
@@ -199,9 +201,10 @@ class P2pTransportService {
   }
 
   Future<void> handleRemoteCandidate(Map<String, dynamic> payload) async {
-    final String targetDeviceId = _extractTargetDeviceId(payload);
-    _log('handleRemoteCandidate target=$targetDeviceId');
-    final _PeerLink link = await _findLinkByPeer(targetDeviceId);
+    final _PeerLink link = await _findLinkForSignal(payload);
+    _log(
+      'handleRemoteCandidate session=${link.session.sessionId} peer=${link.peerDeviceId}',
+    );
     final Map<String, dynamic> candidate = _normalizeMap(payload['candidate']);
     link.remoteCandidateTypes.addAll(
       _extractCandidateTypes(candidate['candidate']?.toString()),
@@ -1076,13 +1079,26 @@ class P2pTransportService {
     }
   }
 
-  String _extractTargetDeviceId(Map<String, dynamic> payload) {
-    final String direct = payload['targetDeviceId']?.toString() ?? '';
-    if (direct.isNotEmpty) {
-      return direct;
+  Future<_PeerLink> _findLinkForSignal(Map<String, dynamic> payload) async {
+    final String? sessionId = extractSignalSessionId(payload);
+    if (sessionId != null) {
+      final _PeerLink? bySession = _links[sessionId];
+      if (bySession != null) {
+        return bySession;
+      }
+      _log('findLinkForSignal missing session=$sessionId, fallback to peer');
     }
-    final Map<String, dynamic> from = _normalizeMap(payload['from']);
-    return from['deviceId']?.toString() ?? '';
+
+    final String? peerDeviceId = resolveSignalPeerDeviceId(
+      payload,
+      selfDeviceId: _selfDeviceId,
+    );
+    if (peerDeviceId == null || peerDeviceId.isEmpty) {
+      throw const RealtimeError(
+        'Unable to resolve peer device from signaling payload.',
+      );
+    }
+    return _findLinkByPeer(peerDeviceId);
   }
 
   Future<_PeerLink> _findLinkByPeer(String peerDeviceId) async {
@@ -1682,6 +1698,63 @@ class P2pTransportService {
 
   void _log(String message) {
     debugPrint('[P2P/TRANSPORT] $message');
+  }
+
+  @visibleForTesting
+  static String? extractSignalSessionId(Map<String, dynamic> payload) {
+    final String direct = payload['sessionId']?.toString().trim() ?? '';
+    if (direct.isNotEmpty) {
+      return direct;
+    }
+
+    final Map<String, dynamic> session = _mapValue(payload['session']);
+    final String nested = session['sessionId']?.toString().trim() ?? '';
+    return nested.isEmpty ? null : nested;
+  }
+
+  @visibleForTesting
+  static String? resolveSignalPeerDeviceId(
+    Map<String, dynamic> payload, {
+    String? selfDeviceId,
+  }) {
+    final String self = selfDeviceId?.trim() ?? '';
+    final Map<String, dynamic> from = _mapValue(payload['from']);
+    final List<String> candidates = <String>[
+      from['deviceId']?.toString() ?? '',
+      payload['fromDeviceId']?.toString() ?? '',
+      payload['senderDeviceId']?.toString() ?? '',
+      payload['sourceDeviceId']?.toString() ?? '',
+      payload['peerDeviceId']?.toString() ?? '',
+      payload['targetDeviceId']?.toString() ?? '',
+    ];
+
+    for (final String raw in candidates) {
+      final String candidate = raw.trim();
+      if (candidate.isNotEmpty && candidate != self) {
+        return candidate;
+      }
+    }
+
+    for (final String raw in candidates) {
+      final String candidate = raw.trim();
+      if (candidate.isNotEmpty) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  static Map<String, dynamic> _mapValue(dynamic value) {
+    if (value is Map<String, dynamic>) {
+      return value;
+    }
+    if (value is Map) {
+      return value.map(
+        (dynamic key, dynamic item) => MapEntry(key.toString(), item),
+      );
+    }
+    return const <String, dynamic>{};
   }
 }
 
