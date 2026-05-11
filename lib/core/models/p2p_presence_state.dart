@@ -51,12 +51,16 @@ class P2pPresenceState extends Equatable {
       status == SignalingPresenceStatus.registering;
 
   List<P2pDevice> devicesExcludingSelf(String? deviceId) {
-    if (deviceId == null || deviceId.isEmpty) {
+    final String normalizedDeviceId = _normalizeDeviceId(deviceId);
+    if (normalizedDeviceId.isEmpty) {
       return devices;
     }
 
     return devices
-        .where((P2pDevice item) => item.deviceId != deviceId)
+        .where(
+          (P2pDevice item) =>
+              _normalizeDeviceId(item.deviceId) != normalizedDeviceId,
+        )
         .toList();
   }
 
@@ -178,5 +182,9 @@ class P2pPresenceState extends Equatable {
       }
     }
     return null;
+  }
+
+  static String _normalizeDeviceId(String? deviceId) {
+    return deviceId?.trim().toLowerCase() ?? '';
   }
 }

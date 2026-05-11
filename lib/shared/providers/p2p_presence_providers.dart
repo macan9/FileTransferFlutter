@@ -440,15 +440,21 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     P2pDevice device, {
     required String selfDeviceId,
   }) {
+    final bool isSelf = _isSelfDevice(
+      deviceId: device.deviceId,
+      selfDeviceId: selfDeviceId,
+    );
     final Map<String, P2pDevice> byId = <String, P2pDevice>{
       for (final P2pDevice item in state.devices) item.deviceId: item,
     };
-    byId[device.deviceId] = device;
+    if (isSelf) {
+      byId.remove(device.deviceId);
+    } else {
+      byId[device.deviceId] = device;
+    }
 
     final P2pDevice? currentDevice =
-        device.deviceId == selfDeviceId && state.isOnline
-            ? device
-            : state.currentDevice;
+        isSelf && state.isOnline ? device : state.currentDevice;
 
     state = state.copyWith(
       currentDevice: currentDevice,
@@ -465,18 +471,22 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
     required String selfDeviceId,
   }) {
     final Map<String, P2pDevice> byId = <String, P2pDevice>{
-      for (final P2pDevice item in state.devices) item.deviceId: item,
+      for (final P2pDevice item in state.devices)
+        if (!_isSelfDevice(deviceId: item.deviceId, selfDeviceId: selfDeviceId))
+          item.deviceId: item,
     };
 
     for (final P2pDevice item in incoming) {
+      if (_isSelfDevice(deviceId: item.deviceId, selfDeviceId: selfDeviceId)) {
+        continue;
+      }
       byId[item.deviceId] = item;
     }
 
     if (currentDevice != null) {
-      byId[currentDevice.deviceId] = currentDevice;
-    } else {
-      byId.remove(selfDeviceId);
+      byId.remove(currentDevice.deviceId);
     }
+    byId.remove(selfDeviceId);
 
     return byId.values.toList()
       ..sort(
@@ -640,5 +650,16 @@ class P2pPresenceController extends Notifier<P2pPresenceState> {
       return 'ios';
     }
     return 'unknown';
+  }
+
+  bool _isSelfDevice({
+    required String deviceId,
+    required String selfDeviceId,
+  }) {
+    return _normalizeDeviceId(deviceId) == _normalizeDeviceId(selfDeviceId);
+  }
+
+  String _normalizeDeviceId(String? value) {
+    return value?.trim().toLowerCase() ?? '';
   }
 }
