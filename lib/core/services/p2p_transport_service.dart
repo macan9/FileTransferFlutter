@@ -377,6 +377,7 @@ class P2pTransportService {
       peerConnection: peerConnection,
       connectionMode: session.connectionMode ?? P2pConnectionMode.connecting,
       forceRelayOnly: forceRelay,
+      webrtcConfig: rtcConfig,
     );
     _links[session.sessionId] = link;
     _bindPeerConnection(link);
@@ -429,6 +430,7 @@ class P2pTransportService {
     final _WebrtcConfig relayConfig = await _loadWebrtcConfig(
       forceRelay: true,
     );
+    link.webrtcConfig = relayConfig;
     link.peerConnection = await _peerConnectionFactory.create(
       iceServers: relayConfig.iceServers,
       iceTransportPolicy: relayConfig.iceTransportPolicy,
@@ -1375,22 +1377,33 @@ class P2pTransportService {
 
         _updateTransportMetrics(link, values);
 
-        final String? localType = _extractSelectedCandidateType(
+        final _SelectedCandidateDetails localCandidate =
+            _extractSelectedCandidateDetails(
           candidateReportId: values['localCandidateId']?.toString(),
           candidateTypeKey: 'localCandidateType',
           reportsById: reportsById,
           values: values,
         );
-        final String? remoteType = _extractSelectedCandidateType(
+        final _SelectedCandidateDetails remoteCandidate =
+            _extractSelectedCandidateDetails(
           candidateReportId: values['remoteCandidateId']?.toString(),
           candidateTypeKey: 'remoteCandidateType',
           reportsById: reportsById,
           values: values,
         );
+        _updateRelayObservation(
+          link,
+          localCandidate: localCandidate,
+          remoteCandidate: remoteCandidate,
+        );
 
         final Set<String> selectedTypes = <String>{
-          if (localType != null && localType.isNotEmpty) localType,
-          if (remoteType != null && remoteType.isNotEmpty) remoteType,
+          if (localCandidate.candidateType != null &&
+              localCandidate.candidateType!.isNotEmpty)
+            localCandidate.candidateType!,
+          if (remoteCandidate.candidateType != null &&
+              remoteCandidate.candidateType!.isNotEmpty)
+            remoteCandidate.candidateType!,
         };
         if (selectedTypes.contains('relay')) {
           return P2pConnectionMode.relay;
@@ -1407,7 +1420,7 @@ class P2pTransportService {
     return null;
   }
 
-  String? _extractSelectedCandidateType({
+  _SelectedCandidateDetails _extractSelectedCandidateDetails({
     required String? candidateReportId,
     required String candidateTypeKey,
     required Map<String, StatsReport> reportsById,
@@ -1415,19 +1428,53 @@ class P2pTransportService {
   }) {
     final String? inlineType =
         values[candidateTypeKey]?.toString().toLowerCase();
-    if (inlineType != null && inlineType.isNotEmpty) {
-      return inlineType;
-    }
-    if (candidateReportId == null || candidateReportId.isEmpty) {
-      return null;
-    }
-    final StatsReport? report = reportsById[candidateReportId];
-    if (report == null) {
-      return null;
-    }
-    final Map<String, dynamic> reportValues =
-        _normalizeStatsValues(report.values);
-    return reportValues['candidateType']?.toString().toLowerCase();
+    final StatsReport? report = candidateReportId == null || candidateReportId.isEmpty
+        ? null
+        : reportsById[candidateReportId];
+    final Map<String, dynamic> reportValues = report == null
+        ? const <String, dynamic>{}
+        : _normalizeStatsValues(report.values);
+    return _SelectedCandidateDetails(
+      candidateType: (inlineType != null && inlineType.isNotEmpty)
+          ? inlineType
+          : _normalizeObservedString(reportValues['candidateType']),
+      address: P2pTransportService.extractStatsCandidateAddress(reportValues),
+      url: P2pTransportService.extractStatsCandidateUrl(reportValues),
+    );
+  }
+
+  void _updateRelayObservation(
+    _PeerLink link, {
+    required _SelectedCandidateDetails localCandidate,
+    required _SelectedCandidateDetails remoteCandidate,
+  }) {
+    final List<_SelectedCandidateDetails> relayCandidates =
+        <_SelectedCandidateDetails>[
+      localCandidate,
+      remoteCandidate,
+    ].where(
+      (_SelectedCandidateDetails item) => item.candidateType == 'relay',
+    ).toList(growable: false);
+
+    link.selectedRelayAddress = relayCandidates.isEmpty
+        ? null
+        : _firstNormalizedObservedString(
+            relayCandidates.map((item) => item.address),
+          );
+    link.selectedRelayUrl = relayCandidates.isEmpty
+        ? null
+        : _firstNormalizedObservedString(
+            relayCandidates.map((item) => item.url),
+          );
+    link.relayNodeId = _resolveRelayNodeIdForLink(link);
+  }
+
+  String? _resolveRelayNodeIdForLink(_PeerLink link) {
+    return P2pTransportService.resolveRelayNodeIdFromIceServers(
+      iceServers: link.webrtcConfig.iceServers,
+      selectedRelayUrl: link.selectedRelayUrl,
+      selectedRelayAddress: link.selectedRelayAddress,
+    );
   }
 
   void _updateTransportMetrics(_PeerLink link, Map<String, dynamic> values) {
@@ -1472,6 +1519,48 @@ class P2pTransportService {
     }
     if (value is String) {
       return num.tryParse(value.trim());
+    }
+    return null;
+  }
+
+  @visibleForTesting
+  static String? extractStatsCandidateAddress(Map<String, dynamic> values) {
+    return _firstNormalizedObservedString(<dynamic>[
+      values['address'],
+      values['ip'],
+      values['ipAddress'],
+      values['relayAddress'],
+    ]);
+  }
+
+  @visibleForTesting
+  static String? extractStatsCandidateUrl(Map<String, dynamic> values) {
+    return _firstNormalizedObservedString(<dynamic>[
+      values['url'],
+      values['urls'],
+      values['relayUrl'],
+    ]);
+  }
+
+  @visibleForTesting
+  static String? resolveRelayNodeIdFromIceServers({
+    required List<Map<String, dynamic>> iceServers,
+    String? selectedRelayUrl,
+    String? selectedRelayAddress,
+  }) {
+    final List<_RelayIceServerMapping> mappings =
+        _relayIceServerMappings(iceServers);
+    for (final _RelayIceServerMapping mapping in mappings) {
+      if (selectedRelayUrl != null &&
+          mapping.urls.any(
+            (String url) => _urlsMatch(selectedRelayUrl, url),
+          )) {
+        return mapping.relayNodeId;
+      }
+      if (selectedRelayAddress != null &&
+          mapping.hosts.contains(selectedRelayAddress.trim())) {
+        return mapping.relayNodeId;
+      }
     }
     return null;
   }
@@ -1618,6 +1707,9 @@ class P2pTransportService {
             dataChannelOpen: link.dataChannelOpen,
             dataChannelLabel: link.dataChannelLabel,
             lastError: link.lastError,
+            relayNodeId: link.relayNodeId,
+            selectedRelayAddress: link.selectedRelayAddress,
+            selectedRelayUrl: link.selectedRelayUrl,
             rttMs: link.rttMs,
             txBytes: link.txBytes,
             rxBytes: link.rxBytes,
@@ -1765,6 +1857,7 @@ class _PeerLink {
     required this.peerConnection,
     required this.connectionMode,
     required this.forceRelayOnly,
+    required this.webrtcConfig,
   });
 
   P2pSession session;
@@ -1778,9 +1871,13 @@ class _PeerLink {
   bool relayFallbackAttempted = false;
   TransportLinkStatus linkStatus = TransportLinkStatus.idle;
   P2pConnectionMode connectionMode;
+  _WebrtcConfig webrtcConfig;
   final Set<String> localCandidateTypes = <String>{};
   final Set<String> remoteCandidateTypes = <String>{};
   String? lastError;
+  String? relayNodeId;
+  String? selectedRelayAddress;
+  String? selectedRelayUrl;
   int? rttMs;
   int? txBytes;
   int? rxBytes;
@@ -1790,6 +1887,18 @@ class _PeerLink {
     await dataChannel?.close();
     await peerConnection.close();
   }
+}
+
+class _SelectedCandidateDetails {
+  const _SelectedCandidateDetails({
+    required this.candidateType,
+    required this.address,
+    required this.url,
+  });
+
+  final String? candidateType;
+  final String? address;
+  final String? url;
 }
 
 class _WebrtcConfig {
@@ -1901,4 +2010,116 @@ class _ChunkPayload {
 
   final int index;
   final Uint8List data;
+}
+
+String? _firstNormalizedObservedString(Iterable<dynamic> values) {
+  for (final dynamic value in values) {
+    final String? normalized = _normalizeObservedString(value);
+    if (normalized != null) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+String? _normalizeObservedString(dynamic value) {
+  final String text = value?.toString().trim() ?? '';
+  return text.isEmpty ? null : text;
+}
+
+List<_RelayIceServerMapping> _relayIceServerMappings(
+  List<Map<String, dynamic>> iceServers,
+) {
+  final List<_RelayIceServerMapping> mappings = <_RelayIceServerMapping>[];
+  for (final Map<String, dynamic> server in iceServers) {
+    final String? relayNodeId = _normalizeObservedString(server['relayNodeId']);
+    if (relayNodeId == null) {
+      continue;
+    }
+    final List<String> urls = _normalizedIceServerUrls(server['urls']);
+    if (urls.isEmpty) {
+      continue;
+    }
+    final Set<String> hosts = urls
+        .map(_hostFromIceUrl)
+        .whereType<String>()
+        .toSet();
+    mappings.add(
+      _RelayIceServerMapping(
+        relayNodeId: relayNodeId,
+        urls: urls,
+        hosts: hosts,
+      ),
+    );
+  }
+  return mappings;
+}
+
+List<String> _normalizedIceServerUrls(dynamic rawUrls) {
+  if (rawUrls is String) {
+    final String? value = _normalizeObservedString(rawUrls);
+    return value == null ? const <String>[] : <String>[value];
+  }
+  if (rawUrls is List) {
+    return rawUrls
+        .map(_normalizeObservedString)
+        .whereType<String>()
+        .toList(growable: false);
+  }
+  return const <String>[];
+}
+
+String? _hostFromIceUrl(String url) {
+  final String trimmed = url.trim();
+  if (trimmed.isEmpty) {
+    return null;
+  }
+  final int schemeIndex = trimmed.indexOf(':');
+  if (schemeIndex < 0 || schemeIndex + 1 >= trimmed.length) {
+    return null;
+  }
+  String remainder = trimmed.substring(schemeIndex + 1);
+  if (remainder.startsWith('//')) {
+    remainder = remainder.substring(2);
+  }
+  final int queryIndex = remainder.indexOf('?');
+  if (queryIndex >= 0) {
+    remainder = remainder.substring(0, queryIndex);
+  }
+  final int slashIndex = remainder.indexOf('/');
+  if (slashIndex >= 0) {
+    remainder = remainder.substring(0, slashIndex);
+  }
+  if (remainder.startsWith('[')) {
+    final int closingIndex = remainder.indexOf(']');
+    if (closingIndex > 1) {
+      return remainder.substring(1, closingIndex);
+    }
+  }
+  final List<String> parts = remainder.split(':');
+  return parts.isEmpty ? null : _normalizeObservedString(parts.first);
+}
+
+bool _urlsMatch(String selected, String configured) {
+  final String selectedValue = selected.trim();
+  final String configuredValue = configured.trim();
+  if (selectedValue.isEmpty || configuredValue.isEmpty) {
+    return false;
+  }
+  if (selectedValue == configuredValue) {
+    return true;
+  }
+  return _hostFromIceUrl(selectedValue) == _hostFromIceUrl(configuredValue);
+}
+
+class _RelayIceServerMapping {
+  const _RelayIceServerMapping({
+    required this.relayNodeId,
+    required this.urls,
+    required this.hosts,
+  });
+
+  final String relayNodeId;
+  final List<String> urls;
+  final Set<String> hosts;
 }

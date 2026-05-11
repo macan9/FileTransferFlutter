@@ -21,6 +21,9 @@ class P2pSessionTransport extends Equatable {
     required this.dataChannelOpen,
     this.dataChannelLabel,
     this.lastError,
+    this.relayNodeId,
+    this.selectedRelayAddress,
+    this.selectedRelayUrl,
     this.rttMs,
     this.txBytes,
     this.rxBytes,
@@ -34,6 +37,9 @@ class P2pSessionTransport extends Equatable {
   final bool dataChannelOpen;
   final String? dataChannelLabel;
   final String? lastError;
+  final String? relayNodeId;
+  final String? selectedRelayAddress;
+  final String? selectedRelayUrl;
   final int? rttMs;
   final int? txBytes;
   final int? rxBytes;
@@ -52,6 +58,12 @@ class P2pSessionTransport extends Equatable {
     bool clearDataChannelLabel = false,
     String? lastError,
     bool clearLastError = false,
+    String? relayNodeId,
+    bool clearRelayNodeId = false,
+    String? selectedRelayAddress,
+    bool clearSelectedRelayAddress = false,
+    String? selectedRelayUrl,
+    bool clearSelectedRelayUrl = false,
     int? rttMs,
     bool clearRttMs = false,
     int? txBytes,
@@ -70,6 +82,12 @@ class P2pSessionTransport extends Equatable {
           ? null
           : dataChannelLabel ?? this.dataChannelLabel,
       lastError: clearLastError ? null : lastError ?? this.lastError,
+      relayNodeId: clearRelayNodeId ? null : relayNodeId ?? this.relayNodeId,
+      selectedRelayAddress: clearSelectedRelayAddress
+          ? null
+          : selectedRelayAddress ?? this.selectedRelayAddress,
+      selectedRelayUrl:
+          clearSelectedRelayUrl ? null : selectedRelayUrl ?? this.selectedRelayUrl,
       rttMs: clearRttMs ? null : rttMs ?? this.rttMs,
       txBytes: clearTxBytes ? null : txBytes ?? this.txBytes,
       rxBytes: clearRxBytes ? null : rxBytes ?? this.rxBytes,
@@ -86,6 +104,9 @@ class P2pSessionTransport extends Equatable {
         dataChannelOpen,
         dataChannelLabel,
         lastError,
+        relayNodeId,
+        selectedRelayAddress,
+        selectedRelayUrl,
         rttMs,
         txBytes,
         rxBytes,

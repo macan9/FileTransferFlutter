@@ -774,7 +774,9 @@ class NetworkingAgentRuntimeController
 
     return _ObservedRelayState(
       connectionMode: mode,
-      relayNodeId: null,
+      relayNodeId: _firstObservedRelayNodeId(
+        transportState?.sessionTransports.map((item) => item.relayNodeId),
+      ),
       rttMs: _firstObservedMetric(
         transportState?.sessionTransports
             .map((item) => item.rttMs)
@@ -2639,6 +2641,19 @@ int? _firstObservedMetric(Iterable<int>? values) {
   }
   for (final int value in values) {
     return value;
+  }
+  return null;
+}
+
+String? _firstObservedRelayNodeId(Iterable<String?>? values) {
+  if (values == null) {
+    return null;
+  }
+  for (final String? value in values) {
+    final String trimmed = value?.trim() ?? '';
+    if (trimmed.isNotEmpty) {
+      return trimmed;
+    }
   }
   return null;
 }
