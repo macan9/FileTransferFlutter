@@ -146,6 +146,7 @@ ZeroTierWindowsPlugin::ZeroTierWindowsPlugin()
 ZeroTierWindowsPlugin::~ZeroTierWindowsPlugin() {
   if (state_) {
     state_->runtime.ClearEventCallback();
+    state_->runtime.ShutdownForProcessExit();
     state_->window_handle = nullptr;
   }
   if (registrar_ != nullptr && window_proc_delegate_id_ != 0) {

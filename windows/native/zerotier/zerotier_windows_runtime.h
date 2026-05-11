@@ -78,6 +78,7 @@ class ZeroTierWindowsRuntime {
   flutter::EncodableMap PrepareEnvironment();
   flutter::EncodableMap StartNode();
   flutter::EncodableMap StopNode();
+  void ShutdownForProcessExit();
 
   void SetEventCallback(EventCallback callback);
   void ClearEventCallback();
