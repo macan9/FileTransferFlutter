@@ -65,23 +65,31 @@ class HiveAppConfigRepository implements AppConfigRepository {
     );
 
     final AppConfig persisted = AppConfig.fromJson(json);
+    final bool serverChanged = _normalizeServerUrl(persisted.serverUrl) !=
+        _normalizeServerUrl(defaults.serverUrl);
     return defaults.copyWith(
       // The root launch environment file is the source of truth for serverUrl.
       serverUrl: defaults.serverUrl,
-      deviceId: _preferPersisted(persisted.deviceId, defaults.deviceId),
+      deviceId: serverChanged
+          ? defaults.deviceId
+          : _preferPersisted(persisted.deviceId, defaults.deviceId),
       deviceName: _preferPersisted(persisted.deviceName, defaults.deviceName),
       devicePlatform: _preferPersisted(
         persisted.devicePlatform,
         defaults.devicePlatform,
       ),
-      zeroTierNodeId: _preferPersisted(
-        persisted.zeroTierNodeId,
-        defaults.zeroTierNodeId,
-      ),
-      agentToken: _preferPersisted(
-        persisted.agentToken,
-        defaults.agentToken,
-      ),
+      zeroTierNodeId: serverChanged
+          ? defaults.zeroTierNodeId
+          : _preferPersisted(
+              persisted.zeroTierNodeId,
+              defaults.zeroTierNodeId,
+            ),
+      agentToken: serverChanged
+          ? defaults.agentToken
+          : _preferPersisted(
+              persisted.agentToken,
+              defaults.agentToken,
+            ),
       downloadDirectory: _preferPersisted(
         persisted.downloadDirectory,
         defaults.downloadDirectory,
@@ -98,6 +106,18 @@ class HiveAppConfigRepository implements AppConfigRepository {
   String _preferPersisted(String persisted, String fallback) {
     final String trimmed = persisted.trim();
     return trimmed.isEmpty ? fallback : trimmed;
+  }
+
+  String _normalizeServerUrl(String value) {
+    final String trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return '';
+    }
+    final Uri uri = Uri.parse(trimmed);
+    final String normalizedPath = uri.path.endsWith('/') && uri.path.length > 1
+        ? uri.path.substring(0, uri.path.length - 1)
+        : uri.path;
+    return uri.replace(path: normalizedPath).toString();
   }
 
   bool _jsonEquals(dynamic raw, Map<String, dynamic> normalizedJson) {

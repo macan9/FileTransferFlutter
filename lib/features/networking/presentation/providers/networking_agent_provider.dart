@@ -282,6 +282,7 @@ class NetworkingAgentRuntimeController
   DateTime? _commandPollingSuppressedAt;
   int _runtimeRefreshRevision = 0;
   int _consecutiveHeartbeatTransportFailureCount = 0;
+  Future<bool>? _identityRecoveryFuture;
 
   NetworkingService get _networkingService =>
       ref.read(networkingServiceProvider);
@@ -608,16 +609,56 @@ class NetworkingAgentRuntimeController
       final bool needsBootstrap = config.agentToken.trim().isEmpty ||
           config.zeroTierNodeId.trim() != status.nodeId ||
           config.deviceId.trim().isEmpty;
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_identity_bootstrap_check',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'deviceId': config.deviceId,
+            'configNodeId': config.zeroTierNodeId,
+            'runtimeNodeId': status.nodeId,
+            'hasAgentToken': config.agentToken.trim().isNotEmpty,
+            'needsBootstrap': needsBootstrap,
+            'runtimeServiceState': status.serviceState,
+          },
+        ),
+      );
       if (!needsBootstrap) {
         state = state.copyWith(isBootstrapping: false, clearLastError: true);
         return;
       }
 
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_identity_bootstrap_start',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'deviceId': config.deviceId,
+            'configNodeId': config.zeroTierNodeId,
+            'runtimeNodeId': status.nodeId,
+            'deviceName': config.deviceName,
+            'platform': config.devicePlatform,
+          },
+        ),
+      );
       final NetworkDeviceIdentity identity =
           await _networkingService.bootstrapDevice(
         deviceName: config.deviceName,
         platform: config.devicePlatform,
         zeroTierNodeId: status.nodeId,
+      );
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_identity_bootstrap_success',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'identityDeviceId': identity.id,
+            'identityNodeId': identity.zeroTierNodeId,
+            'hasAgentToken': identity.agentToken.trim().isNotEmpty,
+            'agentTokenIssuedAt': identity.agentTokenIssuedAt,
+            'status': identity.status,
+          },
+        ),
       );
 
       await ref.read(appConfigProvider.notifier).save(
@@ -638,6 +679,20 @@ class NetworkingAgentRuntimeController
         clearLastError: true,
       );
     } catch (error) {
+      final AppConfig config = ref.read(appConfigProvider);
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_identity_bootstrap_error',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'deviceId': config.deviceId,
+            'configNodeId': config.zeroTierNodeId,
+            'runtimeNodeId': state.runtimeStatus.nodeId,
+            'kind': error.runtimeType.toString(),
+            'message': error is RealtimeError ? error.message : '$error',
+          },
+        ),
+      );
       state = state.copyWith(
         isBootstrapping: false,
         lastError: error is RealtimeError ? error.message : '$error',
@@ -671,6 +726,19 @@ class NetworkingAgentRuntimeController
     state = state.copyWith(isHeartbeating: true);
     final _ObservedRelayState observedRelayState = _resolveObservedRelayState();
     try {
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_heartbeat_start',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'deviceId': config.deviceId,
+            'configNodeId': config.zeroTierNodeId,
+            'runtimeNodeId': state.runtimeStatus.nodeId,
+            'connectionMode': observedRelayState.connectionMode.value,
+            'relayNodeId': observedRelayState.relayNodeId,
+          },
+        ),
+      );
       try {
         await _networkingService.heartbeatAgent(
           deviceId: config.deviceId,
@@ -683,6 +751,22 @@ class NetworkingAgentRuntimeController
           rxBytes: observedRelayState.rxBytes,
         );
       } on RealtimeError catch (error) {
+        unawaited(
+          NetworkingDebugLog.write(
+            'agent_heartbeat_error',
+            fields: <String, Object?>{
+              'serverUrl': config.serverUrl,
+              'deviceId': config.deviceId,
+              'configNodeId': config.zeroTierNodeId,
+              'runtimeNodeId': state.runtimeStatus.nodeId,
+              'statusCode': error.statusCode,
+              'code': error.code,
+              'bootstrapRequired': error.bootstrapRequired,
+              'message': error.message,
+              'phase': 'initial',
+            },
+          ),
+        );
         if (!await _recoverIdentityIfRequired(error)) {
           rethrow;
         }
@@ -694,6 +778,17 @@ class NetworkingAgentRuntimeController
             'Agent identity recovery completed without usable credentials.',
           );
         }
+        unawaited(
+          NetworkingDebugLog.write(
+            'agent_heartbeat_retry_after_recovery',
+            fields: <String, Object?>{
+              'serverUrl': config.serverUrl,
+              'deviceId': config.deviceId,
+              'configNodeId': config.zeroTierNodeId,
+              'runtimeNodeId': state.runtimeStatus.nodeId,
+            },
+          ),
+        );
         await _networkingService.heartbeatAgent(
           deviceId: config.deviceId,
           agentToken: config.agentToken,
@@ -705,6 +800,17 @@ class NetworkingAgentRuntimeController
           rxBytes: observedRelayState.rxBytes,
         );
       }
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_heartbeat_success',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'deviceId': config.deviceId,
+            'configNodeId': config.zeroTierNodeId,
+            'runtimeNodeId': state.runtimeStatus.nodeId,
+          },
+        ),
+      );
       state = state.copyWith(
         isHeartbeating: false,
         lastHeartbeatAt: DateTime.now(),
@@ -734,6 +840,19 @@ class NetworkingAgentRuntimeController
       } else {
         _consecutiveHeartbeatTransportFailureCount = 0;
       }
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_heartbeat_failure',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'deviceId': config.deviceId,
+            'configNodeId': config.zeroTierNodeId,
+            'runtimeNodeId': state.runtimeStatus.nodeId,
+            'kind': error.runtimeType.toString(),
+            'message': error is RealtimeError ? error.message : '$error',
+          },
+        ),
+      );
       state = state.copyWith(
         isHeartbeating: false,
         lastError: error is RealtimeError ? error.message : '$error',
@@ -855,6 +974,17 @@ class NetworkingAgentRuntimeController
     _busyPolling = true;
     state = state.copyWith(isPolling: true);
     try {
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_command_poll_start',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'deviceId': config.deviceId,
+            'configNodeId': config.zeroTierNodeId,
+            'runtimeNodeId': state.runtimeStatus.nodeId,
+          },
+        ),
+      );
       List<NetworkAgentCommand> commands;
       try {
         commands = await _networkingService.fetchAgentCommands(
@@ -862,6 +992,22 @@ class NetworkingAgentRuntimeController
           agentToken: config.agentToken,
         );
       } on RealtimeError catch (error) {
+        unawaited(
+          NetworkingDebugLog.write(
+            'agent_command_poll_error',
+            fields: <String, Object?>{
+              'serverUrl': config.serverUrl,
+              'deviceId': config.deviceId,
+              'configNodeId': config.zeroTierNodeId,
+              'runtimeNodeId': state.runtimeStatus.nodeId,
+              'statusCode': error.statusCode,
+              'code': error.code,
+              'bootstrapRequired': error.bootstrapRequired,
+              'message': error.message,
+              'phase': 'initial',
+            },
+          ),
+        );
         if (!await _recoverIdentityIfRequired(error)) {
           rethrow;
         }
@@ -873,11 +1019,34 @@ class NetworkingAgentRuntimeController
             'Agent identity recovery completed without usable credentials.',
           );
         }
+        unawaited(
+          NetworkingDebugLog.write(
+            'agent_command_poll_retry_after_recovery',
+            fields: <String, Object?>{
+              'serverUrl': config.serverUrl,
+              'deviceId': config.deviceId,
+              'configNodeId': config.zeroTierNodeId,
+              'runtimeNodeId': state.runtimeStatus.nodeId,
+            },
+          ),
+        );
         commands = await _networkingService.fetchAgentCommands(
           deviceId: config.deviceId,
           agentToken: config.agentToken,
         );
       }
+      unawaited(
+        NetworkingDebugLog.write(
+          'agent_command_poll_success',
+          fields: <String, Object?>{
+            'serverUrl': config.serverUrl,
+            'deviceId': config.deviceId,
+            'configNodeId': config.zeroTierNodeId,
+            'runtimeNodeId': state.runtimeStatus.nodeId,
+            'commandCount': commands.length,
+          },
+        ),
+      );
 
       if (commands.isEmpty) {
         final bool shouldRefreshRuntimeStatus = state.isLocalInitializing ||
@@ -2155,6 +2324,17 @@ class NetworkingAgentRuntimeController
       'ZeroTier identity drift detected: configNodeId=$configuredNodeId, '
       'runtimeNodeId=$runtimeNodeId. Rebootstrapping agent identity.',
     );
+    unawaited(
+      NetworkingDebugLog.write(
+        'agent_identity_drift_detected',
+        fields: <String, Object?>{
+          'serverUrl': config.serverUrl,
+          'deviceId': config.deviceId,
+          'configNodeId': configuredNodeId,
+          'runtimeNodeId': runtimeNodeId,
+        },
+      ),
+    );
     await _initializeIdentity();
     return ref.read(appConfigProvider);
   }
@@ -2163,26 +2343,79 @@ class NetworkingAgentRuntimeController
     if (!_isBootstrapRequiredError(error)) {
       return false;
     }
+    final Future<bool>? activeRecovery = _identityRecoveryFuture;
+    if (activeRecovery != null) {
+      return activeRecovery;
+    }
+    final Future<bool> recovery = _runIdentityRecovery(error);
+    _identityRecoveryFuture = recovery;
+    try {
+      return await recovery;
+    } finally {
+      if (identical(_identityRecoveryFuture, recovery)) {
+        _identityRecoveryFuture = null;
+      }
+    }
+  }
+
+  Future<bool> _runIdentityRecovery(RealtimeError error) async {
     final AppConfig config = ref.read(appConfigProvider);
+    unawaited(
+      NetworkingDebugLog.write(
+        'agent_identity_recovery_start',
+        fields: <String, Object?>{
+          'serverUrl': config.serverUrl,
+          'deviceId': config.deviceId,
+          'configNodeId': config.zeroTierNodeId,
+          'runtimeNodeId': state.runtimeStatus.nodeId,
+          'statusCode': error.statusCode,
+          'code': error.code,
+          'bootstrapRequired': error.bootstrapRequired,
+          'message': error.message,
+        },
+      ),
+    );
     await ref.read(appConfigProvider.notifier).save(
           config.copyWith(
             deviceId: '',
+            zeroTierNodeId: '',
             agentToken: '',
           ),
         );
     await _initializeIdentity();
     final AppConfig refreshed = ref.read(appConfigProvider);
-    return refreshed.deviceId.trim().isNotEmpty &&
+    final bool recovered = refreshed.deviceId.trim().isNotEmpty &&
         refreshed.agentToken.trim().isNotEmpty &&
         refreshed.zeroTierNodeId.trim().isNotEmpty;
+    unawaited(
+      NetworkingDebugLog.write(
+        'agent_identity_recovery_finish',
+        fields: <String, Object?>{
+          'serverUrl': refreshed.serverUrl,
+          'deviceId': refreshed.deviceId,
+          'configNodeId': refreshed.zeroTierNodeId,
+          'runtimeNodeId': state.runtimeStatus.nodeId,
+          'recovered': recovered,
+        },
+      ),
+    );
+    return recovered;
   }
 
   bool _isBootstrapRequiredError(RealtimeError error) {
     if (error.requiresBootstrapRecovery) {
       return true;
     }
+    final String code = error.code?.trim().toUpperCase() ?? '';
+    if (code == 'DEVICE_NOT_FOUND' ||
+        code == 'INVALID_DEVICE_AGENT_TOKEN' ||
+        code == 'DEVICE_AGENT_TOKEN_NOT_ISSUED' ||
+        code == 'MISSING_DEVICE_AGENT_TOKEN') {
+      return true;
+    }
     final String message = error.message.trim().toLowerCase();
-    return message.contains('does not exist') && message.contains('device ');
+    return (message.contains('does not exist') && message.contains('device ')) ||
+        message.contains('invalid device agent token');
   }
 
   Future<void> _ensureManagedAddressAssignedForCommand(String networkId) async {

@@ -150,6 +150,7 @@ enum _DefaultNetworkingUiState {
   localMountFailed,
   success,
   closing,
+  retryableError,
 }
 
 class _NetworkingPageState extends ConsumerState<NetworkingPage> {
@@ -200,6 +201,11 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       networkingAgentRuntimeProvider,
       (NetworkingAgentRuntimeState? previous,
           NetworkingAgentRuntimeState next) {
+        final bool hasIdentityTokenError =
+            _hasInvalidDeviceAgentTokenError(next.lastError) ||
+                _hasInvalidDeviceAgentTokenError(
+                  next.runtimeStatus.lastError,
+                );
         final ZeroTierRuntimeEventType? nextEventType =
             next.lastRuntimeEvent?.type;
         final String defaultLeaveTargetNetworkId =
@@ -326,7 +332,12 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
               _defaultJoinTransitionStartedAt != null &&
               DateTime.now().difference(_defaultJoinTransitionStartedAt!) >=
                   _defaultMountStallTimeout;
-          if (currentDefaultOnline) {
+          if (hasIdentityTokenError) {
+            setState(() {
+              _defaultFlowState = _DefaultNetworkingUiState.retryableError;
+              _isDefaultJoinTransitioning = false;
+            });
+          } else if (currentDefaultOnline) {
             setState(() {
               _defaultFlowState = _DefaultNetworkingUiState.success;
             });
@@ -391,7 +402,28 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
             _joinFlowState = _PrivateNetworkingFlowState.localOrchestrating;
           });
         }
-        if (joinedPrivateOnline &&
+        if (hasIdentityTokenError) {
+          if ((_joinFlowState == _PrivateNetworkingFlowState.success ||
+                  _joinFlowState ==
+                      _PrivateNetworkingFlowState.localOrchestrating ||
+                  _joinFlowState ==
+                      _PrivateNetworkingFlowState.serverOrchestrating) &&
+              mounted) {
+            setState(() {
+              _joinFlowState = _PrivateNetworkingFlowState.idle;
+            });
+          }
+          if ((_hostFlowState == _PrivateNetworkingFlowState.success ||
+                  _hostFlowState ==
+                      _PrivateNetworkingFlowState.localOrchestrating ||
+                  _hostFlowState ==
+                      _PrivateNetworkingFlowState.serverOrchestrating) &&
+              mounted) {
+            setState(() {
+              _hostFlowState = _PrivateNetworkingFlowState.idle;
+            });
+          }
+        } else if (joinedPrivateOnline &&
             _joinFlowState != _PrivateNetworkingFlowState.success &&
             mounted) {
           setState(() {
@@ -982,6 +1014,11 @@ class _NetworkingPageState extends ConsumerState<NetworkingPage> {
       return;
     }
     _showPageMessage(successMessage);
+  }
+
+  bool _hasInvalidDeviceAgentTokenError(String? message) {
+    final String normalized = message?.trim().toLowerCase() ?? '';
+    return normalized.contains('invalid device agent token');
   }
 
   String _eventMessage(ZeroTierRuntimeEvent event) {
@@ -1834,6 +1871,8 @@ class _OneClickNetworkingTab extends StatelessWidget {
             ? debugFlowState
             : debugFlowState,
       _DefaultNetworkingUiState.closing => _DefaultNetworkFlowState.closing,
+      _DefaultNetworkingUiState.retryableError =>
+        _DefaultNetworkFlowState.retryableError,
     };
     final _DefaultNetworkFlowPresentation flowPresentation =
         _describeDefaultNetworkFlowState(

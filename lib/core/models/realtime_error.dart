@@ -16,7 +16,11 @@ class RealtimeError implements Exception {
   final String? agentRegisterEndpoint;
 
   bool get requiresBootstrapRecovery =>
-      bootstrapRequired || code == 'DEVICE_NOT_FOUND';
+      bootstrapRequired ||
+      code == 'DEVICE_NOT_FOUND' ||
+      code == 'INVALID_DEVICE_AGENT_TOKEN' ||
+      code == 'DEVICE_AGENT_TOKEN_NOT_ISSUED' ||
+      code == 'MISSING_DEVICE_AGENT_TOKEN';
 
   @override
   String toString() => message;
