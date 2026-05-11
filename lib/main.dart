@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_transfer_flutter/app/app.dart';
@@ -52,10 +53,12 @@ Future<void> main() async {
     windowButtonVisibility: false,
   );
 
-  await windowManager.waitUntilReadyToShow(windowOptions, () async {
+  windowManager.waitUntilReadyToShow(windowOptions, () async {
     windowStateService.attach();
     await windowStateService.restoreAfterShow(launchOptions);
     await windowManager.setTitle(AppConstants.appName);
+    await windowManager.show();
+    await windowManager.focus();
   });
 
   runApp(
@@ -70,13 +73,18 @@ Future<void> main() async {
     ),
   );
 
-  WidgetsBinding.instance.addPostFrameCallback((_) async {
-    await windowManager.show();
-    await windowManager.focus();
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(_initializeDesktopTraySafely());
   });
-
-  await DesktopTrayService.initialize();
 }
 
 bool get _isDesktopPlatform =>
     Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+
+Future<void> _initializeDesktopTraySafely() async {
+  try {
+    await DesktopTrayService.initialize();
+  } catch (_) {
+    // Keep desktop-only initialization failures from blocking the UI.
+  }
+}
