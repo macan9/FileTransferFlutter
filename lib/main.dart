@@ -85,7 +85,7 @@ Future<void> main() async {
   await _writeStartupLog('main.window_manager_ready');
 
   const Size defaultWindowSize = Size(680, 780);
-  const Size minimumWindowSize = Size(300, 350);
+  const Size minimumWindowSize = Size(580, 620);
 
   final WindowStateService windowStateService =
       await WindowStateService.create();

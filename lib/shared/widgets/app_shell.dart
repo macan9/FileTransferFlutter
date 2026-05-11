@@ -49,11 +49,22 @@ class _AppShellState extends ConsumerState<AppShell> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(networkingAgentRuntimeProvider.notifier).activate();
+      unawaited(_runStartupInitialization());
+    });
+  }
+
+  Future<void> _runStartupInitialization() async {
+    try {
+      await ref.read(networkingAgentRuntimeProvider.notifier).activate();
+      if (!mounted) {
+        return;
+      }
       if (ref.read(appConfigProvider).autoOnline) {
         _applyAutoOnline(enabled: true);
       }
-    });
+    } catch (_) {
+      // Startup initialization failures are surfaced by provider state/logs.
+    }
   }
 
   @override

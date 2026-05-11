@@ -5,6 +5,7 @@ import 'package:file_transfer_flutter/app/router/app_route_names.dart';
 import 'package:file_transfer_flutter/app/router/app_router.dart';
 import 'package:file_transfer_flutter/core/constants/app_constants.dart';
 import 'package:file_transfer_flutter/core/services/windows_window_control.dart';
+import 'package:hive/hive.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -125,7 +126,10 @@ class DesktopTrayService with TrayListener {
     _isQuitting = true;
 
     await WindowsWindowControl.hide();
+    unawaited(Hive.close());
     unawaited(_finishQuit());
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    exit(0);
   }
 
   Future<void> _quit() async {
@@ -135,8 +139,8 @@ class DesktopTrayService with TrayListener {
   static Future<void> _finishQuit() async {
     try {
       await trayManager.destroy();
-    } finally {
-      await windowManager.destroy();
+    } catch (_) {
+      // Best effort cleanup before the process exits.
     }
   }
 }

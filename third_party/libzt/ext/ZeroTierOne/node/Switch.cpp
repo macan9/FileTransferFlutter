@@ -715,6 +715,14 @@ void Switch::aqm_enqueue(void *tPtr, const SharedPtr<Network> &network, Packet &
 		send(tPtr, packet, encrypt, flowId);
 		return;
 	}
+	// Don't apply QoS scheduling to ZT protocol traffic
+	if (packet.verb() != Packet::VERB_FRAME && packet.verb() != Packet::VERB_EXT_FRAME) {
+		send(tPtr, packet, encrypt, flowId);
+		return;
+	}
+
+	_aqm_m.lock();
+
 	NetworkQoSControlBlock *nqcb = _netQueueControlBlock[network->id()];
 	if (!nqcb) {
 		nqcb = new NetworkQoSControlBlock();
@@ -725,12 +733,6 @@ void Switch::aqm_enqueue(void *tPtr, const SharedPtr<Network> &network, Packet &
 			nqcb->inactiveQueues.push_back(new ManagedQueue(i));
 		}
 	}
-	// Don't apply QoS scheduling to ZT protocol traffic
-	if (packet.verb() != Packet::VERB_FRAME && packet.verb() != Packet::VERB_EXT_FRAME) {
-		send(tPtr, packet, encrypt, flowId);
-	}
-
-	_aqm_m.lock();
 
 	// Enqueue packet and move queue to appropriate list
 
@@ -738,25 +740,30 @@ void Switch::aqm_enqueue(void *tPtr, const SharedPtr<Network> &network, Packet &
 	TXQueueEntry *txEntry = new TXQueueEntry(dest,RR->node->now(),packet,encrypt,flowId);
 
 	ManagedQueue *selectedQueue = nullptr;
-	for (size_t i=0; i<ZT_AQM_NUM_BUCKETS; i++) {
-		if (i < nqcb->oldQueues.size()) { // search old queues first (I think this is best since old would imply most recent usage of the queue)
-			if (nqcb->oldQueues[i]->id == qosBucket) {
-				selectedQueue = nqcb->oldQueues[i];
+	for (std::vector<ManagedQueue*>::iterator it(nqcb->oldQueues.begin()); it != nqcb->oldQueues.end(); ++it) {
+		if ((*it) && (*it)->id == qosBucket) {
+			selectedQueue = *it;
+			break;
+		}
+	}
+	if (!selectedQueue) {
+		for (std::vector<ManagedQueue*>::iterator it(nqcb->newQueues.begin()); it != nqcb->newQueues.end(); ++it) {
+			if ((*it) && (*it)->id == qosBucket) {
+				selectedQueue = *it;
+				break;
 			}
 		}
-		if (i < nqcb->newQueues.size()) { // search new queues (this would imply not often-used queues)
-			if (nqcb->newQueues[i]->id == qosBucket) {
-				selectedQueue = nqcb->newQueues[i];
-			}
-		}
-		if (i < nqcb->inactiveQueues.size()) { // search inactive queues
-			if (nqcb->inactiveQueues[i]->id == qosBucket) {
-				selectedQueue = nqcb->inactiveQueues[i];
+	}
+	if (!selectedQueue) {
+		for (std::vector<ManagedQueue*>::iterator it(nqcb->inactiveQueues.begin()); it != nqcb->inactiveQueues.end(); ++it) {
+			if ((*it) && (*it)->id == qosBucket) {
+				selectedQueue = *it;
 				// move queue to end of NEW queue list
 				selectedQueue->byteCredit = ZT_AQM_QUANTUM;
 				// DEBUG_INFO("moving q=%p from INACTIVE to NEW list", selectedQueue);
 				nqcb->newQueues.push_back(selectedQueue);
-				nqcb->inactiveQueues.erase(nqcb->inactiveQueues.begin() + i);
+				nqcb->inactiveQueues.erase(it);
+				break;
 			}
 		}
 	}
@@ -796,7 +803,7 @@ void Switch::aqm_enqueue(void *tPtr, const SharedPtr<Network> &network, Packet &
 				}
 			}
 		}
-		if (selectedQueueToDropFrom) {
+		if (selectedQueueToDropFrom && !selectedQueueToDropFrom->q.empty()) {
 			// DEBUG_INFO("dropping packet from head of largest queue (%d payload bytes)", maxQueueLength);
 			int sizeOfDroppedPacket = selectedQueueToDropFrom->q.front()->packet.payloadLength();
 			delete selectedQueueToDropFrom->q.front();
@@ -818,12 +825,14 @@ Switch::dqr Switch::dodequeue(ManagedQueue *q, uint64_t now)
 {
 	dqr r;
 	r.ok_to_drop = false;
-	r.p = q->q.front();
-
-	if (r.p == NULL) {
-		q->first_above_time = 0;
+	r.p = nullptr;
+	if (!q || q->q.empty()) {
+		if (q) {
+			q->first_above_time = 0;
+		}
 		return r;
 	}
+	r.p = q->q.front();
 	uint64_t sojourn_time = now - r.p->creationTime;
 	if (sojourn_time < ZT_AQM_TARGET || q->byteLength <= ZT_DEFAULT_MTU) {
 		// went below - stay below for at least interval
@@ -842,13 +851,17 @@ Switch::dqr Switch::dodequeue(ManagedQueue *q, uint64_t now)
 
 Switch::TXQueueEntry * Switch::CoDelDequeue(ManagedQueue *q, bool isNew, uint64_t now)
 {
+	if (!q || q->q.empty()) {
+		return nullptr;
+	}
+
 	dqr r = dodequeue(q, now);
 
 	if (q->dropping) {
 		if (!r.ok_to_drop) {
 			q->dropping = false;
 		}
-		while (now >= q->drop_next && q->dropping) {
+		while (now >= q->drop_next && q->dropping && !q->q.empty()) {
 			q->q.pop_front(); // drop
 			r = dodequeue(q, now);
 			if (!r.ok_to_drop) {
@@ -860,7 +873,7 @@ Switch::TXQueueEntry * Switch::CoDelDequeue(ManagedQueue *q, bool isNew, uint64_
 				q->drop_next = control_law(q->drop_next, q->count);
 			}
 		}
-	} else if (r.ok_to_drop) {
+	} else if (r.ok_to_drop && !q->q.empty()) {
 		q->q.pop_front(); // drop
 		r = dodequeue(q, now);
 		q->dropping = true;
@@ -873,10 +886,13 @@ Switch::TXQueueEntry * Switch::CoDelDequeue(ManagedQueue *q, bool isNew, uint64_
 
 void Switch::aqm_dequeue(void *tPtr)
 {
+	_aqm_m.lock();
+
 	// Cycle through network-specific QoS control blocks
 	for(std::map<uint64_t,NetworkQoSControlBlock*>::iterator nqcb(_netQueueControlBlock.begin());nqcb!=_netQueueControlBlock.end();) {
-		if (!(*nqcb).second->_currEnqueuedPackets) {
-			return;
+		if (!(*nqcb).second || !(*nqcb).second->_currEnqueuedPackets) {
+			nqcb++;
+			continue;
 		}
 
 		uint64_t now = RR->node->now();
@@ -884,8 +900,6 @@ void Switch::aqm_dequeue(void *tPtr)
 		std::vector<ManagedQueue*> *currQueues = &((*nqcb).second->newQueues);
 		std::vector<ManagedQueue*> *oldQueues = &((*nqcb).second->oldQueues);
 		std::vector<ManagedQueue*> *inactiveQueues = &((*nqcb).second->inactiveQueues);
-
-		_aqm_m.lock();
 
 		// Attempt dequeue from queues in NEW list
 		bool examiningNewQueues = true;
@@ -909,7 +923,9 @@ void Switch::aqm_dequeue(void *tPtr)
 					queueAtFrontOfList->byteLength -= len;
 					queueAtFrontOfList->byteCredit -= len;
 					// Send the packet!
-					queueAtFrontOfList->q.pop_front();
+					if (!queueAtFrontOfList->q.empty()) {
+						queueAtFrontOfList->q.pop_front();
+					}
 					send(tPtr, entryToEmit->packet, entryToEmit->encrypt, entryToEmit->flowId);
 					(*nqcb).second->_currEnqueuedPackets--;
 				}
@@ -940,7 +956,9 @@ void Switch::aqm_dequeue(void *tPtr)
 					int len = entryToEmit->packet.payloadLength();
 					queueAtFrontOfList->byteLength -= len;
 					queueAtFrontOfList->byteCredit -= len;
-					queueAtFrontOfList->q.pop_front();
+					if (!queueAtFrontOfList->q.empty()) {
+						queueAtFrontOfList->q.pop_front();
+					}
 					send(tPtr, entryToEmit->packet, entryToEmit->encrypt, entryToEmit->flowId);
 					(*nqcb).second->_currEnqueuedPackets--;
 				}
@@ -951,18 +969,21 @@ void Switch::aqm_dequeue(void *tPtr)
 			}
 		}
 		nqcb++;
-		_aqm_m.unlock();
 	}
+
+	_aqm_m.unlock();
 }
 
 void Switch::removeNetworkQoSControlBlock(uint64_t nwid)
 {
+	_aqm_m.lock();
 	NetworkQoSControlBlock *nq = _netQueueControlBlock[nwid];
 	if (nq) {
 		_netQueueControlBlock.erase(nwid);
 		delete nq;
 		nq = NULL;
 	}
+	_aqm_m.unlock();
 }
 
 void Switch::send(void *tPtr,Packet &packet,bool encrypt,int32_t flowId)
