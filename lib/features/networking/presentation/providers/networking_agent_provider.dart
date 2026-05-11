@@ -880,9 +880,19 @@ class NetworkingAgentRuntimeController
       }
 
       if (commands.isEmpty) {
+        final bool shouldRefreshRuntimeStatus = state.isLocalInitializing ||
+            state.runtimeStatus.isNodeStarting ||
+            !state.isLocalReady ||
+            state.isNetworkTransitioning;
+        if (shouldRefreshRuntimeStatus) {
+          await _refreshRuntimeStatus();
+        }
+        final bool shouldClearLastError =
+            state.runtimeStatus.lastError?.trim().isNotEmpty != true &&
+                state.lastError?.trim().isNotEmpty != true;
         state = state.copyWith(
           isPolling: false,
-          clearLastError: true,
+          clearLastError: shouldClearLastError,
         );
         _busyPolling = false;
         return;
@@ -1449,7 +1459,7 @@ class NetworkingAgentRuntimeController
 
   Future<ZeroTierRuntimeStatus> _waitForNodeReady() async {
     ZeroTierRuntimeStatus latest = state.runtimeStatus;
-    for (int attempt = 0; attempt < 30; attempt += 1) {
+    for (int attempt = 0; attempt < 70; attempt += 1) {
       await Future<void>.delayed(const Duration(milliseconds: 500));
       latest = await _zeroTierService.detectStatus();
       if (latest.isNodeReady ||

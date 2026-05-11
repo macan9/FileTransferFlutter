@@ -1132,7 +1132,8 @@ class _HeroStatusCard extends StatelessWidget {
       recentEvents: recentEvents,
       lastError: lastError,
     );
-    final PairingSession? latestSession = _latestPairingSession(pairingSessions);
+    final PairingSession? latestSession =
+        _latestPairingSession(pairingSessions);
 
     return SectionCard(
       title: 'ZeroTier 节点概览',
@@ -2058,8 +2059,8 @@ class _PrivateNetworkingTab extends StatelessWidget {
     final bool orbSpinning;
 
     if (!isLocalReady) {
-      orbLabel = '环境未就绪';
-      orbSubtitle = '请等待本地环境初始化';
+      orbLabel = '本地节点启动中';
+      orbSubtitle = '首次可能需要 30-60 秒\n请继续等待';
       orbIcon = Icons.hourglass_top_rounded;
       orbTone = _NetworkingOrbTone.disabled;
       orbSpinning = true;
@@ -5428,9 +5429,9 @@ _DefaultNetworkFlowPresentation _describeDefaultNetworkFlowState(
   switch (state) {
     case _DefaultNetworkFlowState.initializing:
       return const _DefaultNetworkFlowPresentation(
-        label: '环境未就绪',
-        subtitle: '请等待本地环境初始化',
-        hint: '初始化完成前，不允许开始默认网络编排。',
+        label: '本地节点启动中',
+        subtitle: '首次可能需要 30-60 秒\n请继续等待',
+        hint: '初始化完成前，默认组网暂不可用。',
         icon: Icons.hourglass_top_rounded,
         tone: _NetworkingOrbTone.disabled,
         isInProgress: true,
@@ -5573,12 +5574,14 @@ PairingSession? _latestPairingSession(List<PairingSession> sessions) {
     return null;
   }
 
-  final List<PairingSession> sortedSessions = List<PairingSession>.from(sessions)
-    ..sort(_comparePairingSessionsByRecency);
+  final List<PairingSession> sortedSessions =
+      List<PairingSession>.from(sessions)
+        ..sort(_comparePairingSessionsByRecency);
   return sortedSessions.first;
 }
 
-int _comparePairingSessionsByRecency(PairingSession left, PairingSession right) {
+int _comparePairingSessionsByRecency(
+    PairingSession left, PairingSession right) {
   final DateTime leftTime = _pairingSessionSortTime(left);
   final DateTime rightTime = _pairingSessionSortTime(right);
   return rightTime.compareTo(leftTime);
